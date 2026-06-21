@@ -5,10 +5,7 @@
 
 mod machine;
 
-use crate::{
-    features::Wasip1HandlerSet,
-    protocol::{BudgetExpired, BudgetRun, ProcExitStatus},
-};
+use crate::protocol::{BudgetExpired, BudgetRun, ProcExitStatus};
 
 pub use machine::{FdStat, PathBytes};
 
@@ -19,13 +16,13 @@ pub struct Guest<'a> {
 }
 
 impl<'a> Guest<'a> {
+    /// # Safety
+    ///
+    /// `dst` must be valid for writes, properly aligned for `Guest<'a>`, and
+    /// must not be read until this function returns `Ok(())`.
     pub unsafe fn init_in_place(dst: *mut Self, module: &'a [u8]) -> Result<(), Error> {
         unsafe {
-            machine::Vm::init_in_place(
-                core::ptr::addr_of_mut!((*dst).engine),
-                module,
-                Wasip1HandlerSet::active(),
-            )?;
+            machine::Vm::init_in_place(core::ptr::addr_of_mut!((*dst).engine), module)?;
         }
         Ok(())
     }
@@ -70,8 +67,8 @@ impl<'a> Guest<'a> {
                 Ok(Event::MemoryFence(MemoryFence { event }))
             }
             Ok(machine::VmEvent::BudgetExpired(expired)) => Ok(Event::BudgetExpired(expired)),
-            Ok(machine::VmEvent::ProcExit(status)) => Ok(Event::Exit(ProcExit::new(status))),
-            Ok(machine::VmEvent::Done) => Ok(Event::Done),
+            Ok(machine::VmEvent::ProcExit(status)) => Ok(Event::Exit(Exit::new(status))),
+            Ok(machine::VmEvent::Done) => Ok(Event::Exit(Exit::returned())),
             Err(error) => Err(error),
         }
     }
@@ -81,8 +78,7 @@ pub enum Event {
     Call(Call),
     MemoryFence(MemoryFence),
     BudgetExpired(BudgetExpired),
-    Done,
-    Exit(ProcExit),
+    Exit(Exit),
 }
 
 pub enum Call {
@@ -103,13 +99,21 @@ pub enum Call {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcExit {
+pub struct Exit {
     status: u32,
 }
 
-impl ProcExit {
+impl Exit {
     const fn new(status: u32) -> Self {
         Self { status }
+    }
+
+    const fn returned() -> Self {
+        Self { status: 0 }
+    }
+
+    pub const fn status(self) -> u32 {
+        self.status
     }
 
     pub const fn as_protocol_status(self) -> Option<ProcExitStatus> {
@@ -332,10 +336,6 @@ pub struct ArgsGet {
 }
 
 impl ArgsGet {
-    pub const fn max_len(&self) -> u8 {
-        u8::MAX
-    }
-
     pub fn complete(self, guest: &mut Guest<'_>, args: &[&[u8]], errno: u32) -> Result<(), Error> {
         guest.engine.finish_args_get(self.call, args, errno)
     }
@@ -364,10 +364,6 @@ pub struct EnvironGet {
 }
 
 impl EnvironGet {
-    pub const fn max_len(&self) -> u8 {
-        u8::MAX
-    }
-
     pub fn complete(
         self,
         guest: &mut Guest<'_>,
@@ -382,19 +378,34 @@ pub struct MemoryFence {
     event: machine::MemoryGrowEvent,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryFenceOutcome {
+    Grown { new_pages: u32 },
+    Rejected,
+}
+
 impl MemoryFence {
     pub const fn previous_pages(&self) -> u32 {
         self.event.previous_pages
     }
 
-    pub const fn new_pages(&self) -> Option<u32> {
-        self.event.new_pages
+    pub const fn requested_pages(&self) -> u32 {
+        self.event.requested_pages
+    }
+
+    pub const fn outcome(&self) -> MemoryFenceOutcome {
+        match self.event.outcome {
+            machine::MemoryGrowOutcome::Grown { new_pages } => {
+                MemoryFenceOutcome::Grown { new_pages }
+            }
+            machine::MemoryGrowOutcome::Rejected => MemoryFenceOutcome::Rejected,
+        }
     }
 
     pub const fn fence_epoch(&self) -> u32 {
-        match self.new_pages() {
-            Some(pages) => pages,
-            None => self.previous_pages(),
+        match self.outcome() {
+            MemoryFenceOutcome::Grown { new_pages } => new_pages,
+            MemoryFenceOutcome::Rejected => self.previous_pages(),
         }
     }
 
@@ -404,6 +415,41 @@ impl MemoryFence {
             Ok(())
         } else {
             Err(Error::PendingMismatch)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Event, Guest};
+    use crate::protocol::BudgetRun;
+    use core::mem::MaybeUninit;
+    use std::boxed::Box;
+
+    const START_RETURNS: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03,
+        0x02, 0x01, 0x00, 0x07, 0x0a, 0x01, 0x06, b'_', b's', b't', b'a', b'r', b't', 0x00, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    ];
+
+    #[test]
+    fn facade_returns_explicit_exit_when_start_returns() {
+        let mut storage = Box::new(MaybeUninit::<Guest<'_>>::uninit());
+        let guest = unsafe {
+            let ptr = storage.as_mut_ptr();
+            Guest::init_in_place(ptr, START_RETURNS).expect("guest init");
+            &mut *ptr
+        };
+
+        let event = guest
+            .resume(BudgetRun::new(1, 1, 16))
+            .expect("guest returns");
+
+        match event {
+            Event::Exit(exit) => assert_eq!(exit.status(), 0),
+            Event::Call(_) | Event::MemoryFence(_) | Event::BudgetExpired(_) => {
+                panic!("expected explicit exit event")
+            }
         }
     }
 }

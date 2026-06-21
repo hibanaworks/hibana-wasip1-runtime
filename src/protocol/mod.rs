@@ -15,17 +15,6 @@ macro_rules! wire_payload_via_decode {
     };
 }
 
-pub const LABEL_WASIP1_STDOUT: u8 = 17;
-pub const LABEL_WASIP1_STDOUT_RET: u8 = 18;
-pub const LABEL_WASIP1_STDERR: u8 = 19;
-pub const LABEL_WASIP1_STDERR_RET: u8 = 20;
-pub const LABEL_WASIP1_STDIN: u8 = 21;
-pub const LABEL_WASIP1_STDIN_RET: u8 = 22;
-pub const LABEL_WASIP1_CLOCK_NOW: u8 = 23;
-pub const LABEL_WASIP1_CLOCK_NOW_RET: u8 = 24;
-pub const LABEL_WASIP1_RANDOM_SEED: u8 = 25;
-pub const LABEL_WASIP1_RANDOM_SEED_RET: u8 = 26;
-pub const LABEL_WASIP1_EXIT: u8 = 27;
 pub const LABEL_MEM_BORROW_READ: u8 = 28;
 pub const LABEL_MEM_BORROW_WRITE: u8 = 29;
 pub const LABEL_MEM_GRANT: u8 = 30;
@@ -69,13 +58,6 @@ pub const LABEL_WASI_PATH_OPEN_RET: u8 = 128;
 pub const LABEL_WASI_FD_READDIR: u8 = 149;
 pub const LABEL_WASI_FD_READDIR_RET: u8 = 150;
 
-pub const TAG_REQ_LOG_U32: u8 = 1;
-pub const TAG_REQ_WASIP1_STDOUT: u8 = 3;
-pub const TAG_REQ_WASIP1_STDERR: u8 = 4;
-pub const TAG_REQ_WASIP1_STDIN: u8 = 5;
-pub const TAG_REQ_WASIP1_CLOCK_NOW: u8 = 6;
-pub const TAG_REQ_WASIP1_RANDOM_SEED: u8 = 7;
-pub const TAG_REQ_WASIP1_EXIT: u8 = 8;
 pub const TAG_REQ_WASI_FD_WRITE: u8 = 11;
 pub const TAG_REQ_WASI_FD_READ: u8 = 12;
 pub const TAG_REQ_WASI_FD_FDSTAT_GET: u8 = 13;
@@ -92,12 +74,6 @@ pub const TAG_REQ_WASI_ENVIRON_SIZES_GET: u8 = 23;
 pub const TAG_REQ_WASI_PATH_OPEN: u8 = 24;
 pub const TAG_REQ_WASI_FD_READDIR: u8 = 25;
 
-pub const TAG_RET_LOGGED: u8 = 1;
-pub const TAG_RET_WASIP1_STDOUT_WRITTEN: u8 = 3;
-pub const TAG_RET_WASIP1_STDERR_WRITTEN: u8 = 4;
-pub const TAG_RET_WASIP1_STDIN_READ: u8 = 5;
-pub const TAG_RET_WASIP1_CLOCK_NOW: u8 = 6;
-pub const TAG_RET_WASIP1_RANDOM_SEED: u8 = 7;
 pub const TAG_RET_WASI_FD_WRITE_DONE: u8 = 10;
 pub const TAG_RET_WASI_FD_READ_DONE: u8 = 11;
 pub const TAG_RET_WASI_FD_FDSTAT: u8 = 12;
@@ -113,12 +89,8 @@ pub const TAG_RET_WASI_ENVIRON_SIZES: u8 = 21;
 pub const TAG_RET_WASI_PATH_OPENED: u8 = 22;
 pub const TAG_RET_WASI_FD_READDIR_DONE: u8 = 23;
 
-pub const WASIP1_STREAM_CHUNK_CAPACITY: usize = 30;
+pub const WASIP1_IO_CHUNK_CAPACITY: usize = 30;
 pub const WASIP1_PATH_CHUNK_CAPACITY: usize = 40;
-pub const STDOUT_CHUNK_CAPACITY: usize = WASIP1_STREAM_CHUNK_CAPACITY;
-pub const STDERR_CHUNK_CAPACITY: usize = WASIP1_STREAM_CHUNK_CAPACITY;
-pub const STDIN_CHUNK_CAPACITY: usize = WASIP1_STREAM_CHUNK_CAPACITY;
-pub const MEM_LEASE_NONE: u8 = 0;
 
 mod wasi;
 pub use wasi::*;

@@ -1,4 +1,4 @@
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObjectId(pub u32);
 
 /// Immutable path-to-object fact consumed by driver-side logic.
@@ -9,7 +9,7 @@ pub struct ChoreoFsFact<'a> {
 }
 
 impl<'a> ChoreoFsFact<'a> {
-    pub const EMPTY: Self = Self {
+    const EMPTY: Self = Self {
         path: &[],
         object: ObjectId(0),
     };
@@ -31,7 +31,7 @@ impl<'a> ChoreoFsFact<'a> {
 ///
 /// This helper is only shorthand for ledger facts. It does not own protocol
 /// progress, route selection, or boundary authority.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdSpec {
     fd: u32,
     rights: u64,
@@ -131,7 +131,7 @@ impl<const N: usize> ChoreoFsObjectSet<N> {
 }
 
 /// ChoreoFS fact resolver. It does not own protocol progress or route authority.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChoreoFsFacts<'a> {
     entries: &'a [ChoreoFsFact<'a>],
 }
@@ -159,7 +159,7 @@ impl<'a> ChoreoFsFacts<'a> {
 }
 
 /// Immutable fd/object materialization fact.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LedgerFdFact {
     fd: u32,
     object: ObjectId,
@@ -168,7 +168,7 @@ pub struct LedgerFdFact {
 }
 
 impl LedgerFdFact {
-    pub const EMPTY: Self = Self {
+    const EMPTY: Self = Self {
         fd: 0,
         object: ObjectId(0),
         rights: 0,
@@ -202,7 +202,7 @@ impl LedgerFdFact {
 }
 
 /// Read-only ledger facts. The choreography still owns progress authority.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LedgerFacts<'a> {
     fds: &'a [LedgerFdFact],
 }
@@ -230,18 +230,13 @@ impl<'a> LedgerFacts<'a> {
 }
 
 /// Driver-side service facts handed to sealed localside contexts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DriverFacts<'a> {
     choreofs: ChoreoFsFacts<'a>,
     ledger: LedgerFacts<'a>,
 }
 
 impl<'a> DriverFacts<'a> {
-    pub const EMPTY: Self = Self {
-        choreofs: ChoreoFsFacts { entries: &[] },
-        ledger: LedgerFacts { fds: &[] },
-    };
-
     pub const fn new(choreofs: ChoreoFsFacts<'a>, ledger: LedgerFacts<'a>) -> Self {
         Self { choreofs, ledger }
     }
@@ -252,5 +247,43 @@ impl<'a> DriverFacts<'a> {
 
     pub const fn ledger(&self) -> LedgerFacts<'a> {
         self.ledger
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static OBJECTS: ChoreoFsObjectSet<2> = ChoreoFsObjectSet::new([
+        ChoreoFsObject::new(b"device/led/green", ObjectId(1), FdSpec::new(10, 0b01, 100)),
+        ChoreoFsObject::new(b"device/led/red", ObjectId(2), FdSpec::new(11, 0b10, 101)),
+    ]);
+
+    #[test]
+    fn object_set_expands_choreofs_and_ledger_driver_facts() {
+        let facts = OBJECTS.driver_facts();
+
+        assert_eq!(facts.choreofs().entries().len(), 2);
+        assert_eq!(
+            facts.choreofs().resolve(b"device/led/green"),
+            Some(ObjectId(1))
+        );
+        assert_eq!(
+            facts.choreofs().resolve(b"device/led/red"),
+            Some(ObjectId(2))
+        );
+        assert_eq!(facts.choreofs().resolve(b"device/led/yellow"), None);
+
+        let green_fd = facts.ledger().fd(10).expect("green fd fact");
+        assert_eq!(green_fd.object(), ObjectId(1));
+        assert_eq!(green_fd.rights(), 0b01);
+        assert_eq!(green_fd.generation(), 100);
+
+        let red_fd = facts.ledger().fd(11).expect("red fd fact");
+        assert_eq!(red_fd.object(), ObjectId(2));
+        assert_eq!(red_fd.rights(), 0b10);
+        assert_eq!(red_fd.generation(), 101);
+
+        assert_eq!(facts.ledger().fd(12), None);
     }
 }
