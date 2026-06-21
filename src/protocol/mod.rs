@@ -1,0 +1,124 @@
+use hibana::{
+    g::Msg,
+    runtime::wire::{CodecError, Payload, WireEncode, WirePayload},
+};
+
+macro_rules! wire_payload_via_decode {
+    () => {
+        fn validate_payload(input: Payload<'_>) -> Result<(), CodecError> {
+            Self::decode_payload(input).map(|_| ())
+        }
+
+        fn decode_validated_payload<'a>(input: Payload<'a>) -> Self::Decoded<'a> {
+            Self::decode_payload(input).expect("validated payload")
+        }
+    };
+}
+
+pub const LABEL_WASIP1_STDOUT: u8 = 17;
+pub const LABEL_WASIP1_STDOUT_RET: u8 = 18;
+pub const LABEL_WASIP1_STDERR: u8 = 19;
+pub const LABEL_WASIP1_STDERR_RET: u8 = 20;
+pub const LABEL_WASIP1_STDIN: u8 = 21;
+pub const LABEL_WASIP1_STDIN_RET: u8 = 22;
+pub const LABEL_WASIP1_CLOCK_NOW: u8 = 23;
+pub const LABEL_WASIP1_CLOCK_NOW_RET: u8 = 24;
+pub const LABEL_WASIP1_RANDOM_SEED: u8 = 25;
+pub const LABEL_WASIP1_RANDOM_SEED_RET: u8 = 26;
+pub const LABEL_WASIP1_EXIT: u8 = 27;
+pub const LABEL_MEM_BORROW_READ: u8 = 28;
+pub const LABEL_MEM_BORROW_WRITE: u8 = 29;
+pub const LABEL_MEM_GRANT: u8 = 30;
+pub const LABEL_MEM_RELEASE: u8 = 31;
+pub const LABEL_MEM_COMMIT: u8 = 32;
+pub const LABEL_MEM_FENCE: u8 = 33;
+pub const LABEL_ENGINE_RUN: u8 = 50;
+pub const LABEL_ENGINE_BUDGET_EXPIRED: u8 = 51;
+pub const LABEL_ENGINE_SUSPEND: u8 = 52;
+pub const LABEL_ENGINE_RESTART: u8 = 53;
+pub const LABEL_WASI_CLOCK_RES_GET: u8 = 63;
+pub const LABEL_WASI_CLOCK_RES_GET_RET: u8 = 64;
+pub const LABEL_WASI_FD_WRITE: u8 = 85;
+pub const LABEL_WASI_FD_WRITE_RET: u8 = 86;
+pub const LABEL_WASI_FD_READ: u8 = 87;
+pub const LABEL_WASI_FD_READ_RET: u8 = 88;
+pub const LABEL_WASI_FD_FDSTAT_GET: u8 = 89;
+pub const LABEL_WASI_FD_FDSTAT_GET_RET: u8 = 90;
+pub const LABEL_WASI_FD_CLOSE: u8 = 91;
+pub const LABEL_WASI_FD_CLOSE_RET: u8 = 92;
+pub const LABEL_WASI_CLOCK_TIME_GET: u8 = 93;
+pub const LABEL_WASI_CLOCK_TIME_GET_RET: u8 = 94;
+pub const LABEL_WASI_POLL_ONEOFF: u8 = 95;
+pub const LABEL_WASI_POLL_ONEOFF_RET: u8 = 96;
+pub const LABEL_WASI_RANDOM_GET: u8 = 97;
+pub const LABEL_WASI_RANDOM_GET_RET: u8 = 98;
+pub const LABEL_WASI_PROC_EXIT: u8 = 99;
+pub const LABEL_WASI_ARGS_GET: u8 = 100;
+pub const LABEL_WASI_ARGS_GET_RET: u8 = 101;
+pub const LABEL_WASI_ENVIRON_GET: u8 = 102;
+pub const LABEL_WASI_ENVIRON_GET_RET: u8 = 103;
+pub const LABEL_WASI_FD_ERROR: u8 = 104;
+pub const LABEL_MEM_GRANT_READ_CONTROL: u8 = 106;
+pub const LABEL_MEM_GRANT_WRITE_CONTROL: u8 = 107;
+pub const LABEL_WASI_ARGS_SIZES_GET: u8 = 123;
+pub const LABEL_WASI_ARGS_SIZES_GET_RET: u8 = 124;
+pub const LABEL_WASI_ENVIRON_SIZES_GET: u8 = 125;
+pub const LABEL_WASI_ENVIRON_SIZES_GET_RET: u8 = 126;
+pub const LABEL_WASI_PATH_OPEN: u8 = 127;
+pub const LABEL_WASI_PATH_OPEN_RET: u8 = 128;
+pub const LABEL_WASI_FD_READDIR: u8 = 149;
+pub const LABEL_WASI_FD_READDIR_RET: u8 = 150;
+
+pub const TAG_REQ_LOG_U32: u8 = 1;
+pub const TAG_REQ_WASIP1_STDOUT: u8 = 3;
+pub const TAG_REQ_WASIP1_STDERR: u8 = 4;
+pub const TAG_REQ_WASIP1_STDIN: u8 = 5;
+pub const TAG_REQ_WASIP1_CLOCK_NOW: u8 = 6;
+pub const TAG_REQ_WASIP1_RANDOM_SEED: u8 = 7;
+pub const TAG_REQ_WASIP1_EXIT: u8 = 8;
+pub const TAG_REQ_WASI_FD_WRITE: u8 = 11;
+pub const TAG_REQ_WASI_FD_READ: u8 = 12;
+pub const TAG_REQ_WASI_FD_FDSTAT_GET: u8 = 13;
+pub const TAG_REQ_WASI_FD_CLOSE: u8 = 14;
+pub const TAG_REQ_WASI_CLOCK_TIME_GET: u8 = 15;
+pub const TAG_REQ_WASI_POLL_ONEOFF: u8 = 16;
+pub const TAG_REQ_WASI_RANDOM_GET: u8 = 17;
+pub const TAG_REQ_WASI_PROC_EXIT: u8 = 18;
+pub const TAG_REQ_WASI_ARGS_GET: u8 = 19;
+pub const TAG_REQ_WASI_ENVIRON_GET: u8 = 20;
+pub const TAG_REQ_WASI_CLOCK_RES_GET: u8 = 21;
+pub const TAG_REQ_WASI_ARGS_SIZES_GET: u8 = 22;
+pub const TAG_REQ_WASI_ENVIRON_SIZES_GET: u8 = 23;
+pub const TAG_REQ_WASI_PATH_OPEN: u8 = 24;
+pub const TAG_REQ_WASI_FD_READDIR: u8 = 25;
+
+pub const TAG_RET_LOGGED: u8 = 1;
+pub const TAG_RET_WASIP1_STDOUT_WRITTEN: u8 = 3;
+pub const TAG_RET_WASIP1_STDERR_WRITTEN: u8 = 4;
+pub const TAG_RET_WASIP1_STDIN_READ: u8 = 5;
+pub const TAG_RET_WASIP1_CLOCK_NOW: u8 = 6;
+pub const TAG_RET_WASIP1_RANDOM_SEED: u8 = 7;
+pub const TAG_RET_WASI_FD_WRITE_DONE: u8 = 10;
+pub const TAG_RET_WASI_FD_READ_DONE: u8 = 11;
+pub const TAG_RET_WASI_FD_FDSTAT: u8 = 12;
+pub const TAG_RET_WASI_FD_CLOSED: u8 = 13;
+pub const TAG_RET_WASI_CLOCK_TIME: u8 = 14;
+pub const TAG_RET_WASI_POLL_READY: u8 = 15;
+pub const TAG_RET_WASI_RANDOM_DONE: u8 = 16;
+pub const TAG_RET_WASI_ARGS_DONE: u8 = 17;
+pub const TAG_RET_WASI_ENVIRON_DONE: u8 = 18;
+pub const TAG_RET_WASI_CLOCK_RESOLUTION: u8 = 19;
+pub const TAG_RET_WASI_ARGS_SIZES: u8 = 20;
+pub const TAG_RET_WASI_ENVIRON_SIZES: u8 = 21;
+pub const TAG_RET_WASI_PATH_OPENED: u8 = 22;
+pub const TAG_RET_WASI_FD_READDIR_DONE: u8 = 23;
+
+pub const WASIP1_STREAM_CHUNK_CAPACITY: usize = 30;
+pub const WASIP1_PATH_CHUNK_CAPACITY: usize = 40;
+pub const STDOUT_CHUNK_CAPACITY: usize = WASIP1_STREAM_CHUNK_CAPACITY;
+pub const STDERR_CHUNK_CAPACITY: usize = WASIP1_STREAM_CHUNK_CAPACITY;
+pub const STDIN_CHUNK_CAPACITY: usize = WASIP1_STREAM_CHUNK_CAPACITY;
+pub const MEM_LEASE_NONE: u8 = 0;
+
+mod wasi;
+pub use wasi::*;

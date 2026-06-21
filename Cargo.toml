@@ -1,0 +1,27 @@
+[package]
+name = "hibana-wasip1-runtime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+hibana = { version = "0.9.0", default-features = false }
+
+[patch.crates-io]
+hibana = { path = "../hibana" }
+
+[features]
+default = []
+engine = []
+args-env = []
+fd-write = []
+fd-read = []
+fd-readdir = []
+fd-fdstat-get = []
+fd-close = []
+clock-res-get = []
+clock-time-get = []
+poll-oneoff = []
+random-get = []
+proc-exit = []
+path-open = []
