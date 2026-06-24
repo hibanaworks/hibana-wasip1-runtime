@@ -216,22 +216,20 @@ const TEST_RESUME_FUEL: u32 = 1024;
 const WASM_BLOCKTYPE_EMPTY: u8 = 0x40;
 const CORE_WASM_MAX_TYPES: usize = 24;
 const CORE_WASM_MAX_IMPORTS: usize = 16;
-const CORE_WASM_MAX_FUNCTIONS: usize = 128;
+const CORE_WASM_MAX_FUNCTIONS: usize = 224;
 const CORE_WASM_MAX_GLOBALS: usize = 16;
 const CORE_WASM_MAX_PARAMS: usize = 12;
 const CORE_WASM_MAX_RESULTS: usize = 1;
 const CORE_WASM_VALUE_STACK_CAPACITY: usize = 64;
 const CORE_WASM_LOCAL_CAPACITY: usize = 32;
-const CORE_WASM_CALL_STACK_CAPACITY: usize = 8;
-const CORE_WASM_CONTROL_STACK_CAPACITY: usize = 16;
-const CORE_WASM_CONTROL_TARGET_CAPACITY: usize = 56;
+const CORE_WASM_CALL_STACK_CAPACITY: usize = 16;
+const CORE_WASM_CONTROL_STACK_CAPACITY: usize = 128;
+const CORE_WASM_CONTROL_TARGET_CAPACITY: usize = 192;
 const CORE_WASM_BR_TABLE_CAPACITY: usize = 8;
 const CORE_WASIP1_PATH_CAPACITY: usize = 64;
-const CORE_WASM_TABLE_CAPACITY: usize = 48;
+const CORE_WASM_TABLE_CAPACITY: usize = 64;
 const CORE_WASM_MAX_ELEMENT_SEGMENTS: usize = 8;
 const CORE_WASM_PAGE_SIZE: usize = 64 * 1024;
-const CORE_WASM_MAX_MEMORY_PAGES: u32 = 1;
-const CORE_WASM_MEMORY_SIZE: usize = CORE_WASM_PAGE_SIZE * CORE_WASM_MAX_MEMORY_PAGES as usize;
 #[cfg(any(test, target_arch = "arm"))]
 const CORE1_VM_OBJECT_BUDGET_BYTES: usize = 96 * 1024;
 const WASIP1_EVENTTYPE_CLOCK: u8 = 0;
@@ -248,8 +246,90 @@ pub const WASIP1_FDSTAT_FILETYPE_OFFSET: u32 = 0;
 pub const WASIP1_FDSTAT_FLAGS_OFFSET: u32 = 2;
 pub const WASIP1_FDSTAT_RIGHTS_BASE_OFFSET: u32 = 8;
 pub const WASIP1_FDSTAT_RIGHTS_INHERITING_OFFSET: u32 = 16;
+const WASIP1_PRESTAT_SIZE: usize = 8;
+const WASIP1_PRESTAT_TAG_DIR: u8 = 0;
+const WASIP1_PRESTAT_DIR_NAME_LEN_OFFSET: usize = 4;
+const WASIP1_FILESTAT_SIZE: usize = 64;
+const WASIP1_FILESTAT_FILETYPE_OFFSET: usize = 16;
+const WASIP1_FILESTAT_NLINK_OFFSET: usize = 24;
+const WASIP1_FILESTAT_SIZE_OFFSET: usize = 32;
 
-type LinearMemory = [u8; CORE_WASM_MEMORY_SIZE];
+pub const GUEST_MEMORY_PAGE_SIZE: usize = CORE_WASM_PAGE_SIZE;
+pub const DEFAULT_GUEST_MEMORY_BYTES: usize = CORE_WASM_PAGE_SIZE;
+
+pub struct GuestMemory<'a> {
+    ptr: core::ptr::NonNull<u8>,
+    len: usize,
+    committed_pages: u32,
+    _borrow: core::marker::PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> GuestMemory<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        // Slice pointers are non-null, including the dangling pointer for empty slices.
+        let ptr = unsafe { core::ptr::NonNull::new_unchecked(bytes.as_mut_ptr()) };
+        Self {
+            ptr,
+            len: bytes.len(),
+            committed_pages: 0,
+            _borrow: core::marker::PhantomData,
+        }
+    }
+
+    pub const fn committed_pages(&self) -> u32 {
+        self.committed_pages
+    }
+
+    pub fn capacity_pages(&self) -> u32 {
+        let pages = self.len / CORE_WASM_PAGE_SIZE;
+        pages.min(u32::MAX as usize) as u32
+    }
+
+    pub const fn capacity_bytes(&self) -> usize {
+        self.len
+    }
+
+    pub(super) fn committed_len(&self) -> Result<usize, WasmError> {
+        (self.committed_pages as usize)
+            .checked_mul(CORE_WASM_PAGE_SIZE)
+            .ok_or(WasmError::Truncated)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.as_mut_slice().fill(0);
+        self.committed_pages = 0;
+    }
+
+    pub(super) fn commit_pages(&mut self, pages: u32) -> Result<(), WasmError> {
+        if pages > self.capacity_pages() {
+            return Err(WasmError::Truncated);
+        }
+        self.committed_pages = pages;
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl core::ops::Deref for GuestMemory<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl core::ops::DerefMut for GuestMemory<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WasmError {
@@ -443,16 +523,374 @@ pub(super) enum HostImport {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MemoryGrowOutcome {
-    Grown { new_pages: u32 },
-    Rejected,
+pub(super) enum Wasip1Row {
+    FdWrite,
+    FdRead,
+    FdFdstatGet,
+    FdPrestatGet,
+    FdPrestatDirName,
+    FdFilestatGet,
+    FdClose,
+    FdReaddir,
+    ClockResGet,
+    ClockTimeGet,
+    PollOneoff,
+    RandomGet,
+    PathOpen,
+    PathFilestatGet,
+    ArgsSizesGet,
+    ArgsGet,
+    EnvironSizesGet,
+    EnvironGet,
+    ProcExit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportSignatureId {
+    FdWrite,
+    FdRead,
+    FdFdstatGet,
+    FdPrestatGet,
+    FdPrestatDirName,
+    FdFilestatGet,
+    FdClose,
+    FdReaddir,
+    ClockResGet,
+    ClockTimeGet,
+    PollOneoff,
+    RandomGet,
+    PathOpen,
+    PathFilestatGet,
+    ArgsSizesGet,
+    ArgsGet,
+    EnvironSizesGet,
+    EnvironGet,
+    ProcExit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImportPlanEntry {
+    row: Wasip1Row,
+    signature: ImportSignatureId,
+}
+
+impl ImportPlanEntry {
+    const fn new(row: Wasip1Row, signature: ImportSignatureId) -> Self {
+        Self { row, signature }
+    }
+
+    const fn row(self) -> Wasip1Row {
+        self.row
+    }
+
+    const fn signature(self) -> ImportSignatureId {
+        self.signature
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportPlanDiagnostics {
+    import_count: u16,
+}
+
+impl ImportPlanDiagnostics {
+    pub const fn import_count(self) -> u16 {
+        self.import_count
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ImportPlan {
+    entries: [Option<ImportPlanEntry>; CORE_WASM_MAX_IMPORTS],
+    import_count: u16,
+}
+
+impl ImportPlan {
+    const fn empty() -> Self {
+        Self {
+            entries: [None; CORE_WASM_MAX_IMPORTS],
+            import_count: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        function_index: usize,
+        row: Wasip1Row,
+        ty: FuncType,
+    ) -> Result<(), WasmError> {
+        let signature = row.validate_signature(ty)?;
+        let Some(slot) = self.entries.get_mut(function_index) else {
+            return Err(unsupported!("too many core wasm imports"));
+        };
+        *slot = Some(ImportPlanEntry::new(row, signature));
+        self.import_count = self
+            .import_count
+            .checked_add(1)
+            .ok_or(unsupported!("too many core wasm imports"))?;
+        Ok(())
+    }
+
+    fn entry(&self, function_index: u32) -> Result<ImportPlanEntry, WasmError> {
+        self.entries
+            .get(function_index as usize)
+            .copied()
+            .flatten()
+            .ok_or(invalid!("missing import plan row"))
+    }
+
+    const fn diagnostics(&self) -> ImportPlanDiagnostics {
+        ImportPlanDiagnostics {
+            import_count: self.import_count,
+        }
+    }
+}
+
+impl Wasip1Row {
+    const fn from_import(name: Wasip1ImportName) -> Option<Self> {
+        match name {
+            Wasip1ImportName::FdWrite => Some(Self::FdWrite),
+            Wasip1ImportName::FdRead => Some(Self::FdRead),
+            Wasip1ImportName::FdFdstatGet => Some(Self::FdFdstatGet),
+            Wasip1ImportName::FdPrestatGet => Some(Self::FdPrestatGet),
+            Wasip1ImportName::FdPrestatDirName => Some(Self::FdPrestatDirName),
+            Wasip1ImportName::FdFilestatGet => Some(Self::FdFilestatGet),
+            Wasip1ImportName::FdClose => Some(Self::FdClose),
+            Wasip1ImportName::FdReaddir => Some(Self::FdReaddir),
+            Wasip1ImportName::ClockResGet => Some(Self::ClockResGet),
+            Wasip1ImportName::ClockTimeGet => Some(Self::ClockTimeGet),
+            Wasip1ImportName::PollOneoff => Some(Self::PollOneoff),
+            Wasip1ImportName::RandomGet => Some(Self::RandomGet),
+            Wasip1ImportName::PathOpen => Some(Self::PathOpen),
+            Wasip1ImportName::PathFilestatGet => Some(Self::PathFilestatGet),
+            Wasip1ImportName::ArgsSizesGet => Some(Self::ArgsSizesGet),
+            Wasip1ImportName::ArgsGet => Some(Self::ArgsGet),
+            Wasip1ImportName::EnvironSizesGet => Some(Self::EnvironSizesGet),
+            Wasip1ImportName::EnvironGet => Some(Self::EnvironGet),
+            Wasip1ImportName::ProcExit => Some(Self::ProcExit),
+            _ => None,
+        }
+    }
+
+    fn validate_signature(self, ty: FuncType) -> Result<ImportSignatureId, WasmError> {
+        match self {
+            Self::FdWrite => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                    ],
+                    1,
+                    diagnostic!("fd_write import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::FdWrite)
+            }
+            Self::FdRead => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                    ],
+                    1,
+                    diagnostic!("fd_read import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::FdRead)
+            }
+            Self::FdFdstatGet => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32, ValueKind::I32],
+                    1,
+                    diagnostic!("fd_fdstat_get import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::FdFdstatGet)
+            }
+            Self::FdPrestatGet => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32, ValueKind::I32],
+                    1,
+                    diagnostic!("fd_prestat_get import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::FdPrestatGet)
+            }
+            Self::FdPrestatDirName => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32, ValueKind::I32, ValueKind::I32],
+                    1,
+                    diagnostic!("fd_prestat_dir_name import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::FdPrestatDirName)
+            }
+            Self::FdFilestatGet => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32, ValueKind::I32],
+                    1,
+                    diagnostic!("fd_filestat_get import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::FdFilestatGet)
+            }
+            Self::FdClose => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32],
+                    1,
+                    diagnostic!("fd_close import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::FdClose)
+            }
+            Self::FdReaddir => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I64,
+                        ValueKind::I32,
+                    ],
+                    1,
+                    diagnostic!("fd_readdir import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::FdReaddir)
+            }
+            Self::ClockResGet => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32, ValueKind::I32],
+                    1,
+                    diagnostic!("clock_res_get import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::ClockResGet)
+            }
+            Self::ClockTimeGet => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32, ValueKind::I64, ValueKind::I32],
+                    1,
+                    diagnostic!("clock_time_get import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::ClockTimeGet)
+            }
+            Self::PollOneoff => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                    ],
+                    1,
+                    diagnostic!("poll_oneoff import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::PollOneoff)
+            }
+            Self::RandomGet => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32, ValueKind::I32],
+                    1,
+                    diagnostic!("random_get import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::RandomGet)
+            }
+            Self::PathOpen => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I64,
+                        ValueKind::I64,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                    ],
+                    1,
+                    diagnostic!("path_open import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::PathOpen)
+            }
+            Self::PathFilestatGet => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                        ValueKind::I32,
+                    ],
+                    1,
+                    diagnostic!("path_filestat_get import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::PathFilestatGet)
+            }
+            Self::ArgsSizesGet => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32, ValueKind::I32],
+                    1,
+                    diagnostic!("args_sizes_get import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::ArgsSizesGet)
+            }
+            Self::ArgsGet => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32, ValueKind::I32],
+                    1,
+                    diagnostic!("args_get import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::ArgsGet)
+            }
+            Self::EnvironSizesGet => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32, ValueKind::I32],
+                    1,
+                    diagnostic!("environ_sizes_get import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::EnvironSizesGet)
+            }
+            Self::EnvironGet => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32, ValueKind::I32],
+                    1,
+                    diagnostic!("environ_get import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::EnvironGet)
+            }
+            Self::ProcExit => {
+                Interpreter::expect_import_signature(
+                    ty,
+                    &[ValueKind::I32],
+                    0,
+                    diagnostic!("proc_exit import signature mismatch"),
+                )?;
+                Ok(ImportSignatureId::ProcExit)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MemoryGrowEvent {
     pub(super) previous_pages: u32,
     pub(super) requested_pages: u32,
-    pub(super) outcome: MemoryGrowOutcome,
+    pub(super) max_pages: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,12 +905,16 @@ pub(super) enum VmEvent {
     FdWrite(FdWriteCall),
     FdRead(FdReadCall),
     FdFdstatGet(FdRequestCall),
+    FdPrestatGet(FdRequestCall),
+    FdPrestatDirName(FdPrestatDirNameCall),
+    FdFilestatGet(FdRequestCall),
     FdClose(FdRequestCall),
     ClockResGet(ClockResGetCall),
     ClockTimeGet(ClockTimeGetCall),
     PollOneoff(PollOneoffCall),
     RandomGet(RandomGetCall),
     PathOpen(PathOpenCall),
+    PathFilestatGet(PathFilestatGetCall),
     FdReaddir(FdReaddirCall),
     ArgsSizesGet(ArgsSizesGetCall),
     ArgsGet(ArgsGetCall),
@@ -489,6 +931,9 @@ enum PendingWasip1Call {
     FdWrite(FdWriteCall),
     FdRead(FdReadCall),
     FdFdstatGet(FdRequestCall),
+    FdPrestatGet(FdRequestCall),
+    FdPrestatDirName(FdPrestatDirNameCall),
+    FdFilestatGet(FdRequestCall),
     FdClose(FdRequestCall),
     FdReaddir(FdReaddirCall),
     ClockResGet(ClockResGetCall),
@@ -496,6 +941,7 @@ enum PendingWasip1Call {
     PollOneoff(PollOneoffCall),
     RandomGet(RandomGetCall),
     PathOpen(PathOpenCall),
+    PathFilestatGet(PathFilestatGetCall),
     ArgsSizesGet(ArgsSizesGetCall),
     ArgsGet(ArgsGetCall),
     EnvironSizesGet(EnvironSizesGetCall),
@@ -516,6 +962,9 @@ impl PendingWasip1Call {
             Self::FdWrite(call) => VmEvent::FdWrite(call),
             Self::FdRead(call) => VmEvent::FdRead(call),
             Self::FdFdstatGet(call) => VmEvent::FdFdstatGet(call),
+            Self::FdPrestatGet(call) => VmEvent::FdPrestatGet(call),
+            Self::FdPrestatDirName(call) => VmEvent::FdPrestatDirName(call),
+            Self::FdFilestatGet(call) => VmEvent::FdFilestatGet(call),
             Self::FdClose(call) => VmEvent::FdClose(call),
             Self::FdReaddir(call) => VmEvent::FdReaddir(call),
             Self::ClockResGet(call) => VmEvent::ClockResGet(call),
@@ -523,6 +972,7 @@ impl PendingWasip1Call {
             Self::PollOneoff(call) => VmEvent::PollOneoff(call),
             Self::RandomGet(call) => VmEvent::RandomGet(call),
             Self::PathOpen(call) => VmEvent::PathOpen(call),
+            Self::PathFilestatGet(call) => VmEvent::PathFilestatGet(call),
             Self::ArgsSizesGet(call) => VmEvent::ArgsSizesGet(call),
             Self::ArgsGet(call) => VmEvent::ArgsGet(call),
             Self::EnvironSizesGet(call) => VmEvent::EnvironSizesGet(call),
@@ -552,6 +1002,25 @@ impl PathOpenCall {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PathFilestatGetCall {
+    fd: u8,
+    flags: u32,
+    path_ptr: u32,
+    path_len: u32,
+    stat_ptr: u32,
+}
+
+impl PathFilestatGetCall {
+    pub(super) const fn fd(self) -> u8 {
+        self.fd
+    }
+
+    pub(super) const fn flags(self) -> u32 {
+        self.flags
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FdReaddirCall {
     fd: u8,
     buf: u32,
@@ -571,6 +1040,23 @@ impl FdReaddirCall {
 
     pub(super) const fn max_len(self) -> usize {
         self.buf_len as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FdPrestatDirNameCall {
+    fd: u8,
+    path_ptr: u32,
+    path_len: u32,
+}
+
+impl FdPrestatDirNameCall {
+    pub(super) const fn fd(self) -> u8 {
+        self.fd
+    }
+
+    pub(super) const fn max_len(self) -> usize {
+        self.path_len as usize
     }
 }
 
@@ -618,6 +1104,26 @@ impl FdStat {
 
     pub const fn rights_inheriting(self) -> u64 {
         self.rights_inheriting
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStat {
+    filetype: u8,
+    size: u64,
+}
+
+impl FileStat {
+    pub const fn new(filetype: u8, size: u64) -> Self {
+        Self { filetype, size }
+    }
+
+    pub const fn filetype(self) -> u8 {
+        self.filetype
+    }
+
+    pub const fn size(self) -> u64 {
+        self.size
     }
 }
 
@@ -912,7 +1418,7 @@ struct Frame<'a> {
     locals: [Value; CORE_WASM_LOCAL_CAPACITY],
     local_kinds: [ValueKind; CORE_WASM_LOCAL_CAPACITY],
     local_count: usize,
-    controls: [ControlFrame; CORE_WASM_CONTROL_STACK_CAPACITY],
+    control_base: usize,
     control_len: usize,
 }
 
@@ -924,15 +1430,7 @@ impl<'a> Frame<'a> {
             locals: [Value::I32(0); CORE_WASM_LOCAL_CAPACITY],
             local_kinds: [ValueKind::I32; CORE_WASM_LOCAL_CAPACITY],
             local_count: 0,
-            controls: [ControlFrame {
-                kind: ControlKind::Block,
-                start_pos: 0,
-                else_pos: usize::MAX,
-                end_pos: 0,
-                result_count: 0,
-                result_kind: ValueKind::I32,
-                stack_height: 0,
-            }; CORE_WASM_CONTROL_STACK_CAPACITY],
+            control_base: 0,
             control_len: 0,
         }
     }
@@ -952,6 +1450,7 @@ pub(super) struct Module<'a> {
     type_count: usize,
     imports: [Option<Import<'a>>; CORE_WASM_MAX_IMPORTS],
     import_type_indices: [u32; CORE_WASM_MAX_IMPORTS],
+    import_plan: ImportPlan,
     import_count: usize,
     function_type_indices: [u32; CORE_WASM_MAX_FUNCTIONS],
     function_count: usize,
@@ -978,12 +1477,13 @@ pub(super) struct Interpreter<'a> {
     global_kinds: [ValueKind; CORE_WASM_MAX_GLOBALS],
     global_mutable: [bool; CORE_WASM_MAX_GLOBALS],
     global_count: usize,
-    memory: LinearMemory,
-    memory_pages: u32,
+    memory: GuestMemory<'a>,
     data_dropped: [bool; WASM_MAX_DATA_SEGMENTS],
     element_dropped: [bool; CORE_WASM_MAX_ELEMENT_SEGMENTS],
     table_functions: [u32; CORE_WASM_TABLE_CAPACITY],
     table_size: usize,
+    controls: [ControlFrame; CORE_WASM_CONTROL_STACK_CAPACITY],
+    control_len: usize,
     control_targets: [CoreControlTarget; CORE_WASM_CONTROL_TARGET_CAPACITY],
     control_target_count: usize,
     pending: Option<PendingExecution>,
@@ -1032,12 +1532,60 @@ enum ControlKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ControlFrame {
     kind: ControlKind,
-    start_pos: usize,
-    else_pos: usize,
-    end_pos: usize,
-    result_count: usize,
     result_kind: ValueKind,
-    stack_height: usize,
+    result_count: u8,
+    stack_height: u8,
+    start_pos: u16,
+    end_pos: u16,
+}
+
+impl ControlFrame {
+    const EMPTY: Self = Self {
+        kind: ControlKind::Block,
+        result_kind: ValueKind::I32,
+        stack_height: 0,
+        result_count: 0,
+        start_pos: 0,
+        end_pos: 0,
+    };
+
+    fn new(
+        kind: ControlKind,
+        start_pos: usize,
+        end_pos: usize,
+        result_count: usize,
+        result_kind: ValueKind,
+        stack_height: usize,
+    ) -> Result<Self, WasmError> {
+        Ok(Self {
+            kind,
+            result_kind,
+            result_count: u8::try_from(result_count)
+                .map_err(|_| unsupported!("core control result count too large"))?,
+            stack_height: u8::try_from(stack_height)
+                .map_err(|_| unsupported!("core value stack too deep"))?,
+            start_pos: u16::try_from(start_pos)
+                .map_err(|_| unsupported!("core wasm body too large"))?,
+            end_pos: u16::try_from(end_pos)
+                .map_err(|_| unsupported!("core wasm body too large"))?,
+        })
+    }
+
+    const fn result_count(self) -> usize {
+        self.result_count as usize
+    }
+
+    const fn stack_height(self) -> usize {
+        self.stack_height as usize
+    }
+
+    const fn start_pos(self) -> usize {
+        self.start_pos as usize
+    }
+
+    const fn end_next_pos(self) -> usize {
+        self.end_pos as usize + 1
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1162,6 +1710,7 @@ impl<'a> Module<'a> {
             type_count: 0,
             imports: [None; CORE_WASM_MAX_IMPORTS],
             import_type_indices: [0; CORE_WASM_MAX_IMPORTS],
+            import_plan: ImportPlan::empty(),
             import_count: 0,
             function_type_indices: [0; CORE_WASM_MAX_FUNCTIONS],
             function_count: 0,
@@ -1293,7 +1842,11 @@ impl<'a> Module<'a> {
                 return Err(unsupported!("core wasm only supports function imports"));
             }
             let type_index = section.read_var_u32()?;
-            self.core_func_type(type_index)?;
+            let ty = self.core_func_type(type_index)?;
+            let HostImport::Wasip1(name) = host;
+            let row = Wasip1Row::from_import(name)
+                .ok_or(WasmError::Unsupported(UNSUPPORTED_WASIP1_IMPORT))?;
+            self.import_plan.push(index, row, ty)?;
             self.imports[index] = Some(Import {
                 function_index: index as u32,
                 host,
@@ -1448,10 +2001,10 @@ impl<'a> Module<'a> {
         let max = if flags & 0x01 != 0 {
             section.read_var_u32()?
         } else {
-            CORE_WASM_MAX_MEMORY_PAGES
+            u32::MAX
         };
-        if min > max || max > CORE_WASM_MAX_MEMORY_PAGES {
-            return Err(unsupported!("core wasm memory exceeds runtime limit"));
+        if min > max {
+            return Err(unsupported!("core wasm memory minimum exceeds maximum"));
         }
         self.memory_min_pages = min;
         self.memory_max_pages = max;
@@ -1646,9 +2199,12 @@ impl<'a> Module<'a> {
 }
 
 impl<'a> Interpreter<'a> {
-    unsafe fn init_from_parsed_module_in_place(dst: *mut Interpreter<'a>) -> Result<(), WasmError> {
+    unsafe fn init_from_parsed_module_in_place(
+        dst: *mut Interpreter<'a>,
+        memory: GuestMemory<'a>,
+    ) -> Result<(), WasmError> {
         let module = unsafe { &*core::ptr::addr_of!((*dst).module) };
-        if module.memory_min_pages > CORE_WASM_MAX_MEMORY_PAGES {
+        if module.memory_min_pages > memory.capacity_pages() {
             return Err(unsupported!("core wasm memory too large"));
         }
         let memory_min_pages = module.memory_min_pages;
@@ -1656,7 +2212,10 @@ impl<'a> Interpreter<'a> {
         let table_size = module.table_min.max(module.table_function_count);
         let start_function_index = module.start_function_index;
         unsafe {
-            core::ptr::addr_of_mut!((*dst).memory_pages).write(memory_min_pages);
+            core::ptr::addr_of_mut!((*dst).memory).write(memory);
+            let memory = &mut *core::ptr::addr_of_mut!((*dst).memory);
+            memory.clear();
+            memory.commit_pages(memory_min_pages)?;
             write_empty_frames(core::ptr::addr_of_mut!((*dst).frames));
             core::ptr::addr_of_mut!((*dst).frame_len).write(0);
             core::ptr::addr_of_mut!((*dst).values)
@@ -1667,13 +2226,15 @@ impl<'a> Interpreter<'a> {
                 .write([ValueKind::I32; CORE_WASM_MAX_GLOBALS]);
             core::ptr::addr_of_mut!((*dst).global_mutable).write([false; CORE_WASM_MAX_GLOBALS]);
             core::ptr::addr_of_mut!((*dst).global_count).write(global_count);
-            core::ptr::addr_of_mut!((*dst).memory).write_bytes(0, 1);
             core::ptr::addr_of_mut!((*dst).data_dropped).write([false; WASM_MAX_DATA_SEGMENTS]);
             core::ptr::addr_of_mut!((*dst).element_dropped)
                 .write([false; CORE_WASM_MAX_ELEMENT_SEGMENTS]);
             core::ptr::addr_of_mut!((*dst).table_functions)
                 .write([u32::MAX; CORE_WASM_TABLE_CAPACITY]);
             core::ptr::addr_of_mut!((*dst).table_size).write(table_size);
+            core::ptr::addr_of_mut!((*dst).controls)
+                .write([ControlFrame::EMPTY; CORE_WASM_CONTROL_STACK_CAPACITY]);
+            core::ptr::addr_of_mut!((*dst).control_len).write(0);
             core::ptr::addr_of_mut!((*dst).control_targets)
                 .write([CoreControlTarget::EMPTY; CORE_WASM_CONTROL_TARGET_CAPACITY]);
             core::ptr::addr_of_mut!((*dst).control_target_count).write(0);
@@ -1942,10 +2503,14 @@ impl<'a> Interpreter<'a> {
     }
 
     #[cfg(test)]
-    unsafe fn init_in_place(dst: *mut Self, module: &'a [u8]) -> Result<(), WasmError> {
+    unsafe fn init_in_place(
+        dst: *mut Self,
+        module: &'a [u8],
+        memory: GuestMemory<'a>,
+    ) -> Result<(), WasmError> {
         unsafe {
             Module::parse_in_place(core::ptr::addr_of_mut!((*dst).module), module)?;
-            Self::init_from_parsed_module_in_place(dst)?;
+            Self::init_from_parsed_module_in_place(dst, memory)?;
         }
         Ok(())
     }
@@ -2029,15 +2594,14 @@ impl<'a> Interpreter<'a> {
                     _ => ControlKind::Block,
                 };
                 let stack_height = self.value_len;
-                self.push_core_control(ControlFrame {
+                self.push_core_control(ControlFrame::new(
                     kind,
                     start_pos,
-                    else_pos: usize::MAX,
                     end_pos,
-                    result_count: target.result_count,
-                    result_kind: target.result_kind,
+                    target.result_count,
+                    target.result_kind,
                     stack_height,
-                })?;
+                )?)?;
             }
             Instr::If(target) => {
                 let condition = self.pop_core_i32()?;
@@ -2047,25 +2611,23 @@ impl<'a> Interpreter<'a> {
                 let end_pos = target.end()?;
                 let stack_height = self.value_len;
                 if condition != 0 {
-                    self.push_core_control(ControlFrame {
-                        kind: ControlKind::If,
+                    self.push_core_control(ControlFrame::new(
+                        ControlKind::If,
                         start_pos,
-                        else_pos,
                         end_pos,
-                        result_count: target.result_count,
-                        result_kind: target.result_kind,
+                        target.result_count,
+                        target.result_kind,
                         stack_height,
-                    })?;
+                    )?)?;
                 } else if else_pos != usize::MAX {
-                    self.push_core_control(ControlFrame {
-                        kind: ControlKind::If,
-                        start_pos: else_pos.saturating_add(1),
-                        else_pos,
+                    self.push_core_control(ControlFrame::new(
+                        ControlKind::If,
+                        else_pos.saturating_add(1),
                         end_pos,
-                        result_count: target.result_count,
-                        result_kind: target.result_kind,
+                        target.result_count,
+                        target.result_kind,
                         stack_height,
-                    })?;
+                    )?)?;
                     self.current_frame_mut()?.pc = else_pos.saturating_add(1);
                 } else if target.result_count == 0 {
                     self.current_frame_mut()?.pc = end_pos.saturating_add(1);
@@ -2079,7 +2641,7 @@ impl<'a> Interpreter<'a> {
                     return Err(invalid!("else without if"));
                 }
                 self.normalize_core_control_result(control)?;
-                self.current_frame_mut()?.pc = control.end_pos.saturating_add(1);
+                self.current_frame_mut()?.pc = control.end_next_pos();
             }
             Instr::End => {
                 if self.current_frame()?.control_len == 0 {
@@ -2193,37 +2755,21 @@ impl<'a> Interpreter<'a> {
                 if value != 0 {
                     return Err(invalid!("core memory instruction index must be zero"));
                 }
-                self.push_core_value(Value::I32(self.memory_pages))?;
+                self.push_core_value(Value::I32(self.memory.committed_pages()))?;
             }
             OPCODE_MEMORY_GROW => {
                 if value != 0 {
                     return Err(invalid!("core memory instruction index must be zero"));
                 }
                 let requested_pages = self.pop_core_i32()?;
-                let previous_pages = self.memory_pages;
-                let grown_pages = previous_pages
-                    .checked_add(requested_pages)
-                    .and_then(|pages| {
-                        if pages <= self.module.memory_max_pages
-                            && pages <= CORE_WASM_MAX_MEMORY_PAGES
-                        {
-                            Some(pages)
-                        } else {
-                            None
-                        }
-                    });
-                let outcome = if let Some(pages) = grown_pages {
-                    self.memory_pages = pages;
-                    self.push_core_value(Value::I32(previous_pages))?;
-                    MemoryGrowOutcome::Grown { new_pages: pages }
-                } else {
-                    self.push_core_value(Value::I32(u32::MAX))?;
-                    MemoryGrowOutcome::Rejected
-                };
+                let previous_pages = self.memory.committed_pages();
                 let event = MemoryGrowEvent {
                     previous_pages,
                     requested_pages,
-                    outcome,
+                    max_pages: self
+                        .memory
+                        .capacity_pages()
+                        .min(self.module.memory_max_pages),
                 };
                 self.pending = Some(PendingExecution::MemoryGrow(event));
                 return Ok(Some(ExecutionEvent::MemoryGrow(event)));
@@ -2838,18 +3384,48 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
-    pub(super) fn finish_memory_grow_event(&mut self) -> Result<MemoryGrowEvent, WasmError> {
+    pub(super) fn finish_memory_grow_event(
+        &mut self,
+        expected: MemoryGrowEvent,
+        grant: bool,
+    ) -> Result<(), WasmError> {
         let pending = self.pending.take().ok_or(WasmError::PendingRequired)?;
         let PendingExecution::MemoryGrow(event) = pending else {
             self.pending = Some(pending);
             return Err(WasmError::PendingMismatch);
         };
-        Ok(event)
+        if event != expected {
+            self.pending = Some(PendingExecution::MemoryGrow(event));
+            return Err(WasmError::PendingMismatch);
+        }
+        if self.value_len >= CORE_WASM_VALUE_STACK_CAPACITY {
+            self.pending = Some(PendingExecution::MemoryGrow(event));
+            return Err(WasmError::StackOverflow);
+        }
+        if grant {
+            let Some(new_pages) = event.previous_pages.checked_add(event.requested_pages) else {
+                self.pending = Some(PendingExecution::MemoryGrow(event));
+                return Err(WasmError::Truncated);
+            };
+            if new_pages > event.max_pages {
+                self.pending = Some(PendingExecution::MemoryGrow(event));
+                return Err(WasmError::PendingMismatch);
+            }
+            if let Err(error) = self.memory.commit_pages(new_pages) {
+                self.pending = Some(PendingExecution::MemoryGrow(event));
+                return Err(error);
+            }
+            self.values[self.value_len] = Value::I32(event.previous_pages);
+        } else {
+            self.values[self.value_len] = Value::I32(u32::MAX);
+        }
+        self.value_len += 1;
+        Ok(())
     }
 
     #[cfg(test)]
     fn memory_pages(&self) -> u32 {
-        self.memory_pages
+        self.memory.committed_pages()
     }
 
     pub(super) fn read_memory(&self, addr: u32, out: &mut [u8]) -> Result<(), WasmError> {
@@ -2885,6 +3461,16 @@ impl<'a> Interpreter<'a> {
     pub(super) fn write_memory_u32(&mut self, addr: u32, value: u32) -> Result<(), WasmError> {
         let offset = self.core_translate_addr(addr)?;
         self.core_write_u32(offset, value)
+    }
+
+    pub(super) fn write_filestat(&mut self, addr: u32, stat: FileStat) -> Result<(), WasmError> {
+        let mut bytes = [0u8; WASIP1_FILESTAT_SIZE];
+        bytes[WASIP1_FILESTAT_FILETYPE_OFFSET] = stat.filetype();
+        bytes[WASIP1_FILESTAT_NLINK_OFFSET..WASIP1_FILESTAT_NLINK_OFFSET + 8]
+            .copy_from_slice(&(1u64).to_le_bytes());
+        bytes[WASIP1_FILESTAT_SIZE_OFFSET..WASIP1_FILESTAT_SIZE_OFFSET + 8]
+            .copy_from_slice(&stat.size().to_le_bytes());
+        self.write_memory(addr, &bytes)
     }
 
     fn init_core_data_segments(&mut self) -> Result<(), WasmError> {
@@ -2929,6 +3515,7 @@ impl<'a> Interpreter<'a> {
         }
         self.value_len = arg_start;
         {
+            let control_base = self.control_len;
             let slot = self
                 .frames
                 .get_mut(self.frame_len)
@@ -2937,6 +3524,8 @@ impl<'a> Interpreter<'a> {
             slot.code = body.code;
             slot.local_count = body.local_count;
             slot.local_kinds = body.local_kinds;
+            slot.control_base = control_base;
+            slot.control_len = 0;
 
             for index in 0..ty.param_count {
                 slot.locals[index] = self.values[arg_start + index];
@@ -2954,9 +3543,12 @@ impl<'a> Interpreter<'a> {
         if self.frame_len == 0 {
             return Err(WasmError::StackUnderflow);
         }
+        let control_base = self.frames[self.frame_len - 1].control_base;
+        self.control_len = control_base;
         self.frame_len -= 1;
         if self.frame_len == 0 {
             self.done = true;
+            self.control_len = 0;
             self.control_target_count = 0;
         } else {
             self.decode_current_frame_control_targets()?;
@@ -2989,24 +3581,9 @@ impl<'a> Interpreter<'a> {
         Ok(fd as u8)
     }
 
-    fn begin_wasip1_import(
-        &mut self,
-        name: Wasip1ImportName,
-        ty: FuncType,
-    ) -> Result<PendingWasip1Call, WasmError> {
-        match name {
-            Wasip1ImportName::FdWrite => {
-                Self::expect_import_signature(
-                    ty,
-                    &[
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I32,
-                    ],
-                    1,
-                    diagnostic!("fd_write import signature mismatch"),
-                )?;
+    fn begin_wasip1_import(&mut self, row: Wasip1Row) -> Result<PendingWasip1Call, WasmError> {
+        match row {
+            Wasip1Row::FdWrite => {
                 let nwritten = self.pop_core_i32()?;
                 let iovs_len = self.pop_core_i32()?;
                 let iovs = self.pop_core_i32()?;
@@ -3018,18 +3595,7 @@ impl<'a> Interpreter<'a> {
                     nwritten,
                 }))
             }
-            Wasip1ImportName::FdRead => {
-                Self::expect_import_signature(
-                    ty,
-                    &[
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I32,
-                    ],
-                    1,
-                    diagnostic!("fd_read import signature mismatch"),
-                )?;
+            Wasip1Row::FdRead => {
                 let nread = self.pop_core_i32()?;
                 let iovs_len = self.pop_core_i32()?;
                 let iovs = self.pop_core_i32()?;
@@ -3041,13 +3607,7 @@ impl<'a> Interpreter<'a> {
                     nread,
                 }))
             }
-            Wasip1ImportName::FdFdstatGet => {
-                Self::expect_import_signature(
-                    ty,
-                    &[ValueKind::I32, ValueKind::I32],
-                    1,
-                    diagnostic!("fd_fdstat_get import signature mismatch"),
-                )?;
+            Wasip1Row::FdFdstatGet => {
                 let out_ptr = self.pop_core_i32()?;
                 let fd = self.pop_import_fd()?;
                 Ok(PendingWasip1Call::FdFdstatGet(FdRequestCall {
@@ -3055,29 +3615,37 @@ impl<'a> Interpreter<'a> {
                     out_ptr,
                 }))
             }
-            Wasip1ImportName::FdClose => {
-                Self::expect_import_signature(
-                    ty,
-                    &[ValueKind::I32],
-                    1,
-                    diagnostic!("fd_close import signature mismatch"),
-                )?;
+            Wasip1Row::FdPrestatGet => {
+                let out_ptr = self.pop_core_i32()?;
+                let fd = self.pop_import_fd()?;
+                Ok(PendingWasip1Call::FdPrestatGet(FdRequestCall {
+                    fd,
+                    out_ptr,
+                }))
+            }
+            Wasip1Row::FdPrestatDirName => {
+                let path_len = self.pop_core_i32()?;
+                let path_ptr = self.pop_core_i32()?;
+                let fd = self.pop_import_fd()?;
+                Ok(PendingWasip1Call::FdPrestatDirName(FdPrestatDirNameCall {
+                    fd,
+                    path_ptr,
+                    path_len,
+                }))
+            }
+            Wasip1Row::FdFilestatGet => {
+                let out_ptr = self.pop_core_i32()?;
+                let fd = self.pop_import_fd()?;
+                Ok(PendingWasip1Call::FdFilestatGet(FdRequestCall {
+                    fd,
+                    out_ptr,
+                }))
+            }
+            Wasip1Row::FdClose => {
                 let fd = self.pop_import_fd()?;
                 Ok(PendingWasip1Call::FdClose(FdRequestCall { fd, out_ptr: 0 }))
             }
-            Wasip1ImportName::FdReaddir => {
-                Self::expect_import_signature(
-                    ty,
-                    &[
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I64,
-                        ValueKind::I32,
-                    ],
-                    1,
-                    diagnostic!("fd_readdir import signature mismatch"),
-                )?;
+            Wasip1Row::FdReaddir => {
                 let bufused = self.pop_core_i32()?;
                 let cookie = self.pop_core_i64()?;
                 let buf_len = self.pop_core_i32()?;
@@ -3091,13 +3659,7 @@ impl<'a> Interpreter<'a> {
                     bufused,
                 }))
             }
-            Wasip1ImportName::ClockResGet => {
-                Self::expect_import_signature(
-                    ty,
-                    &[ValueKind::I32, ValueKind::I32],
-                    1,
-                    diagnostic!("clock_res_get import signature mismatch"),
-                )?;
+            Wasip1Row::ClockResGet => {
                 let resolution_ptr = self.pop_core_i32()?;
                 let clock_id = self.pop_core_i32()?;
                 Ok(PendingWasip1Call::ClockResGet(ClockResGetCall {
@@ -3105,13 +3667,7 @@ impl<'a> Interpreter<'a> {
                     resolution_ptr,
                 }))
             }
-            Wasip1ImportName::ClockTimeGet => {
-                Self::expect_import_signature(
-                    ty,
-                    &[ValueKind::I32, ValueKind::I64, ValueKind::I32],
-                    1,
-                    diagnostic!("clock_time_get import signature mismatch"),
-                )?;
+            Wasip1Row::ClockTimeGet => {
                 let time_ptr = self.pop_core_i32()?;
                 let precision = self.pop_core_i64()?;
                 let clock_id = self.pop_core_i32()?;
@@ -3121,18 +3677,7 @@ impl<'a> Interpreter<'a> {
                     time_ptr,
                 }))
             }
-            Wasip1ImportName::PollOneoff => {
-                Self::expect_import_signature(
-                    ty,
-                    &[
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I32,
-                    ],
-                    1,
-                    diagnostic!("poll_oneoff import signature mismatch"),
-                )?;
+            Wasip1Row::PollOneoff => {
                 let nevents = self.pop_core_i32()?;
                 let nsubscriptions = self.pop_core_i32()?;
                 let out_ptr = self.pop_core_i32()?;
@@ -3144,38 +3689,16 @@ impl<'a> Interpreter<'a> {
                     nevents,
                 }))
             }
-            Wasip1ImportName::RandomGet => {
-                Self::expect_import_signature(
-                    ty,
-                    &[ValueKind::I32, ValueKind::I32],
-                    1,
-                    diagnostic!("random_get import signature mismatch"),
-                )?;
+            Wasip1Row::RandomGet => {
                 let buf_len = self.pop_core_i32()?;
                 let buf = self.pop_core_i32()?;
                 Ok(PendingWasip1Call::RandomGet(RandomGetCall { buf, buf_len }))
             }
-            Wasip1ImportName::PathOpen => {
-                Self::expect_import_signature(
-                    ty,
-                    &[
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I32,
-                        ValueKind::I64,
-                        ValueKind::I64,
-                        ValueKind::I32,
-                        ValueKind::I32,
-                    ],
-                    1,
-                    diagnostic!("path_open import signature mismatch"),
-                )?;
+            Wasip1Row::PathOpen => {
                 let opened_fd_ptr = self.pop_core_i32()?;
                 self.pop_core_i32()?;
-                self.pop_core_i64()?;
-                let rights_base = self.pop_core_i64()?;
+                let rights_inheriting = self.pop_core_i64()?;
+                let rights_base = self.pop_core_i64()? | rights_inheriting;
                 self.pop_core_i32()?;
                 let path_len = self.pop_core_i32()?;
                 let path_ptr = self.pop_core_i32()?;
@@ -3189,13 +3712,21 @@ impl<'a> Interpreter<'a> {
                     opened_fd_ptr,
                 }))
             }
-            Wasip1ImportName::ArgsSizesGet => {
-                Self::expect_import_signature(
-                    ty,
-                    &[ValueKind::I32, ValueKind::I32],
-                    1,
-                    diagnostic!("args_sizes_get import signature mismatch"),
-                )?;
+            Wasip1Row::PathFilestatGet => {
+                let stat_ptr = self.pop_core_i32()?;
+                let path_len = self.pop_core_i32()?;
+                let path_ptr = self.pop_core_i32()?;
+                let flags = self.pop_core_i32()?;
+                let fd = self.pop_import_fd()?;
+                Ok(PendingWasip1Call::PathFilestatGet(PathFilestatGetCall {
+                    fd,
+                    flags,
+                    path_ptr,
+                    path_len,
+                    stat_ptr,
+                }))
+            }
+            Wasip1Row::ArgsSizesGet => {
                 let argv_buf_size_ptr = self.pop_core_i32()?;
                 let argc_ptr = self.pop_core_i32()?;
                 Ok(PendingWasip1Call::ArgsSizesGet(ArgsSizesGetCall {
@@ -3203,24 +3734,12 @@ impl<'a> Interpreter<'a> {
                     argv_buf_size_ptr,
                 }))
             }
-            Wasip1ImportName::ArgsGet => {
-                Self::expect_import_signature(
-                    ty,
-                    &[ValueKind::I32, ValueKind::I32],
-                    1,
-                    diagnostic!("args_get import signature mismatch"),
-                )?;
+            Wasip1Row::ArgsGet => {
                 let argv_buf = self.pop_core_i32()?;
                 let argv = self.pop_core_i32()?;
                 Ok(PendingWasip1Call::ArgsGet(ArgsGetCall { argv, argv_buf }))
             }
-            Wasip1ImportName::EnvironSizesGet => {
-                Self::expect_import_signature(
-                    ty,
-                    &[ValueKind::I32, ValueKind::I32],
-                    1,
-                    diagnostic!("environ_sizes_get import signature mismatch"),
-                )?;
+            Wasip1Row::EnvironSizesGet => {
                 let environ_buf_size_ptr = self.pop_core_i32()?;
                 let environ_count_ptr = self.pop_core_i32()?;
                 Ok(PendingWasip1Call::EnvironSizesGet(EnvironSizesGetCall {
@@ -3228,13 +3747,7 @@ impl<'a> Interpreter<'a> {
                     environ_buf_size_ptr,
                 }))
             }
-            Wasip1ImportName::EnvironGet => {
-                Self::expect_import_signature(
-                    ty,
-                    &[ValueKind::I32, ValueKind::I32],
-                    1,
-                    diagnostic!("environ_get import signature mismatch"),
-                )?;
+            Wasip1Row::EnvironGet => {
                 let environ_buf = self.pop_core_i32()?;
                 let environ = self.pop_core_i32()?;
                 Ok(PendingWasip1Call::EnvironGet(EnvironGetCall {
@@ -3242,53 +3755,43 @@ impl<'a> Interpreter<'a> {
                     environ_buf,
                 }))
             }
-            Wasip1ImportName::ProcExit => {
-                Self::expect_import_signature(
-                    ty,
-                    &[ValueKind::I32],
-                    0,
-                    diagnostic!("proc_exit import signature mismatch"),
-                )?;
+            Wasip1Row::ProcExit => {
                 let code = self.pop_core_i32()?;
                 Ok(PendingWasip1Call::ProcExit(code))
             }
-            _ => Err(WasmError::Unsupported(UNSUPPORTED_WASIP1_IMPORT)),
         }
     }
 
     fn call_core_import(&mut self, function_index: u32) -> Result<ExecutionEvent, WasmError> {
-        let import = self
-            .module
-            .imports
-            .get(function_index as usize)
-            .copied()
-            .flatten()
-            .ok_or(invalid!("missing core import"))?;
-        let ty = self
-            .module
-            .core_func_type(self.module.import_type_indices[function_index as usize])?;
-        let HostImport::Wasip1(name) = import.host;
-        let call = self.begin_wasip1_import(name, ty)?;
+        let entry = self.module.import_plan.entry(function_index)?;
+        #[cfg(debug_assertions)]
+        {
+            let type_index = self.module.import_type_indices[function_index as usize];
+            let signature = entry
+                .row()
+                .validate_signature(self.module.core_func_type(type_index)?)?;
+            debug_assert_eq!(entry.signature(), signature);
+        }
+        let call = self.begin_wasip1_import(entry.row())?;
         self.pending = Some(PendingExecution::Wasip1(call));
         Ok(ExecutionEvent::Wasip1Call)
     }
 
     fn current_frame(&self) -> Result<&Frame<'a>, WasmError> {
-        if self.frame_len == 0 {
-            return Err(WasmError::StackUnderflow);
-        }
-        self.frames
-            .get(self.frame_len - 1)
-            .ok_or(WasmError::StackUnderflow)
+        let index = self.current_frame_index()?;
+        self.frames.get(index).ok_or(WasmError::StackUnderflow)
     }
 
     fn current_frame_mut(&mut self) -> Result<&mut Frame<'a>, WasmError> {
+        let index = self.current_frame_index()?;
+        self.frames.get_mut(index).ok_or(WasmError::StackUnderflow)
+    }
+
+    fn current_frame_index(&self) -> Result<usize, WasmError> {
         if self.frame_len == 0 {
             return Err(WasmError::StackUnderflow);
         }
-        self.frames
-            .get_mut(self.frame_len - 1)
-            .ok_or(WasmError::StackUnderflow)
+        Ok(self.frame_len - 1)
     }
 
     fn current_instr(&mut self) -> Result<Instr, WasmError> {
@@ -3506,65 +4009,99 @@ impl<'a> Interpreter<'a> {
     }
 
     fn push_core_control(&mut self, control: ControlFrame) -> Result<(), WasmError> {
-        let frame = self.current_frame_mut()?;
-        let slot = frame
+        let frame_index = self.current_frame_index()?;
+        let control_base = self.frames[frame_index].control_base;
+        let local_len = self.frames[frame_index].control_len;
+        let pool_index = control_base
+            .checked_add(local_len)
+            .ok_or(WasmError::StackOverflow)?;
+        if pool_index != self.control_len {
+            return Err(invalid!("core control pool out of sync"));
+        }
+        let slot = self
             .controls
-            .get_mut(frame.control_len)
+            .get_mut(pool_index)
             .ok_or(WasmError::StackOverflow)?;
         *slot = control;
-        frame.control_len += 1;
+        self.frames[frame_index].control_len = local_len + 1;
+        self.control_len = pool_index + 1;
         Ok(())
     }
 
     fn pop_core_control(&mut self) -> Result<ControlFrame, WasmError> {
-        let frame = self.current_frame_mut()?;
-        if frame.control_len == 0 {
+        let frame_index = self.current_frame_index()?;
+        let local_len = self.frames[frame_index].control_len;
+        if local_len == 0 {
             return Err(WasmError::StackUnderflow);
         }
-        frame.control_len -= 1;
-        Ok(frame.controls[frame.control_len])
+        let next_local_len = local_len - 1;
+        let pool_index = self.frames[frame_index]
+            .control_base
+            .checked_add(next_local_len)
+            .ok_or(WasmError::StackUnderflow)?;
+        if self.control_len != pool_index + 1 {
+            return Err(invalid!("core control pool out of sync"));
+        }
+        let control = self.controls[pool_index];
+        self.frames[frame_index].control_len = next_local_len;
+        self.control_len = pool_index;
+        Ok(control)
     }
 
     fn normalize_core_control_result(&mut self, control: ControlFrame) -> Result<(), WasmError> {
-        if control.result_count == 0 {
-            self.value_len = self.value_len.min(control.stack_height);
+        if control.result_count() == 0 {
+            self.value_len = self.value_len.min(control.stack_height());
             return Ok(());
         }
         let result = self.pop_core_value()?;
         if result.kind() != control.result_kind {
             return Err(invalid!("core block result type mismatch"));
         }
-        self.value_len = control.stack_height;
+        self.value_len = control.stack_height();
         self.push_core_value(result)
     }
 
     fn core_branch(&mut self, depth: usize) -> Result<(), WasmError> {
-        let frame = self.current_frame()?;
+        let frame_index = self.current_frame_index()?;
+        let frame = self.frames[frame_index];
         let Some(target_index) = frame.control_len.checked_sub(depth.saturating_add(1)) else {
             return Err(invalid!("core branch target out of range"));
         };
-        let control = frame.controls[target_index];
-        if control.result_count != 0 {
+        let pool_index = frame
+            .control_base
+            .checked_add(target_index)
+            .ok_or(invalid!("core branch target out of range"))?;
+        let control = *self
+            .controls
+            .get(..self.control_len)
+            .ok_or(invalid!("core control pool range out of bounds"))?
+            .get(pool_index)
+            .ok_or(invalid!("core branch target out of range"))?;
+        if control.result_count() != 0 {
             let result = self.pop_core_value()?;
             if result.kind() != control.result_kind {
                 return Err(invalid!("core branch result type mismatch"));
             }
-            self.value_len = control.stack_height;
+            self.value_len = control.stack_height();
             self.push_core_value(result)?;
         } else {
-            self.value_len = self.value_len.min(control.stack_height);
+            self.value_len = self.value_len.min(control.stack_height());
         }
-        let frame = self.current_frame_mut()?;
-        match control.kind {
-            ControlKind::Loop => {
-                frame.control_len = target_index + 1;
-                frame.pc = control.start_pos;
-            }
-            ControlKind::Block | ControlKind::If => {
-                frame.control_len = target_index;
-                frame.pc = control.end_pos.saturating_add(1);
-            }
+        let next_local_len = match control.kind {
+            ControlKind::Loop => target_index + 1,
+            ControlKind::Block | ControlKind::If => target_index,
+        };
+        let next_pc = match control.kind {
+            ControlKind::Loop => control.start_pos(),
+            ControlKind::Block | ControlKind::If => control.end_next_pos(),
+        };
+        let control_base = self.frames[frame_index].control_base;
+        {
+            let frame = &mut self.frames[frame_index];
+            frame.control_len = next_local_len;
+            frame.pc = next_pc;
         }
+        self.control_len = control_base + next_local_len;
         Ok(())
     }
 
@@ -3584,9 +4121,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn core_memory_len(&self) -> Result<usize, WasmError> {
-        (self.memory_pages as usize)
-            .checked_mul(CORE_WASM_PAGE_SIZE)
-            .ok_or(WasmError::Truncated)
+        self.memory.committed_len()
     }
 
     fn core_read_u8(&self, offset: usize) -> Result<u8, WasmError> {
@@ -4069,12 +4604,16 @@ fn trunc_f64_to_i64_u(value: f64) -> Result<u64, WasmError> {
 }
 
 impl<'a> Vm<'a> {
-    pub(super) unsafe fn init_in_place(dst: *mut Self, module: &'a [u8]) -> Result<(), WasmError> {
+    pub(super) unsafe fn init_in_place(
+        dst: *mut Self,
+        module: &'a [u8],
+        memory: GuestMemory<'a>,
+    ) -> Result<(), WasmError> {
         unsafe {
             let core = core::ptr::addr_of_mut!((*dst).core);
             let core_module = core::ptr::addr_of_mut!((*core).module);
             Module::parse_in_place(core_module, module)?;
-            Interpreter::init_from_parsed_module_in_place(core)?;
+            Interpreter::init_from_parsed_module_in_place(core, memory)?;
             core::ptr::addr_of_mut!((*dst).done).write(false);
         }
         Ok(())
@@ -4099,8 +4638,16 @@ impl<'a> Vm<'a> {
         }
     }
 
-    pub(super) fn finish_memory_grow_event(&mut self) -> Result<MemoryGrowEvent, WasmError> {
-        self.core.finish_memory_grow_event()
+    pub(super) const fn import_plan_diagnostics(&self) -> ImportPlanDiagnostics {
+        self.core.module.import_plan.diagnostics()
+    }
+
+    pub(super) fn finish_memory_grow_event(
+        &mut self,
+        expected: MemoryGrowEvent,
+        grant: bool,
+    ) -> Result<(), WasmError> {
+        self.core.finish_memory_grow_event(expected, grant)
     }
 
     pub(super) fn finish_fd_close(
@@ -4171,6 +4718,58 @@ impl<'a> Vm<'a> {
                 ..WASIP1_FDSTAT_RIGHTS_INHERITING_OFFSET as usize + 8]
                 .copy_from_slice(&stat.rights_inheriting().to_le_bytes());
             self.core.write_memory(call.out_ptr, &bytes)?;
+        }
+        self.core
+            .finish_matching_host_import(pending, &[Value::I32(errno)])
+    }
+
+    pub(super) fn finish_fd_filestat_get(
+        &mut self,
+        call: FdRequestCall,
+        stat: FileStat,
+        errno: u32,
+    ) -> Result<(), WasmError> {
+        let pending = PendingWasip1Call::FdFilestatGet(call);
+        self.core.require_matching_host_import(pending)?;
+        if errno == 0 {
+            self.core.write_filestat(call.out_ptr, stat)?;
+        }
+        self.core
+            .finish_matching_host_import(pending, &[Value::I32(errno)])
+    }
+
+    pub(super) fn finish_fd_prestat_get(
+        &mut self,
+        call: FdRequestCall,
+        name_len: u32,
+        errno: u32,
+    ) -> Result<(), WasmError> {
+        let pending = PendingWasip1Call::FdPrestatGet(call);
+        self.core.require_matching_host_import(pending)?;
+        if errno == 0 {
+            let mut bytes = [0u8; WASIP1_PRESTAT_SIZE];
+            bytes[0] = WASIP1_PRESTAT_TAG_DIR;
+            bytes[WASIP1_PRESTAT_DIR_NAME_LEN_OFFSET..WASIP1_PRESTAT_DIR_NAME_LEN_OFFSET + 4]
+                .copy_from_slice(&name_len.to_le_bytes());
+            self.core.write_memory(call.out_ptr, &bytes)?;
+        }
+        self.core
+            .finish_matching_host_import(pending, &[Value::I32(errno)])
+    }
+
+    pub(super) fn finish_fd_prestat_dir_name(
+        &mut self,
+        call: FdPrestatDirNameCall,
+        bytes: &[u8],
+        errno: u32,
+    ) -> Result<(), WasmError> {
+        let pending = PendingWasip1Call::FdPrestatDirName(call);
+        self.core.require_matching_host_import(pending)?;
+        if errno == 0 {
+            if bytes.len() > call.path_len as usize {
+                return Err(unsupported!("fd_prestat_dir_name reply exceeds buffer"));
+            }
+            self.core.write_memory(call.path_ptr, bytes)?;
         }
         self.core
             .finish_matching_host_import(pending, &[Value::I32(errno)])
@@ -4271,6 +4870,23 @@ impl<'a> Vm<'a> {
         })
     }
 
+    pub(super) fn path_filestat_bytes(
+        &self,
+        call: PathFilestatGetCall,
+    ) -> Result<PathBytes, WasmError> {
+        let ptr = call.path_ptr;
+        let len = call.path_len;
+        if len as usize > CORE_WASIP1_PATH_CAPACITY {
+            return Err(unsupported!("path import path too long"));
+        }
+        let mut bytes = [0u8; CORE_WASIP1_PATH_CAPACITY];
+        self.core.read_memory(ptr, &mut bytes[..len as usize])?;
+        Ok(PathBytes {
+            bytes,
+            len: len as usize,
+        })
+    }
+
     pub(super) fn finish_path_open(
         &mut self,
         call: PathOpenCall,
@@ -4281,6 +4897,21 @@ impl<'a> Vm<'a> {
         self.core.require_matching_host_import(pending)?;
         if errno == 0 {
             self.core.write_memory_u32(call.opened_fd_ptr, opened_fd)?;
+        }
+        self.core
+            .finish_matching_host_import(pending, &[Value::I32(errno)])
+    }
+
+    pub(super) fn finish_path_filestat_get(
+        &mut self,
+        call: PathFilestatGetCall,
+        stat: FileStat,
+        errno: u32,
+    ) -> Result<(), WasmError> {
+        let pending = PendingWasip1Call::PathFilestatGet(call);
+        self.core.require_matching_host_import(pending)?;
+        if errno == 0 {
+            self.core.write_filestat(call.stat_ptr, stat)?;
         }
         self.core
             .finish_matching_host_import(pending, &[Value::I32(errno)])
@@ -4554,13 +5185,17 @@ impl<'a> Vm<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CORE1_VM_OBJECT_BUDGET_BYTES, EXTERNAL_KIND_FUNC, ExecutionEvent, Interpreter,
-        MemoryGrowOutcome, Module, OPCODE_CALL, OPCODE_DROP, OPCODE_END, OPCODE_I32_CONST,
-        OPCODE_I64_CONST, SECTION_CODE, SECTION_EXPORT, SECTION_FUNCTION, SECTION_IMPORT,
-        SECTION_MEMORY, SECTION_TYPE, TEST_RESUME_FUEL, VALTYPE_I32, VALTYPE_I64, Vm, VmEvent,
-        WASIP1_FILETYPE_REGULAR_FILE, WasmError, diagnostic_message_code,
+        CORE1_VM_OBJECT_BUDGET_BYTES, DEFAULT_GUEST_MEMORY_BYTES, EXTERNAL_KIND_FUNC,
+        ExecutionEvent, GuestMemory, ImportPlan, Interpreter, Module, OPCODE_CALL, OPCODE_DROP,
+        OPCODE_END, OPCODE_I32_CONST, OPCODE_I64_CONST, SECTION_CODE, SECTION_EXPORT,
+        SECTION_FUNCTION, SECTION_IMPORT, SECTION_MEMORY, SECTION_TYPE, TEST_RESUME_FUEL,
+        VALTYPE_I32, VALTYPE_I64, Vm, VmEvent, WASIP1_FILETYPE_REGULAR_FILE, WasmError,
+        diagnostic_message_code,
     };
-    use super::{FdStat, WASIP1_FDSTAT_RIGHTS_BASE_OFFSET};
+    use super::{
+        FdStat, FileStat, WASIP1_FDSTAT_RIGHTS_BASE_OFFSET, WASIP1_FILESTAT_FILETYPE_OFFSET,
+        WASIP1_FILESTAT_SIZE_OFFSET, WASIP1_PRESTAT_DIR_NAME_LEN_OFFSET, WASIP1_PRESTAT_TAG_DIR,
+    };
     use crate::{
         protocol::{BudgetExpired, BudgetRun},
         wasip1::{WASIP1_PREVIEW1_MODULE, Wasip1ImportName},
@@ -4578,8 +5213,9 @@ mod tests {
     impl<'a> TestInterpreter<'a> {
         fn new(module: &'a [u8]) -> Result<Self, WasmError> {
             let mut storage = Box::new(MaybeUninit::<Interpreter<'a>>::uninit());
+            let memory = test_guest_memory();
             unsafe {
-                Interpreter::init_in_place(storage.as_mut_ptr(), module)?;
+                Interpreter::init_in_place(storage.as_mut_ptr(), module, memory)?;
             }
             Ok(Self { storage })
         }
@@ -4606,8 +5242,9 @@ mod tests {
     impl<'a> TestVm<'a> {
         fn new(module: &'a [u8]) -> Result<Self, WasmError> {
             let mut storage = Box::new(MaybeUninit::<Vm<'a>>::uninit());
+            let memory = test_guest_memory();
             unsafe {
-                Vm::init_in_place(storage.as_mut_ptr(), module)?;
+                Vm::init_in_place(storage.as_mut_ptr(), module, memory)?;
             }
             Ok(Self { storage })
         }
@@ -4631,7 +5268,14 @@ mod tests {
     fn vm_object_stays_within_core1_side_budget() {
         assert!(
             size_of::<Vm<'static>>() <= CORE1_VM_OBJECT_BUDGET_BYTES,
-            "Vm object exceeds the Core1-side SRAM budget"
+            "Vm object uses {} bytes, budget is {} bytes",
+            size_of::<Vm<'static>>(),
+            CORE1_VM_OBJECT_BUDGET_BYTES
+        );
+        assert!(
+            size_of::<ImportPlan>() <= 128,
+            "ImportPlan uses {} bytes",
+            size_of::<ImportPlan>()
         );
     }
 
@@ -4643,6 +5287,11 @@ mod tests {
 
     fn test_budget() -> BudgetRun {
         BudgetRun::new(1, 1, TEST_RESUME_FUEL)
+    }
+
+    fn test_guest_memory<'a>() -> GuestMemory<'a> {
+        let bytes = Box::leak(Box::new([0u8; DEFAULT_GUEST_MEMORY_BYTES]));
+        GuestMemory::new(&mut bytes[..])
     }
 
     fn push_test_u32(out: &mut Vec<u8>, mut value: u32) {
@@ -4694,6 +5343,29 @@ mod tests {
         out.push(id);
         push_test_u32(out, section.len() as u32);
         out.extend_from_slice(section);
+    }
+
+    fn core_wasip1_unknown_import_module(import_name: &[u8]) -> Vec<u8> {
+        let mut module = Vec::new();
+        module.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+
+        let mut types = Vec::new();
+        push_test_u32(&mut types, 1);
+        types.push(0x60);
+        push_test_u32(&mut types, 1);
+        types.push(VALTYPE_I32);
+        push_test_u32(&mut types, 1);
+        types.push(VALTYPE_I32);
+        push_test_section(&mut module, SECTION_TYPE, &types);
+
+        let mut imports = Vec::new();
+        push_test_u32(&mut imports, 1);
+        push_test_name(&mut imports, WASIP1_PREVIEW1_MODULE.as_bytes());
+        push_test_name(&mut imports, import_name);
+        imports.push(EXTERNAL_KIND_FUNC);
+        push_test_u32(&mut imports, 0);
+        push_test_section(&mut module, SECTION_IMPORT, &imports);
+        module
     }
 
     fn core_wasip1_single_import_module(
@@ -4900,6 +5572,17 @@ mod tests {
     }
 
     #[test]
+    fn wasm_vm_rejects_unknown_wasip1_import_name_at_load_time() {
+        let module = core_wasip1_unknown_import_module(b"fd_future_unknown");
+        match TestInterpreter::new(&module) {
+            Err(error) => {
+                assert_eq!(error, unsupported!("unsupported wasi p1 import"));
+            }
+            Ok(_) => panic!("unknown WASI P1 import name must be rejected"),
+        }
+    }
+
+    #[test]
     fn core_wasm_memory_grow_is_generic_engine_event_not_lease_policy() {
         static CORE_MEMORY_GROW_GUEST: &[u8] = &[
             0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
@@ -4916,13 +5599,62 @@ mod tests {
         };
         assert_eq!(event.previous_pages, 0);
         assert_eq!(event.requested_pages, 1);
-        assert_eq!(event.outcome, MemoryGrowOutcome::Grown { new_pages: 1 });
+        assert_eq!(event.max_pages, 1);
+        assert_eq!(core.memory_pages(), 0);
+        assert_eq!(core.finish_memory_grow_event(event, true), Ok(()));
         assert_eq!(core.memory_pages(), 1);
+        assert_eq!(core.resume().expect("resume to done"), ExecutionEvent::Done);
+    }
+
+    #[test]
+    fn core_wasm_memory_grow_reject_keeps_pages_unchanged() {
+        static CORE_MEMORY_GROW_GUEST: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+            0x03, 0x02, 0x01, 0x00, 0x05, 0x04, 0x01, 0x01, 0x00, 0x01, 0x07, 0x0a, 0x01, 0x06,
+            b'_', b's', b't', b'a', b'r', b't', 0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x41,
+            0x01, 0x40, 0x00, 0x1a, 0x0b,
+        ];
+        let mut core = TestInterpreter::new(CORE_MEMORY_GROW_GUEST).expect("instantiate core wasm");
+
+        let ExecutionEvent::MemoryGrow(event) = core.resume().expect("resume to memory.grow event")
+        else {
+            panic!("expected memory.grow core event");
+        };
+        assert_eq!(event.previous_pages, 0);
+        assert_eq!(event.requested_pages, 1);
+        assert_eq!(core.memory_pages(), 0);
+        assert_eq!(core.finish_memory_grow_event(event, false), Ok(()));
+        assert_eq!(core.memory_pages(), 0);
+        assert_eq!(core.resume().expect("resume to done"), ExecutionEvent::Done);
+    }
+
+    #[test]
+    fn core_wasm_memory_grow_invalid_grant_keeps_pending_request() {
+        static CORE_MEMORY_GROW_MAX_ZERO_GUEST: &[u8] = &[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+            0x03, 0x02, 0x01, 0x00, 0x05, 0x04, 0x01, 0x01, 0x00, 0x00, 0x07, 0x0a, 0x01, 0x06,
+            b'_', b's', b't', b'a', b'r', b't', 0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x41,
+            0x01, 0x40, 0x00, 0x1a, 0x0b,
+        ];
+        let mut core =
+            TestInterpreter::new(CORE_MEMORY_GROW_MAX_ZERO_GUEST).expect("instantiate core wasm");
+
+        let ExecutionEvent::MemoryGrow(event) = core.resume().expect("resume to memory.grow event")
+        else {
+            panic!("expected memory.grow core event");
+        };
+        assert_eq!(event.max_pages, 0);
         assert_eq!(
-            core.finish_memory_grow_event()
-                .expect("host observes memory.grow"),
-            event
+            core.finish_memory_grow_event(event, true),
+            Err(WasmError::PendingMismatch)
         );
+        assert_eq!(
+            core.resume(),
+            Err(WasmError::PendingCall),
+            "invalid grant must not drop the pending memory grow request"
+        );
+        assert_eq!(core.finish_memory_grow_event(event, false), Ok(()));
+        assert_eq!(core.memory_pages(), 0);
         assert_eq!(core.resume().expect("resume to done"), ExecutionEvent::Done);
     }
 
@@ -5140,6 +5872,7 @@ mod tests {
 
         let mut guest = TestVm::new(CORE_WASIP1_FD_WRITE_GUEST)
             .expect("instantiate core wasip1 fd_write guest");
+        assert_eq!(guest.import_plan_diagnostics().import_count(), 1);
         let VmEvent::FdWrite(write) = guest
             .resume(test_budget())
             .expect("fd_write trampoline trap")
@@ -5214,14 +5947,13 @@ mod tests {
             &[TestWasmArg::I32(3)],
             false,
         );
-        let mut guest = TestVm::new(&fd_write).expect("signature-mismatch import loads");
-
-        assert_eq!(
-            guest.resume(test_budget()),
-            Err(WasmError::Invalid(diagnostic!(
-                "fd_write import signature mismatch"
-            )))
-        );
+        match TestVm::new(&fd_write) {
+            Err(error) => assert_eq!(
+                error,
+                WasmError::Invalid(diagnostic!("fd_write import signature mismatch"))
+            ),
+            Ok(_) => panic!("signature-mismatch import must be rejected at load time"),
+        }
     }
 
     #[test]
@@ -5341,7 +6073,7 @@ mod tests {
     }
 
     #[test]
-    fn fuel_budget_stops_before_memory_fence_and_waits_for_completion() {
+    fn fuel_budget_stops_before_memory_grow_pending_and_waits_for_completion() {
         static CORE_MEMORY_GROW_GUEST: &[u8] = &[
             0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
             0x03, 0x02, 0x01, 0x00, 0x05, 0x04, 0x01, 0x01, 0x00, 0x01, 0x07, 0x0a, 0x01, 0x06,
@@ -5361,27 +6093,22 @@ mod tests {
             .resume(BudgetRun::new(0x0203, 0x0406, 1))
             .expect("next fuel tick reaches memory.grow")
         else {
-            panic!("expected memory.grow fence");
+            panic!("expected memory.grow pending request");
         };
         assert_eq!(event.previous_pages, 0);
         assert_eq!(event.requested_pages, 1);
-        assert_eq!(event.outcome, MemoryGrowOutcome::Grown { new_pages: 1 });
+        assert_eq!(event.max_pages, 1);
 
         assert_eq!(
             guest.resume(test_budget()),
             Err(WasmError::PendingCall),
-            "guest execution must not run past a pending memory fence"
+            "guest execution must not run past a pending memory grow request"
         );
-        assert_eq!(
-            guest
-                .finish_memory_grow_event()
-                .expect("host observes memory.grow fence"),
-            event
-        );
+        assert_eq!(guest.finish_memory_grow_event(event, true), Ok(()));
         assert_eq!(
             guest
                 .resume(test_budget())
-                .expect("done after memory fence"),
+                .expect("done after memory grow request"),
             VmEvent::Done
         );
     }
@@ -5449,6 +6176,105 @@ mod tests {
                 }
 
                 {
+                    let fd_prestat = core_wasip1_single_import_module(
+                        Wasip1ImportName::FdPrestatGet,
+                        &[VALTYPE_I32, VALTYPE_I32],
+                        &[VALTYPE_I32],
+                        &[TestWasmArg::I32(3), TestWasmArg::I32(80)],
+                        true,
+                    );
+                    let mut guest = TestVm::new(&fd_prestat).expect("fd_prestat_get");
+                    let VmEvent::FdPrestatGet(prestat) =
+                        guest.resume(test_budget()).expect("fd_prestat_get trap")
+                    else {
+                        panic!("expected fd_prestat_get");
+                    };
+                    assert_eq!(prestat.fd(), 3);
+                    assert_eq!(prestat.out_ptr(), 80);
+                    guest
+                        .finish_fd_prestat_get(prestat, 1, 0)
+                        .expect("complete fd_prestat_get");
+                    let mut bytes = [0u8; 8];
+                    guest
+                        .read_memory(80, &mut bytes)
+                        .expect("read prestat result");
+                    assert_eq!(bytes[0], WASIP1_PRESTAT_TAG_DIR);
+                    assert_eq!(
+                        u32::from_le_bytes([
+                            bytes[WASIP1_PRESTAT_DIR_NAME_LEN_OFFSET],
+                            bytes[WASIP1_PRESTAT_DIR_NAME_LEN_OFFSET + 1],
+                            bytes[WASIP1_PRESTAT_DIR_NAME_LEN_OFFSET + 2],
+                            bytes[WASIP1_PRESTAT_DIR_NAME_LEN_OFFSET + 3],
+                        ]),
+                        1
+                    );
+                }
+
+                {
+                    let fd_prestat_name = core_wasip1_single_import_module(
+                        Wasip1ImportName::FdPrestatDirName,
+                        &[VALTYPE_I32, VALTYPE_I32, VALTYPE_I32],
+                        &[VALTYPE_I32],
+                        &[
+                            TestWasmArg::I32(3),
+                            TestWasmArg::I32(88),
+                            TestWasmArg::I32(1),
+                        ],
+                        true,
+                    );
+                    let mut guest = TestVm::new(&fd_prestat_name).expect("fd_prestat_dir_name");
+                    let VmEvent::FdPrestatDirName(prestat_name) = guest
+                        .resume(test_budget())
+                        .expect("fd_prestat_dir_name trap")
+                    else {
+                        panic!("expected fd_prestat_dir_name");
+                    };
+                    assert_eq!(prestat_name.fd(), 3);
+                    assert_eq!(prestat_name.max_len(), 1);
+                    guest
+                        .finish_fd_prestat_dir_name(prestat_name, b"/", 0)
+                        .expect("complete fd_prestat_dir_name");
+                    let mut name = [0u8; 1];
+                    guest.read_memory(88, &mut name).expect("read prestat name");
+                    assert_eq!(&name, b"/");
+                }
+
+                {
+                    let fd_filestat = core_wasip1_single_import_module(
+                        Wasip1ImportName::FdFilestatGet,
+                        &[VALTYPE_I32, VALTYPE_I32],
+                        &[VALTYPE_I32],
+                        &[TestWasmArg::I32(4), TestWasmArg::I32(96)],
+                        true,
+                    );
+                    let mut guest = TestVm::new(&fd_filestat).expect("fd_filestat_get");
+                    let VmEvent::FdFilestatGet(stat) =
+                        guest.resume(test_budget()).expect("fd_filestat_get trap")
+                    else {
+                        panic!("expected fd_filestat_get");
+                    };
+                    assert_eq!(stat.fd(), 4);
+                    assert_eq!(stat.out_ptr(), 96);
+                    guest
+                        .finish_fd_filestat_get(
+                            stat,
+                            FileStat::new(WASIP1_FILETYPE_REGULAR_FILE, 17),
+                            0,
+                        )
+                        .expect("complete fd_filestat_get");
+                    let mut filetype = [0u8; 1];
+                    guest
+                        .read_memory(96 + WASIP1_FILESTAT_FILETYPE_OFFSET as u32, &mut filetype)
+                        .expect("read fd filestat filetype");
+                    assert_eq!(filetype[0], WASIP1_FILETYPE_REGULAR_FILE);
+                    let mut size = [0u8; 8];
+                    guest
+                        .read_memory(96 + WASIP1_FILESTAT_SIZE_OFFSET as u32, &mut size)
+                        .expect("read fd filestat size");
+                    assert_eq!(u64::from_le_bytes(size), 17);
+                }
+
+                {
                     let fd_close = core_wasip1_single_import_module(
                         Wasip1ImportName::FdClose,
                         &[VALTYPE_I32],
@@ -5511,8 +6337,59 @@ mod tests {
                     );
                 }
 
+                {
+                    let path_filestat = core_wasip1_single_import_module(
+                        Wasip1ImportName::PathFilestatGet,
+                        &[
+                            VALTYPE_I32,
+                            VALTYPE_I32,
+                            VALTYPE_I32,
+                            VALTYPE_I32,
+                            VALTYPE_I32,
+                        ],
+                        &[VALTYPE_I32],
+                        &[
+                            TestWasmArg::I32(3),
+                            TestWasmArg::I32(0),
+                            TestWasmArg::I32(208),
+                            TestWasmArg::I32(9),
+                            TestWasmArg::I32(224),
+                        ],
+                        true,
+                    );
+                    let mut guest = TestVm::new(&path_filestat).expect("path_filestat_get");
+                    guest
+                        .write_memory(208, b"app/state")
+                        .expect("write path filestat path");
+                    let VmEvent::PathFilestatGet(stat) =
+                        guest.resume(test_budget()).expect("path_filestat_get trap")
+                    else {
+                        panic!("expected path_filestat_get");
+                    };
+                    assert_eq!(stat.fd(), 3);
+                    assert_eq!(stat.flags(), 0);
+                    assert_eq!(
+                        guest
+                            .path_filestat_bytes(stat)
+                            .expect("path filestat bytes")
+                            .as_bytes(),
+                        b"app/state"
+                    );
+                    guest
+                        .finish_path_filestat_get(
+                            stat,
+                            FileStat::new(WASIP1_FILETYPE_REGULAR_FILE, 23),
+                            0,
+                        )
+                        .expect("complete path_filestat_get");
+                    let mut size = [0u8; 8];
+                    guest
+                        .read_memory(224 + WASIP1_FILESTAT_SIZE_OFFSET as u32, &mut size)
+                        .expect("read path filestat size");
+                    assert_eq!(u64::from_le_bytes(size), 23);
+                }
+
                 for unsupported in [
-                    Wasip1ImportName::FdPrestatGet,
                     Wasip1ImportName::FdSeek,
                     Wasip1ImportName::FdFdstatSetRights,
                     Wasip1ImportName::PathLink,
@@ -5530,11 +6407,9 @@ mod tests {
                         &[TestWasmArg::I32(3)],
                         false,
                     );
-                    let mut guest = TestVm::new(&module)
-                        .expect("static unsupported import is not admission authority");
                     assert!(
-                        matches!(guest.resume(test_budget()), Err(WasmError::Unsupported(_))),
-                        "{} should fault only when the unsupported WASI P1 import is called",
+                        matches!(TestVm::new(&module), Err(WasmError::Unsupported(_))),
+                        "{} should be rejected while building the WASI P1 import plan",
                         unsupported.name()
                     );
                 }
@@ -5620,6 +6495,34 @@ mod tests {
                         .read_memory(112, &mut random_out)
                         .expect("read random result");
                     assert_eq!(&random_out, b"RAND");
+                }
+
+                {
+                    let poll = core_wasip1_single_import_module(
+                        Wasip1ImportName::PollOneoff,
+                        &[VALTYPE_I32, VALTYPE_I32, VALTYPE_I32, VALTYPE_I32],
+                        &[VALTYPE_I32],
+                        &[
+                            TestWasmArg::I32(120),
+                            TestWasmArg::I32(136),
+                            TestWasmArg::I32(1),
+                            TestWasmArg::I32(152),
+                        ],
+                        true,
+                    );
+                    let mut guest = TestVm::new(&poll).expect("poll_oneoff");
+                    let VmEvent::PollOneoff(poll) =
+                        guest.resume(test_budget()).expect("poll_oneoff trap")
+                    else {
+                        panic!("expected poll_oneoff");
+                    };
+                    assert_eq!(poll.in_ptr, 120);
+                    assert_eq!(poll.out_ptr, 136);
+                    assert_eq!(poll.nsubscriptions, 1);
+                    assert_eq!(poll.nevents, 152);
+                    guest
+                        .finish_poll_oneoff(poll, 0, 52)
+                        .expect("complete poll_oneoff errno");
                 }
             })
             .expect("spawn wasm test")

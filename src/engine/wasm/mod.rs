@@ -7,7 +7,10 @@ mod machine;
 
 use crate::protocol::{BudgetExpired, BudgetRun, ProcExitStatus};
 
-pub use machine::{FdStat, PathBytes};
+pub use machine::{
+    DEFAULT_GUEST_MEMORY_BYTES, FdStat, FileStat, GUEST_MEMORY_PAGE_SIZE, GuestMemory,
+    ImportPlanDiagnostics, PathBytes,
+};
 
 pub type Error = machine::WasmError;
 
@@ -20,9 +23,13 @@ impl<'a> Guest<'a> {
     ///
     /// `dst` must be valid for writes, properly aligned for `Guest<'a>`, and
     /// must not be read until this function returns `Ok(())`.
-    pub unsafe fn init_in_place(dst: *mut Self, module: &'a [u8]) -> Result<(), Error> {
+    pub unsafe fn init_in_place(
+        dst: *mut Self,
+        module: &'a [u8],
+        memory: GuestMemory<'a>,
+    ) -> Result<(), Error> {
         unsafe {
-            machine::Vm::init_in_place(core::ptr::addr_of_mut!((*dst).engine), module)?;
+            machine::Vm::init_in_place(core::ptr::addr_of_mut!((*dst).engine), module, memory)?;
         }
         Ok(())
     }
@@ -33,6 +40,17 @@ impl<'a> Guest<'a> {
             Ok(machine::VmEvent::FdRead(call)) => Ok(Event::Call(Call::FdRead(FdRead { call }))),
             Ok(machine::VmEvent::FdFdstatGet(call)) => {
                 Ok(Event::Call(Call::FdFdstatGet(FdFdstatGet { call })))
+            }
+            Ok(machine::VmEvent::FdPrestatGet(call)) => {
+                Ok(Event::Call(Call::FdPrestatGet(FdPrestatGet { call })))
+            }
+            Ok(machine::VmEvent::FdPrestatDirName(call)) => {
+                Ok(Event::Call(Call::FdPrestatDirName(FdPrestatDirName {
+                    call,
+                })))
+            }
+            Ok(machine::VmEvent::FdFilestatGet(call)) => {
+                Ok(Event::Call(Call::FdFilestatGet(FdFilestatGet { call })))
             }
             Ok(machine::VmEvent::FdClose(call)) => Ok(Event::Call(Call::FdClose(FdClose { call }))),
             Ok(machine::VmEvent::ClockResGet(call)) => {
@@ -53,6 +71,9 @@ impl<'a> Guest<'a> {
             Ok(machine::VmEvent::PathOpen(call)) => {
                 Ok(Event::Call(Call::PathOpen(PathOpen { call })))
             }
+            Ok(machine::VmEvent::PathFilestatGet(call)) => {
+                Ok(Event::Call(Call::PathFilestatGet(PathFilestatGet { call })))
+            }
             Ok(machine::VmEvent::ArgsSizesGet(call)) => {
                 Ok(Event::Call(Call::ArgsSizesGet(ArgsSizesGet { call })))
             }
@@ -64,7 +85,7 @@ impl<'a> Guest<'a> {
                 Ok(Event::Call(Call::EnvironGet(EnvironGet { call })))
             }
             Ok(machine::VmEvent::MemoryGrow(event)) => {
-                Ok(Event::MemoryFence(MemoryFence { event }))
+                Ok(Event::MemoryGrowPending(MemoryGrowPending { event }))
             }
             Ok(machine::VmEvent::BudgetExpired(expired)) => Ok(Event::BudgetExpired(expired)),
             Ok(machine::VmEvent::ProcExit(status)) => Ok(Event::Exit(Exit::new(status))),
@@ -72,19 +93,27 @@ impl<'a> Guest<'a> {
             Err(error) => Err(error),
         }
     }
+
+    pub const fn import_plan_diagnostics(&self) -> ImportPlanDiagnostics {
+        self.engine.import_plan_diagnostics()
+    }
 }
 
 pub enum Event {
     Call(Call),
-    MemoryFence(MemoryFence),
+    MemoryGrowPending(MemoryGrowPending),
     BudgetExpired(BudgetExpired),
     Exit(Exit),
 }
 
+#[doc(hidden)]
 pub enum Call {
     FdWrite(FdWrite),
     FdRead(FdRead),
     FdFdstatGet(FdFdstatGet),
+    FdPrestatGet(FdPrestatGet),
+    FdPrestatDirName(FdPrestatDirName),
+    FdFilestatGet(FdFilestatGet),
     FdClose(FdClose),
     ClockResGet(ClockResGet),
     ClockTimeGet(ClockTimeGet),
@@ -92,6 +121,7 @@ pub enum Call {
     RandomGet(RandomGet),
     FdReaddir(FdReaddir),
     PathOpen(PathOpen),
+    PathFilestatGet(PathFilestatGet),
     ArgsSizesGet(ArgsSizesGet),
     ArgsGet(ArgsGet),
     EnvironSizesGet(EnvironSizesGet),
@@ -185,6 +215,56 @@ impl FdFdstatGet {
 
     pub fn complete(self, guest: &mut Guest<'_>, stat: FdStat, errno: u32) -> Result<(), Error> {
         guest.engine.finish_fd_fdstat_get(self.call, stat, errno)
+    }
+}
+
+pub struct FdPrestatGet {
+    call: machine::FdRequestCall,
+}
+
+impl FdPrestatGet {
+    pub const fn fd(&self) -> u8 {
+        self.call.fd()
+    }
+
+    pub fn complete(self, guest: &mut Guest<'_>, name_len: u32, errno: u32) -> Result<(), Error> {
+        guest
+            .engine
+            .finish_fd_prestat_get(self.call, name_len, errno)
+    }
+}
+
+pub struct FdPrestatDirName {
+    call: machine::FdPrestatDirNameCall,
+}
+
+impl FdPrestatDirName {
+    pub const fn fd(&self) -> u8 {
+        self.call.fd()
+    }
+
+    pub const fn max_len(&self) -> usize {
+        self.call.max_len()
+    }
+
+    pub fn complete(self, guest: &mut Guest<'_>, bytes: &[u8], errno: u32) -> Result<(), Error> {
+        guest
+            .engine
+            .finish_fd_prestat_dir_name(self.call, bytes, errno)
+    }
+}
+
+pub struct FdFilestatGet {
+    call: machine::FdRequestCall,
+}
+
+impl FdFilestatGet {
+    pub const fn fd(&self) -> u8 {
+        self.call.fd()
+    }
+
+    pub fn complete(self, guest: &mut Guest<'_>, stat: FileStat, errno: u32) -> Result<(), Error> {
+        guest.engine.finish_fd_filestat_get(self.call, stat, errno)
     }
 }
 
@@ -313,6 +393,30 @@ impl PathOpen {
     }
 }
 
+pub struct PathFilestatGet {
+    call: machine::PathFilestatGetCall,
+}
+
+impl PathFilestatGet {
+    pub const fn fd(&self) -> u8 {
+        self.call.fd()
+    }
+
+    pub const fn flags(&self) -> u32 {
+        self.call.flags()
+    }
+
+    pub fn path_bytes(&self, guest: &Guest<'_>) -> Result<PathBytes, Error> {
+        guest.engine.path_filestat_bytes(self.call)
+    }
+
+    pub fn complete(self, guest: &mut Guest<'_>, stat: FileStat, errno: u32) -> Result<(), Error> {
+        guest
+            .engine
+            .finish_path_filestat_get(self.call, stat, errno)
+    }
+}
+
 pub struct ArgsSizesGet {
     call: machine::ArgsSizesGetCall,
 }
@@ -374,17 +478,11 @@ impl EnvironGet {
     }
 }
 
-pub struct MemoryFence {
+pub struct MemoryGrowPending {
     event: machine::MemoryGrowEvent,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemoryFenceOutcome {
-    Grown { new_pages: u32 },
-    Rejected,
-}
-
-impl MemoryFence {
+impl MemoryGrowPending {
     pub const fn previous_pages(&self) -> u32 {
         self.event.previous_pages
     }
@@ -393,35 +491,18 @@ impl MemoryFence {
         self.event.requested_pages
     }
 
-    pub const fn outcome(&self) -> MemoryFenceOutcome {
-        match self.event.outcome {
-            machine::MemoryGrowOutcome::Grown { new_pages } => {
-                MemoryFenceOutcome::Grown { new_pages }
-            }
-            machine::MemoryGrowOutcome::Rejected => MemoryFenceOutcome::Rejected,
-        }
+    pub const fn max_pages(&self) -> u32 {
+        self.event.max_pages
     }
 
-    pub const fn fence_epoch(&self) -> u32 {
-        match self.outcome() {
-            MemoryFenceOutcome::Grown { new_pages } => new_pages,
-            MemoryFenceOutcome::Rejected => self.previous_pages(),
-        }
-    }
-
-    pub fn complete(self, guest: &mut Guest<'_>) -> Result<(), Error> {
-        let completed = guest.engine.finish_memory_grow_event()?;
-        if completed == self.event {
-            Ok(())
-        } else {
-            Err(Error::PendingMismatch)
-        }
+    pub fn complete(self, guest: &mut Guest<'_>, grant: bool) -> Result<(), Error> {
+        guest.engine.finish_memory_grow_event(self.event, grant)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, Guest};
+    use super::{DEFAULT_GUEST_MEMORY_BYTES, Event, Guest, GuestMemory};
     use crate::protocol::BudgetRun;
     use core::mem::MaybeUninit;
     use std::boxed::Box;
@@ -437,7 +518,9 @@ mod tests {
         let mut storage = Box::new(MaybeUninit::<Guest<'_>>::uninit());
         let guest = unsafe {
             let ptr = storage.as_mut_ptr();
-            Guest::init_in_place(ptr, START_RETURNS).expect("guest init");
+            let memory = Box::leak(Box::new([0u8; DEFAULT_GUEST_MEMORY_BYTES]));
+            Guest::init_in_place(ptr, START_RETURNS, GuestMemory::new(&mut memory[..]))
+                .expect("guest init");
             &mut *ptr
         };
 
@@ -447,7 +530,7 @@ mod tests {
 
         match event {
             Event::Exit(exit) => assert_eq!(exit.status(), 0),
-            Event::Call(_) | Event::MemoryFence(_) | Event::BudgetExpired(_) => {
+            Event::Call(_) | Event::MemoryGrowPending(_) | Event::BudgetExpired(_) => {
                 panic!("expected explicit exit event")
             }
         }

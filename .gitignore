@@ -1,2 +1,4 @@
 /target/
 /AGENTS.md
+guest/*/target/
+examples/*/guest/target/

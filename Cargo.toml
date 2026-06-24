@@ -2,10 +2,26 @@
 name = "hibana-wasip1-runtime"
 version = "0.1.0"
 edition = "2024"
-publish = false
+rust-version = "1.95"
+description = "Hibana-bound WASI Preview 1 runtime boundary for choreographed Wasm guests"
+license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/hibana-wasip1-runtime"
+readme = "README.md"
+keywords = ["hibana", "wasi", "wasip1", "wasm", "no-std"]
+categories = ["wasm", "embedded", "no-std"]
+include = [
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/src/**",
+    "/examples/**",
+    "/scripts/**",
+]
 
 [dependencies]
-hibana = { version = "0.9.0", default-features = false }
+hibana = { version = "0.9.4", default-features = false }
 
-[patch.crates-io]
-hibana = { path = "../hibana" }
+[dev-dependencies]
+futures-executor = "0.3"
+futures-util = "0.3"

@@ -10,7 +10,7 @@ check_absent() {
     label=$1
     pattern=$2
     shift 2
-    if rg -n "$pattern" "$@"; then
+    if rg -n --glob '!**/target/**' "$pattern" "$@"; then
         printf '%s\n' "residue: $label" >&2
         fail=1
     fi
@@ -39,12 +39,17 @@ runtime_source() {
 check_absent \
     "old source vocabulary" \
     'hibana-pico|Game Boy|GameBoy|gameboy|F#|FSharp|Fame|Fable|Blazor|Pokemon|Pokémon|CHIP-8|resource envelope' \
-    Cargo.toml README.md src
+    Cargo.toml README.md src guest examples
 
 check_absent \
     "syscall feature profiles" \
     '\[features\]|cfg\(feature|feature =|pub type BudgetSuspend[[:space:]]*=|pub type BudgetRestart[[:space:]]*=|deadline_tick|new_pages\(\)|new_pages: Option' \
-    Cargo.toml src
+    Cargo.toml src guest examples
+
+check_absent \
+    "localside hiding helpers" \
+    'complete_offered_row|drive_all|drive_|offer::|standard_shell|read_only_fs|unsupported_by_choreography|handler set|handler sets|branch adapter|answer_|MemoryFence|HibanaMemoryFence|MemFence|LABEL_MEM_FENCE|memory[- ]fence|memory-growth fencing|fence_epoch' \
+    README.md src guest examples
 
 check_absent \
     "string payload runtime errors" \
