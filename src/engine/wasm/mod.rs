@@ -5,7 +5,7 @@
 
 mod machine;
 
-use crate::protocol::{BudgetExpired, BudgetRun, ProcExitStatus};
+use crate::protocol::{BudgetExpired, BudgetRun};
 
 pub use machine::{
     DEFAULT_GUEST_MEMORY_BYTES, FdStat, FileStat, GUEST_MEMORY_PAGE_SIZE, GuestMemory,
@@ -144,14 +144,6 @@ impl Exit {
 
     pub const fn status(self) -> u32 {
         self.status
-    }
-
-    pub const fn as_protocol_status(self) -> Option<ProcExitStatus> {
-        if self.status <= u8::MAX as u32 {
-            Some(ProcExitStatus::new(self.status as u8))
-        } else {
-            None
-        }
     }
 }
 

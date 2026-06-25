@@ -2,15 +2,8 @@ use super::*;
 
 use core::num::NonZeroU8;
 
-pub type BudgetRunMsg = Msg<LABEL_ENGINE_RUN, BudgetRun>;
-pub type BudgetExpiredMsg = Msg<LABEL_ENGINE_BUDGET_EXPIRED, BudgetExpired>;
-pub type BudgetSuspendMsg = Msg<LABEL_ENGINE_SUSPEND, BudgetSuspend>;
-pub type BudgetRestartMsg = Msg<LABEL_ENGINE_RESTART, BudgetRestart>;
 pub type MemoryGrowReqMsg = Msg<LABEL_ENGINE_MEMORY_GROW, MemoryGrowReq>;
 pub type MemoryGrowRetMsg = Msg<LABEL_ENGINE_MEMORY_GROW_RET, MemoryGrowRet>;
-
-pub type MemReadGrantControl = Msg<LABEL_MEM_GRANT_READ_CONTROL, ()>;
-pub type MemWriteGrantControl = Msg<LABEL_MEM_GRANT_WRITE_CONTROL, ()>;
 
 const WIRE_LEASE_INLINE: u8 = 0;
 
@@ -450,119 +443,6 @@ impl WirePayload for BudgetExpired {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BudgetSuspend {
-    run_id: u16,
-    generation: u16,
-}
-
-impl BudgetSuspend {
-    pub const fn new(run_id: u16, generation: u16) -> Self {
-        Self { run_id, generation }
-    }
-
-    pub const fn run_id(&self) -> u16 {
-        self.run_id
-    }
-
-    pub const fn generation(&self) -> u16 {
-        self.generation
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != 4 {
-            return Err(CodecError::Malformed);
-        }
-        Ok(Self::new(
-            u16::from_be_bytes([bytes[0], bytes[1]]),
-            u16::from_be_bytes([bytes[2], bytes[3]]),
-        ))
-    }
-}
-
-impl WireEncode for BudgetSuspend {
-    fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        if out.len() < 4 {
-            return Err(CodecError::Truncated);
-        }
-        out[0..2].copy_from_slice(&self.run_id.to_be_bytes());
-        out[2..4].copy_from_slice(&self.generation.to_be_bytes());
-        Ok(4)
-    }
-}
-
-impl WirePayload for BudgetSuspend {
-    type Decoded<'a> = Self;
-
-    wire_payload_via_decode!();
-
-    fn decode_payload<'a>(input: Payload<'a>) -> Result<Self::Decoded<'a>, CodecError> {
-        Self::decode(input.as_bytes())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BudgetRestart {
-    run_id: u16,
-    generation: u16,
-    fuel: u32,
-}
-
-impl BudgetRestart {
-    pub const fn new(run_id: u16, generation: u16, fuel: u32) -> Self {
-        Self {
-            run_id,
-            generation,
-            fuel,
-        }
-    }
-
-    pub const fn run_id(&self) -> u16 {
-        self.run_id
-    }
-
-    pub const fn generation(&self) -> u16 {
-        self.generation
-    }
-
-    pub const fn fuel(&self) -> u32 {
-        self.fuel
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != 8 {
-            return Err(CodecError::Malformed);
-        }
-        Ok(Self::new(
-            u16::from_be_bytes([bytes[0], bytes[1]]),
-            u16::from_be_bytes([bytes[2], bytes[3]]),
-            u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-        ))
-    }
-}
-
-impl WireEncode for BudgetRestart {
-    fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        if out.len() < 8 {
-            return Err(CodecError::Truncated);
-        }
-        out[0..2].copy_from_slice(&self.run_id.to_be_bytes());
-        out[2..4].copy_from_slice(&self.generation.to_be_bytes());
-        out[4..8].copy_from_slice(&self.fuel.to_be_bytes());
-        Ok(8)
-    }
-}
-
-impl WirePayload for BudgetRestart {
-    type Decoded<'a> = Self;
-
-    wire_payload_via_decode!();
-
-    fn decode_payload<'a>(input: Payload<'a>) -> Result<Self::Decoded<'a>, CodecError> {
-        Self::decode(input.as_bytes())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryGrow {
     previous_pages: u32,
     requested_pages: u32,
@@ -682,7 +562,7 @@ impl WirePayload for MemoryGrowDecision {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EngineReq {
+enum EngineReq {
     FdWrite(FdWrite),
     FdRead(FdRead),
     FdReaddir(FdReaddir),
@@ -695,7 +575,6 @@ pub enum EngineReq {
     ClockTimeGet(ClockTimeGet),
     PollOneoff(PollOneoff),
     RandomGet(RandomGet),
-    ProcExit(ProcExitStatus),
     ArgsSizesGet(ArgsSizesGet),
     ArgsGet(ArgsGet),
     EnvironSizesGet(EnvironSizesGet),
@@ -816,14 +695,6 @@ impl WireEncode for EngineReq {
                 out[2] = request.max_len();
                 Ok(3)
             }
-            Self::ProcExit(status) => {
-                if out.len() < 2 {
-                    return Err(CodecError::Truncated);
-                }
-                out[0] = TAG_REQ_WASI_PROC_EXIT;
-                out[1] = status.code();
-                Ok(2)
-            }
             Self::ArgsSizesGet(_) => {
                 if out.is_empty() {
                     return Err(CodecError::Truncated);
@@ -911,7 +782,6 @@ impl WirePayload for EngineReq {
             TAG_REQ_WASI_CLOCK_TIME_GET => Ok(Self::ClockTimeGet(ClockTimeGet::decode(rest)?)),
             TAG_REQ_WASI_POLL_ONEOFF => Ok(Self::PollOneoff(PollOneoff::decode(rest)?)),
             TAG_REQ_WASI_RANDOM_GET => Ok(Self::RandomGet(RandomGet::decode(rest)?)),
-            TAG_REQ_WASI_PROC_EXIT => Ok(Self::ProcExit(ProcExitStatus::decode(rest)?)),
             TAG_REQ_WASI_ARGS_SIZES_GET => Ok(Self::ArgsSizesGet(ArgsSizesGet::decode(rest)?)),
             TAG_REQ_WASI_ARGS_GET => Ok(Self::ArgsGet(ArgsGet::decode(rest)?)),
             TAG_REQ_WASI_ENVIRON_SIZES_GET => {
@@ -928,7 +798,7 @@ impl WirePayload for EngineReq {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EngineRet {
+enum EngineRet {
     FdWriteDone(FdWriteDone),
     FdReadDone(FdReadDone),
     FdReaddirDone(FdReaddirDone),
@@ -1245,8 +1115,6 @@ pub struct PollOneoffReq(pub PollOneoff);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RandomGetReq(pub RandomGet);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcExitReq(pub ProcExitStatus);
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArgsSizesGetReq(pub ArgsSizesGet);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArgsGetReq(pub ArgsGet);
@@ -1312,7 +1180,6 @@ engine_req_payload!(ClockResGetReq, ClockResGet);
 engine_req_payload!(ClockTimeGetReq, ClockTimeGet);
 engine_req_payload!(PollOneoffReq, PollOneoff);
 engine_req_payload!(RandomGetReq, RandomGet);
-engine_req_payload!(ProcExitReq, ProcExit);
 engine_req_payload!(ArgsSizesGetReq, ArgsSizesGet);
 engine_req_payload!(ArgsGetReq, ArgsGet);
 engine_req_payload!(EnvironSizesGetReq, EnvironSizesGet);
@@ -1397,7 +1264,6 @@ pub type PollOneoffReqMsg = Msg<LABEL_WASI_POLL_ONEOFF, PollOneoffReq>;
 pub type PollOneoffRetMsg = Msg<LABEL_WASI_POLL_ONEOFF_RET, PollReadyRet>;
 pub type RandomGetReqMsg = Msg<LABEL_WASI_RANDOM_GET, RandomGetReq>;
 pub type RandomGetRetMsg = Msg<LABEL_WASI_RANDOM_GET_RET, RandomDoneRet>;
-pub type ProcExitReqMsg = Msg<LABEL_WASI_PROC_EXIT, ProcExitReq>;
 pub type ArgsSizesGetReqMsg = Msg<LABEL_WASI_ARGS_SIZES_GET, ArgsSizesGetReq>;
 pub type ArgsSizesGetRetMsg = Msg<LABEL_WASI_ARGS_SIZES_GET_RET, ArgsSizesRet>;
 pub type ArgsGetReqMsg = Msg<LABEL_WASI_ARGS_GET, ArgsGetReq>;
@@ -1953,56 +1819,6 @@ impl FdPrestatDirName {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FdError {
-    fd: u8,
-    errno: u16,
-}
-
-impl FdError {
-    pub const fn new(fd: u8, errno: u16) -> Self {
-        Self { fd, errno }
-    }
-
-    pub const fn fd(&self) -> u8 {
-        self.fd
-    }
-
-    pub const fn errno(&self) -> u16 {
-        self.errno
-    }
-}
-
-impl WireEncode for FdError {
-    fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        if out.len() < 3 {
-            return Err(CodecError::Truncated);
-        }
-        out[0] = self.fd;
-        out[1..3].copy_from_slice(&self.errno.to_be_bytes());
-        Ok(3)
-    }
-}
-
-impl WirePayload for FdError {
-    type Decoded<'a> = Self;
-
-    wire_payload_via_decode!();
-
-    fn decode_payload<'a>(input: Payload<'a>) -> Result<Self::Decoded<'a>, CodecError> {
-        let bytes = input.as_bytes();
-        if bytes.len() != 3 {
-            return Err(CodecError::Malformed);
-        }
-        Ok(Self::new(
-            bytes[0],
-            u16::from_be_bytes([bytes[1], bytes[2]]),
-        ))
-    }
-}
-
-pub type FdErrorMsg = Msg<LABEL_WASI_FD_ERROR, FdError>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct PathOpen {
     rights_base: u64,
@@ -2270,28 +2086,6 @@ impl RandomGet {
             return Err(CodecError::Malformed);
         }
         Self::new_with_lease_ref(LeaseRef::from_raw(bytes[0])?, bytes[1])
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcExitStatus {
-    code: u8,
-}
-
-impl ProcExitStatus {
-    pub const fn new(code: u8) -> Self {
-        Self { code }
-    }
-
-    pub const fn code(&self) -> u8 {
-        self.code
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != 1 {
-            return Err(CodecError::Malformed);
-        }
-        Ok(Self::new(bytes[0]))
     }
 }
 
@@ -3028,25 +2822,6 @@ mod tests {
             BudgetRun::decode(&out[..9]),
             Err(CodecError::Malformed)
         ));
-    }
-
-    #[test]
-    fn budget_suspend_and_restart_are_distinct_wire_states() {
-        let suspend = BudgetSuspend::new(0x0102, 0x0304);
-        let restart = BudgetRestart::new(0x0102, 0x0305, 0x0607_0809);
-        let mut suspend_bytes = [0u8; 8];
-        let mut restart_bytes = [0u8; 8];
-
-        assert_eq!(suspend.encode_into(&mut suspend_bytes), Ok(4));
-        assert_eq!(&suspend_bytes[..4], &[0x01, 0x02, 0x03, 0x04]);
-        assert_eq!(BudgetSuspend::decode(&suspend_bytes[..4]), Ok(suspend));
-
-        assert_eq!(restart.encode_into(&mut restart_bytes), Ok(8));
-        assert_eq!(
-            restart_bytes,
-            [0x01, 0x02, 0x03, 0x05, 0x06, 0x07, 0x08, 0x09]
-        );
-        assert_eq!(BudgetRestart::decode(&restart_bytes), Ok(restart));
     }
 
     #[test]

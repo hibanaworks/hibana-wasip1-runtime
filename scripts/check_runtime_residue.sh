@@ -43,7 +43,17 @@ check_absent \
 
 check_absent \
     "syscall feature profiles" \
-    '\[features\]|cfg\(feature|feature =|pub type BudgetSuspend[[:space:]]*=|pub type BudgetRestart[[:space:]]*=|deadline_tick|new_pages\(\)|new_pages: Option' \
+    '\[features\]|cfg\(feature|feature =|deadline_tick|new_pages\(\)|new_pages: Option' \
+    Cargo.toml src guest examples
+
+check_absent \
+    "dead public runtime protocol rows" \
+    'ProcExitReq|ProcExitStatus|LABEL_WASI_PROC_EXIT|TAG_REQ_WASI_PROC_EXIT|BudgetRunMsg|BudgetExpiredMsg|BudgetSuspend|BudgetRestart|LABEL_ENGINE_RUN|LABEL_ENGINE_BUDGET_EXPIRED|LABEL_ENGINE_SUSPEND|LABEL_ENGINE_RESTART|FdError|LABEL_WASI_FD_ERROR|MemReadGrantControl|MemWriteGrantControl|LABEL_MEM_GRANT_READ_CONTROL|LABEL_MEM_GRANT_WRITE_CONTROL' \
+    Cargo.toml src guest examples
+
+check_absent \
+    "public internal wire tags or engine envelope enums" \
+    'pub[[:space:]]+const[[:space:]]+TAG_|pub[[:space:]]+enum[[:space:]]+EngineReq|pub[[:space:]]+enum[[:space:]]+EngineRet' \
     Cargo.toml src guest examples
 
 check_absent \
