@@ -9,7 +9,7 @@ use hibana_wasip1_runtime::{
     exchange::FdBindingTable,
     protocol::{
         self, FdBinding, FdReadDone, FdReadRow, FdReaddirRow, FdRequest, FdStat, FdWriteDone,
-        FdWriteRow, MemRights, WASIP1_IO_CHUNK_CAPACITY,
+        FdWriteRow, MemRights,
     },
 };
 
@@ -27,7 +27,7 @@ static CHOREOFS_OBJECTS: ChoreoFsObjectSet<1> = ChoreoFsObjectSet::new([ChoreoFs
     b"outputs/led/green",
     LED_GREEN_ID,
     FdSpec::new(LED_GREEN_FD as u32, FD_WRITE_RIGHT, 1),
-    FdBinding::write(FdWriteRow::Refined),
+    FdBinding::write(FdWriteRow::Object),
 )]);
 
 pub struct ShellEnv {
@@ -69,7 +69,7 @@ impl ShellEnv {
             }) => {
                 let _ = io::stdout().write_all(write.as_bytes());
                 let _ = io::stdout().flush();
-                protocol::FdWriteDoneRet(FdWriteDone::new(write.fd(), bounded_u8(write.len())))
+                protocol::FdWriteDoneRet(FdWriteDone::new(write.fd(), write.len() as u8))
             }
             Some(FdEntry {
                 kind: FdKind::ErrorOutput,
@@ -77,7 +77,7 @@ impl ShellEnv {
             }) => {
                 let _ = io::stderr().write_all(write.as_bytes());
                 let _ = io::stderr().flush();
-                protocol::FdWriteDoneRet(FdWriteDone::new(write.fd(), bounded_u8(write.len())))
+                protocol::FdWriteDoneRet(FdWriteDone::new(write.fd(), write.len() as u8))
             }
             Some(FdEntry {
                 kind: FdKind::OutputLedGreen,
@@ -94,6 +94,19 @@ impl ShellEnv {
     }
 
     pub fn read_fd(&mut self, read: protocol::FdRead) -> DemoResult<protocol::FdReadDoneRet> {
+        if !matches!(
+            self.entries.iter().find(|entry| entry.fd == read.fd()),
+            Some(FdEntry {
+                kind: FdKind::Input,
+                ..
+            })
+        ) {
+            return Ok(protocol::FdReadDoneRet(FdReadDone::new_with_errno(
+                read.fd(),
+                b"",
+                ERRNO_BADF,
+            )?));
+        }
         if self.input.is_empty() {
             let mut line = String::new();
             io::stdin().lock().read_line(&mut line)?;
@@ -110,11 +123,18 @@ impl ShellEnv {
     }
 
     pub fn stat_fd(&self, request: FdRequest) -> protocol::FdStatRet {
-        let rights = match self.entries.iter().find(|entry| entry.fd == request.fd()) {
-            Some(FdEntry {
+        let Some(entry) = self.entries.iter().find(|entry| entry.fd == request.fd()) else {
+            return protocol::FdStatRet(FdStat::new_with_errno(
+                request.fd(),
+                MemRights::Read,
+                ERRNO_BADF,
+            ));
+        };
+        let rights = match entry {
+            FdEntry {
                 kind: FdKind::Output | FdKind::ErrorOutput | FdKind::OutputLedGreen,
                 ..
-            }) => MemRights::Write,
+            } => MemRights::Write,
             _ => MemRights::Read,
         };
         protocol::FdStatRet(FdStat::new(request.fd(), rights))
@@ -151,19 +171,19 @@ impl ShellEnv {
 
 pub fn initial_bindings() -> FdBindingTable {
     let mut bindings = FdBindingTable::empty();
-    let _ = bindings.bind_fd(0, FdBinding::read(FdReadRow::Base));
-    let _ = bindings.bind_fd(1, FdBinding::write(FdWriteRow::Base));
-    let _ = bindings.bind_fd(2, FdBinding::write(FdWriteRow::Base));
-    let _ = bindings.bind_fd(ROOT_FD, FdBinding::readdir(FdReaddirRow::Base));
     bindings
-}
-
-fn bounded_u8(value: impl TryInto<usize>) -> u8 {
-    let value = match value.try_into() {
-        Ok(value) => value,
-        Err(_) => WASIP1_IO_CHUNK_CAPACITY,
-    };
-    value.min(WASIP1_IO_CHUNK_CAPACITY) as u8
+        .bind_fd(0, FdBinding::read(FdReadRow::Base))
+        .expect("stdin fd fits binding table");
+    bindings
+        .bind_fd(1, FdBinding::write(FdWriteRow::Base))
+        .expect("stdout fd fits binding table");
+    bindings
+        .bind_fd(2, FdBinding::write(FdWriteRow::Base))
+        .expect("stderr fd fits binding table");
+    bindings
+        .bind_fd(ROOT_FD, FdBinding::readdir(FdReaddirRow::Base))
+        .expect("root fd fits binding table");
+    bindings
 }
 
 struct FdEntry {

@@ -11,10 +11,10 @@ received.
 ```text
 WASI P1 guest
   -> GuestMemory
-  -> HibanaWasiGuest::resume_hibana(..., BudgetRun)
-  -> HibanaStep
-  -> protocol::*ReqMsg / protocol::*RetMsg
-  -> Hibana Endpoint send() / recv() / offer()
+  -> HibanaWasiGuest::resume_wasi_boundary(..., BudgetRun)
+  -> WasiBoundaryStep
+  -> WasiImportRequest / WasiImportCompletion
+  -> Hibana Endpoint send::<protocol::*ReqMsg>() / recv::<protocol::*RetMsg>()
 ```
 
 It depends on `hibana`; it does not define a second message system, a host
@@ -43,10 +43,11 @@ The core path is:
 
 1. caller provides a Wasm module, `GuestMemory`, fd bindings, and Hibana
    endpoint;
-2. `resume_hibana(..., BudgetRun)` runs the guest with explicit fuel;
+2. `resume_wasi_boundary(..., BudgetRun)` runs the guest with explicit fuel;
 3. the runtime stops at budget exhaustion, a supported WASI import,
    `memory.grow`, or process exit;
-4. supported imports are sent as `protocol::*ReqMsg` values;
+4. supported imports become `WasiImportRequest` values that the caller sends
+   through typed Hibana endpoint operations;
 5. the outside local role answers with the matching `protocol::*RetMsg`;
 6. the runtime performs checked writeback and resumes only through the consumed
    pending event.
@@ -61,7 +62,7 @@ There are four public surfaces:
 
 | Surface | Used for | Main names |
 | --- | --- | --- |
-| Engine stepper | running the guest under Hibana progress | `HibanaWasiGuestStorage`, `HibanaWasiGuest`, `HibanaStep`, `HibanaImportPending`, `HibanaMemoryGrowPending` |
+| Engine stepper | running the guest to a WASI boundary | `HibanaWasiGuestStorage`, `HibanaWasiGuest`, `WasiBoundaryStep`, `WasiImportPending`, `WasiMemoryGrowPending`, `WasiImportRequest`, `WasiImportCompletion` |
 | Guest memory | caller-owned WASM linear-memory backing | `GuestMemory`, `GUEST_MEMORY_PAGE_SIZE`, `DEFAULT_GUEST_MEMORY_BYTES` |
 | Protocol payloads | Hibana message payloads for WASI P1 imports and runtime events | `protocol::*ReqMsg`, `protocol::*RetMsg`, `BudgetRun`, `MemoryGrowReqMsg`, `MemoryGrowRetMsg` |
 | ChoreoFS facts | object and fd facts a local role can use while answering admitted WASI calls | `ChoreoFsObjectSet`, `ChoreoFs`, `ChoreoFsOpen`, `ChoreoFsRead`, `ChoreoFsReadDir`, `ChoreoFsWrite`, `FdBindingTable` |
@@ -76,22 +77,23 @@ The runtime advances through one explicit operation:
 
 ```rust,ignore
 let step = guest
-    .resume_hibana(endpoint, protocol::BudgetRun::new(run_id, generation, fuel))
-    .await?;
+    .resume_wasi_boundary(protocol::BudgetRun::new(run_id, generation, fuel))?;
 ```
 
 Each resume returns exactly one visible state:
 
-- `HibanaStep::ImportPending`: a supported WASI import was sent through the
-  endpoint and must be completed with the matching return message;
-- `HibanaStep::MemoryGrowPending`: `memory.grow` was requested and must be
-  granted or rejected by `MemoryGrowRetMsg`;
-- `HibanaStep::BudgetExpired`: fuel ended before another visible boundary;
-- `HibanaStep::Exit`: the guest called `proc_exit` or returned from start.
+- `WasiBoundaryStep::ImportPending`: a supported WASI import was lowered to a
+  typed request and must be sent through the endpoint, answered, and completed
+  with the matching return value;
+- `WasiBoundaryStep::MemoryGrowPending`: `memory.grow` was requested and must
+  be sent through the endpoint, then granted or rejected by `MemoryGrowRetMsg`;
+- `WasiBoundaryStep::BudgetExpired`: fuel ended before another visible
+  boundary;
+- `WasiBoundaryStep::Exit`: the guest called `proc_exit` or returned from start.
 
 Unsupported imports fail closed while the import plan is built. Known imports
 with wrong signatures fail before guest execution begins. Completion is linear:
-`HibanaImportPending::complete(...)` and `HibanaMemoryGrowPending::complete(...)`
+`WasiImportPending::complete(...)` and `WasiMemoryGrowPending::complete(...)`
 consume the pending value, so a response cannot be reused for a later import.
 
 The crate deliberately excludes:
@@ -131,18 +133,32 @@ async fn run_guest<const ROLE: u8>(
 ) -> Result<i32, Error> {
     let mut run_id = 1u16;
     loop {
-        match guest
-            .resume_hibana(endpoint, protocol::BudgetRun::new(run_id, 0, 100_000))
-            .await?
-        {
-            HibanaStep::ImportPending(pending) => {
-                pending.complete(guest, endpoint).await?;
+        match guest.resume_wasi_boundary(protocol::BudgetRun::new(run_id, 0, 100_000))? {
+            WasiBoundaryStep::ImportPending(pending) => {
+                match pending.request() {
+                    WasiImportRequest::FdRead(request) => {
+                        endpoint.send::<protocol::FdReadReqMsg>(&request).await?;
+                        let done = endpoint.recv::<protocol::FdReadRetMsg>().await?;
+                        pending.complete(guest, WasiImportCompletion::FdRead(done))?;
+                    }
+                    WasiImportRequest::FdWriteObject(request) => {
+                        endpoint.send::<protocol::FdWriteObjectReqMsg>(&request).await?;
+                        let done = endpoint.recv::<protocol::FdWriteObjectRetMsg>().await?;
+                        pending.complete(guest, WasiImportCompletion::FdWriteObject(done))?;
+                    }
+                    // Other admitted imports follow the same direct Hibana row shape:
+                    // send the matching protocol::*ReqMsg, receive protocol::*RetMsg,
+                    // then complete the pending import with WasiImportCompletion.
+                }
             }
-            HibanaStep::MemoryGrowPending(pending) => {
-                pending.complete(guest, endpoint).await?;
+            WasiBoundaryStep::MemoryGrowPending(pending) => {
+                let request = pending.request();
+                endpoint.send::<protocol::MemoryGrowReqMsg>(&request).await?;
+                let decision = endpoint.recv::<protocol::MemoryGrowRetMsg>().await?;
+                pending.complete(guest, decision)?;
             }
-            HibanaStep::BudgetExpired(_) => run_id = run_id.wrapping_add(1),
-            HibanaStep::Exit(exit) => return Ok(exit.status() as i32),
+            WasiBoundaryStep::BudgetExpired(_) => run_id = run_id.wrapping_add(1),
+            WasiBoundaryStep::Exit(exit) => return Ok(exit.status() as i32),
         }
     }
 }
@@ -215,7 +231,7 @@ The repository includes one guest program and two host choreographies:
 | Path | Purpose |
 | --- | --- |
 | `examples/wasi_std_shell_app.rs` | a real `wasm32-wasip1` Rust `std` guest using `std::io` and `std::fs` |
-| `examples/direct_choreofs_write_rejection` | proves that a direct write does not advance when the refined ChoreoFS write row is absent |
+| `examples/direct_choreofs_write_rejection` | proves that a direct write does not advance when the ChoreoFS object write row is absent |
 | `examples/sequenced_choreofs_write` | proves that choreography can require reading `/objects/log` before writing `/outputs/led/green` |
 
 Run the demonstration:

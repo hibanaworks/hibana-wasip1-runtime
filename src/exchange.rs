@@ -14,28 +14,39 @@ use crate::{
     },
     protocol::{
         self, ArgsGet, BudgetExpired, BudgetRun, ClockResGet, ClockTimeGet, EnvironGet, FdBinding,
-        FdRequest, FdWriteRow, MemRights, PollOneoff, RandomGet, WASIP1_IO_CHUNK_CAPACITY,
+        FdReadRow, FdReaddirRow, FdRequest, FdWriteRow, MemRights, PollOneoff, RandomGet,
+        WASIP1_IO_CHUNK_CAPACITY, WASIP1_PATH_CHUNK_CAPACITY,
     },
 };
-use hibana::{Endpoint, EndpointError, runtime::wire::CodecError};
+use hibana::runtime::wire::CodecError;
 
 const FD_READ_RIGHT: u64 = 1 << 1;
 const FD_WRITE_RIGHT: u64 = 1 << 6;
 const FD_READDIR_RIGHT: u64 = 1 << 14;
 const MAX_ARG_REFS: usize = WASIP1_IO_CHUNK_CAPACITY;
 pub const FD_BINDING_CAPACITY: usize = 16;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RowId {
-    FdWrite,
-    FdWriteRefined,
-    FdRead,
-    FdReaddir,
-}
+const UNSUPPORTED_WASIP1_INLINE_REPLY_TOO_LARGE: u16 = 0x5101;
+const UNSUPPORTED_WASIP1_PATH_REPLY_TOO_LARGE: u16 = 0x5102;
+const UNSUPPORTED_WASIP1_CLOCK_ID_TOO_LARGE: u16 = 0x5103;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdBindingTable {
     entries: [Option<FdBinding>; FD_BINDING_CAPACITY],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdBindingCapacityError {
+    fd: u8,
+}
+
+impl FdBindingCapacityError {
+    pub const fn new(fd: u8) -> Self {
+        Self { fd }
+    }
+
+    pub const fn fd(self) -> u8 {
+        self.fd
+    }
 }
 
 impl FdBindingTable {
@@ -45,12 +56,12 @@ impl FdBindingTable {
         }
     }
 
-    pub fn bind_fd(&mut self, fd: u8, binding: FdBinding) -> bool {
+    pub fn bind_fd(&mut self, fd: u8, binding: FdBinding) -> Result<(), FdBindingCapacityError> {
         let Some(slot) = self.entries.get_mut(fd as usize) else {
-            return false;
+            return Err(FdBindingCapacityError::new(fd));
         };
         *slot = Some(binding);
-        true
+        Ok(())
     }
 
     pub fn remove_fd(&mut self, fd: u8) {
@@ -63,54 +74,35 @@ impl FdBindingTable {
         self.entries.get(fd as usize).and_then(|binding| *binding)
     }
 
-    pub fn bound_write_row(&self, fd: u8) -> Option<RowId> {
-        self.binding(fd)
-            .and_then(|binding| binding.write)
-            .map(fd_write_row_id)
+    pub fn bound_write_row(&self, fd: u8) -> Option<FdWriteRow> {
+        self.binding(fd).and_then(|binding| binding.write)
     }
 
-    pub fn bound_read_row(&self, fd: u8) -> Option<RowId> {
-        self.binding(fd).and_then(|binding| {
-            if binding.read.is_some() {
-                Some(RowId::FdRead)
-            } else {
-                None
-            }
-        })
+    pub fn bound_read_row(&self, fd: u8) -> Option<FdReadRow> {
+        self.binding(fd).and_then(|binding| binding.read)
     }
 
-    pub fn bound_readdir_row(&self, fd: u8) -> Option<RowId> {
-        self.binding(fd).and_then(|binding| {
-            if binding.readdir.is_some() {
-                Some(RowId::FdReaddir)
-            } else {
-                None
-            }
-        })
-    }
-}
-
-const fn fd_write_row_id(row: FdWriteRow) -> RowId {
-    match row {
-        FdWriteRow::Base => RowId::FdWrite,
-        FdWriteRow::Refined => RowId::FdWriteRefined,
+    pub fn bound_readdir_row(&self, fd: u8) -> Option<FdReaddirRow> {
+        self.binding(fd).and_then(|binding| binding.readdir)
     }
 }
 
 #[derive(Debug)]
 pub enum ExchangeError {
-    Endpoint(EndpointError),
     Codec(CodecError),
     Wasm(WasmError),
-    FdBindingCapacity,
+    FdBindingCapacity(FdBindingCapacityError),
     UnboundFd(u8),
+    CompletionMismatch {
+        pending: WasiImport,
+        completion: WasiImport,
+    },
+    ReturnFdMismatch {
+        import: WasiImport,
+        expected_fd: u8,
+        actual_fd: u8,
+    },
     GuestStorageAlreadyInitialized,
-}
-
-impl From<EndpointError> for ExchangeError {
-    fn from(error: EndpointError) -> Self {
-        Self::Endpoint(error)
-    }
 }
 
 impl From<CodecError> for ExchangeError {
@@ -122,6 +114,12 @@ impl From<CodecError> for ExchangeError {
 impl From<WasmError> for ExchangeError {
     fn from(error: WasmError) -> Self {
         Self::Wasm(error)
+    }
+}
+
+impl From<FdBindingCapacityError> for ExchangeError {
+    fn from(error: FdBindingCapacityError) -> Self {
+        Self::FdBindingCapacity(error)
     }
 }
 
@@ -189,15 +187,15 @@ impl<'a> HibanaWasiGuest<'a> {
         Ok(())
     }
 
-    pub async fn resume_hibana<const ROLE: u8>(
+    pub fn resume_wasi_boundary(
         &mut self,
-        endpoint: &mut Endpoint<'_, ROLE>,
         budget: BudgetRun,
-    ) -> Result<HibanaStep, ExchangeError> {
-        match self.guest.resume(budget)? {
+    ) -> Result<WasiBoundaryStep, ExchangeError> {
+        let event = self.guest.resume(budget);
+        match event? {
             Event::Call(call) => {
-                let pending = send_call(&self.guest, call, endpoint, &self.bindings).await?;
-                Ok(HibanaStep::ImportPending(HibanaImportPending { pending }))
+                let pending = lower_call(&self.guest, call, &self.bindings);
+                Ok(WasiBoundaryStep::ImportPending(pending?))
             }
             Event::MemoryGrowPending(pending) => {
                 let request = protocol::MemoryGrowReq(protocol::MemoryGrow::new(
@@ -205,15 +203,13 @@ impl<'a> HibanaWasiGuest<'a> {
                     pending.requested_pages(),
                     pending.max_pages(),
                 ));
-                endpoint
-                    .send::<protocol::MemoryGrowReqMsg>(&request)
-                    .await?;
-                Ok(HibanaStep::MemoryGrowPending(HibanaMemoryGrowPending {
+                Ok(WasiBoundaryStep::MemoryGrowPending(WasiMemoryGrowPending {
+                    request,
                     pending,
                 }))
             }
-            Event::BudgetExpired(expired) => Ok(HibanaStep::BudgetExpired(expired)),
-            Event::Exit(exit) => Ok(HibanaStep::Exit(exit)),
+            Event::BudgetExpired(expired) => Ok(WasiBoundaryStep::BudgetExpired(expired)),
+            Event::Exit(exit) => Ok(WasiBoundaryStep::Exit(exit)),
         }
     }
 
@@ -222,34 +218,47 @@ impl<'a> HibanaWasiGuest<'a> {
     }
 }
 
-pub enum HibanaStep {
-    ImportPending(HibanaImportPending),
-    MemoryGrowPending(HibanaMemoryGrowPending),
+pub enum WasiBoundaryStep {
+    ImportPending(WasiImportPending),
+    MemoryGrowPending(WasiMemoryGrowPending),
     BudgetExpired(BudgetExpired),
     Exit(Exit),
 }
 
-pub struct HibanaImportPending {
+pub struct WasiImportPending {
+    request: WasiImportRequest,
     pending: PendingCall,
 }
 
-impl HibanaImportPending {
-    pub async fn complete<const ROLE: u8>(
+impl WasiImportPending {
+    pub const fn request(&self) -> WasiImportRequest {
+        self.request
+    }
+
+    pub const fn import(&self) -> WasiImport {
+        self.request.import()
+    }
+
+    pub fn complete(
         self,
         guest: &mut HibanaWasiGuest<'_>,
-        endpoint: &mut Endpoint<'_, ROLE>,
+        completion: WasiImportCompletion,
     ) -> Result<(), ExchangeError> {
         self.pending
-            .complete(&mut guest.guest, endpoint, &mut guest.bindings)
-            .await
+            .complete_with(&mut guest.guest, completion, &mut guest.bindings)
     }
 }
 
-pub struct HibanaMemoryGrowPending {
+pub struct WasiMemoryGrowPending {
+    request: protocol::MemoryGrowReq,
     pending: MemoryGrowPending,
 }
 
-impl HibanaMemoryGrowPending {
+impl WasiMemoryGrowPending {
+    pub const fn request(&self) -> protocol::MemoryGrowReq {
+        self.request
+    }
+
     pub const fn previous_pages(&self) -> u32 {
         self.pending.previous_pages()
     }
@@ -262,12 +271,11 @@ impl HibanaMemoryGrowPending {
         self.pending.max_pages()
     }
 
-    pub async fn complete<const ROLE: u8>(
+    pub fn complete(
         self,
         guest: &mut HibanaWasiGuest<'_>,
-        endpoint: &mut Endpoint<'_, ROLE>,
+        decision: protocol::MemoryGrowRet,
     ) -> Result<(), ExchangeError> {
-        let decision = endpoint.recv::<protocol::MemoryGrowRetMsg>().await?;
         self.pending
             .complete(&mut guest.guest, decision.0.granted())?;
         Ok(())
@@ -277,7 +285,7 @@ impl HibanaMemoryGrowPending {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WasiImport {
     FdWrite,
-    FdWriteRefined,
+    FdWriteObject,
     FdRead,
     FdReaddir,
     PathOpen,
@@ -301,7 +309,7 @@ impl WasiImport {
     pub const fn from_label(label: u8) -> Option<Self> {
         match label {
             protocol::LABEL_WASI_FD_WRITE => Some(Self::FdWrite),
-            protocol::LABEL_WASI_FD_WRITE_REFINED => Some(Self::FdWriteRefined),
+            protocol::LABEL_WASI_FD_WRITE_OBJECT => Some(Self::FdWriteObject),
             protocol::LABEL_WASI_FD_READ => Some(Self::FdRead),
             protocol::LABEL_WASI_FD_READDIR => Some(Self::FdReaddir),
             protocol::LABEL_WASI_PATH_OPEN => Some(Self::PathOpen),
@@ -324,9 +332,107 @@ impl WasiImport {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WasiImportRequest {
+    FdWrite(protocol::FdWriteReq),
+    FdWriteObject(protocol::FdWriteReq),
+    FdRead(protocol::FdReadReq),
+    FdReaddir(protocol::FdReaddirReq),
+    PathOpen(protocol::PathOpenReq),
+    FdPrestatGet(protocol::FdPrestatGetReq),
+    FdPrestatDirName(protocol::FdPrestatDirNameReq),
+    FdFilestatGet(protocol::FdFilestatGetReq),
+    ArgsSizesGet(protocol::ArgsSizesGetReq),
+    ArgsGet(protocol::ArgsGetReq),
+    EnvironSizesGet(protocol::EnvironSizesGetReq),
+    EnvironGet(protocol::EnvironGetReq),
+    FdFdstatGet(protocol::FdFdstatGetReq),
+    PathFilestatGet(protocol::PathFilestatGetReq),
+    FdClose(protocol::FdCloseReq),
+    ClockResGet(protocol::ClockResGetReq),
+    ClockTimeGet(protocol::ClockTimeGetReq),
+    PollOneoff(protocol::PollOneoffReq),
+    RandomGet(protocol::RandomGetReq),
+}
+
+impl WasiImportRequest {
+    pub const fn import(self) -> WasiImport {
+        match self {
+            Self::FdWrite(_) => WasiImport::FdWrite,
+            Self::FdWriteObject(_) => WasiImport::FdWriteObject,
+            Self::FdRead(_) => WasiImport::FdRead,
+            Self::FdReaddir(_) => WasiImport::FdReaddir,
+            Self::PathOpen(_) => WasiImport::PathOpen,
+            Self::FdPrestatGet(_) => WasiImport::FdPrestatGet,
+            Self::FdPrestatDirName(_) => WasiImport::FdPrestatDirName,
+            Self::FdFilestatGet(_) => WasiImport::FdFilestatGet,
+            Self::ArgsSizesGet(_) => WasiImport::ArgsSizesGet,
+            Self::ArgsGet(_) => WasiImport::ArgsGet,
+            Self::EnvironSizesGet(_) => WasiImport::EnvironSizesGet,
+            Self::EnvironGet(_) => WasiImport::EnvironGet,
+            Self::FdFdstatGet(_) => WasiImport::FdFdstatGet,
+            Self::PathFilestatGet(_) => WasiImport::PathFilestatGet,
+            Self::FdClose(_) => WasiImport::FdClose,
+            Self::ClockResGet(_) => WasiImport::ClockResGet,
+            Self::ClockTimeGet(_) => WasiImport::ClockTimeGet,
+            Self::PollOneoff(_) => WasiImport::PollOneoff,
+            Self::RandomGet(_) => WasiImport::RandomGet,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WasiImportCompletion {
+    FdWrite(protocol::FdWriteDoneRet),
+    FdWriteObject(protocol::FdWriteDoneRet),
+    FdRead(protocol::FdReadDoneRet),
+    FdReaddir(protocol::FdReaddirDoneRet),
+    PathOpen(protocol::PathOpenedRet),
+    FdPrestatGet(protocol::FdPrestatRet),
+    FdPrestatDirName(protocol::FdPrestatDirNameRet),
+    FdFilestatGet(protocol::FdFilestatRet),
+    ArgsSizesGet(protocol::ArgsSizesRet),
+    ArgsGet(protocol::ArgsDoneRet),
+    EnvironSizesGet(protocol::EnvironSizesRet),
+    EnvironGet(protocol::EnvironDoneRet),
+    FdFdstatGet(protocol::FdStatRet),
+    PathFilestatGet(protocol::PathFilestatRet),
+    FdClose(protocol::FdClosedRet),
+    ClockResGet(protocol::ClockResolutionRet),
+    ClockTimeGet(protocol::ClockTimeRet),
+    PollOneoff(protocol::PollReadyRet),
+    RandomGet(protocol::RandomDoneRet),
+}
+
+impl WasiImportCompletion {
+    pub const fn import(self) -> WasiImport {
+        match self {
+            Self::FdWrite(_) => WasiImport::FdWrite,
+            Self::FdWriteObject(_) => WasiImport::FdWriteObject,
+            Self::FdRead(_) => WasiImport::FdRead,
+            Self::FdReaddir(_) => WasiImport::FdReaddir,
+            Self::PathOpen(_) => WasiImport::PathOpen,
+            Self::FdPrestatGet(_) => WasiImport::FdPrestatGet,
+            Self::FdPrestatDirName(_) => WasiImport::FdPrestatDirName,
+            Self::FdFilestatGet(_) => WasiImport::FdFilestatGet,
+            Self::ArgsSizesGet(_) => WasiImport::ArgsSizesGet,
+            Self::ArgsGet(_) => WasiImport::ArgsGet,
+            Self::EnvironSizesGet(_) => WasiImport::EnvironSizesGet,
+            Self::EnvironGet(_) => WasiImport::EnvironGet,
+            Self::FdFdstatGet(_) => WasiImport::FdFdstatGet,
+            Self::PathFilestatGet(_) => WasiImport::PathFilestatGet,
+            Self::FdClose(_) => WasiImport::FdClose,
+            Self::ClockResGet(_) => WasiImport::ClockResGet,
+            Self::ClockTimeGet(_) => WasiImport::ClockTimeGet,
+            Self::PollOneoff(_) => WasiImport::PollOneoff,
+            Self::RandomGet(_) => WasiImport::RandomGet,
+        }
+    }
+}
+
 enum PendingCall {
     FdWrite(wasm::FdWrite),
-    FdWriteRefined(wasm::FdWrite),
+    FdWriteObject(wasm::FdWrite),
     FdRead(wasm::FdRead),
     FdReaddir(wasm::FdReaddir),
     PathOpen(wasm::PathOpen),
@@ -347,109 +453,135 @@ enum PendingCall {
 }
 
 impl PendingCall {
-    pub async fn complete<const ROLE: u8>(
+    fn import(&self) -> WasiImport {
+        match self {
+            Self::FdWrite(_) => WasiImport::FdWrite,
+            Self::FdWriteObject(_) => WasiImport::FdWriteObject,
+            Self::FdRead(_) => WasiImport::FdRead,
+            Self::FdReaddir(_) => WasiImport::FdReaddir,
+            Self::PathOpen(_) => WasiImport::PathOpen,
+            Self::FdPrestatGet(_) => WasiImport::FdPrestatGet,
+            Self::FdPrestatDirName(_) => WasiImport::FdPrestatDirName,
+            Self::FdFilestatGet(_) => WasiImport::FdFilestatGet,
+            Self::ArgsSizesGet(_) => WasiImport::ArgsSizesGet,
+            Self::ArgsGet(_) => WasiImport::ArgsGet,
+            Self::EnvironSizesGet(_) => WasiImport::EnvironSizesGet,
+            Self::EnvironGet(_) => WasiImport::EnvironGet,
+            Self::FdFdstatGet(_) => WasiImport::FdFdstatGet,
+            Self::PathFilestatGet(_) => WasiImport::PathFilestatGet,
+            Self::FdClose(_) => WasiImport::FdClose,
+            Self::ClockResGet(_) => WasiImport::ClockResGet,
+            Self::ClockTimeGet(_) => WasiImport::ClockTimeGet,
+            Self::PollOneoff(_) => WasiImport::PollOneoff,
+            Self::RandomGet(_) => WasiImport::RandomGet,
+        }
+    }
+
+    fn complete_with(
         self,
         guest: &mut Guest<'_>,
-        endpoint: &mut Endpoint<'_, ROLE>,
+        completion: WasiImportCompletion,
         bindings: &mut FdBindingTable,
     ) -> Result<(), ExchangeError> {
-        match self {
-            Self::FdWrite(call) => {
-                let done = endpoint.recv::<protocol::FdWriteRetMsg>().await?;
+        let pending = self.import();
+        let completed = completion.import();
+        if pending != completed {
+            return Err(ExchangeError::CompletionMismatch {
+                pending,
+                completion: completed,
+            });
+        }
+
+        match (self, completion) {
+            (Self::FdWrite(call), WasiImportCompletion::FdWrite(done)) => {
+                expect_fd(WasiImport::FdWrite, call.fd(), done.0.fd())?;
                 call.complete(guest, done.0.errno() as u32)?;
             }
-            Self::FdWriteRefined(call) => {
-                let done = endpoint.recv::<protocol::FdWriteRefinedRetMsg>().await?;
+            (Self::FdWriteObject(call), WasiImportCompletion::FdWriteObject(done)) => {
+                expect_fd(WasiImport::FdWriteObject, call.fd(), done.0.fd())?;
                 call.complete(guest, done.0.errno() as u32)?;
             }
-            Self::FdRead(call) => {
-                let done = endpoint.recv::<protocol::FdReadRetMsg>().await?;
-                call.complete(guest, done.0.as_bytes(), 0)?;
-            }
-            Self::FdReaddir(call) => {
-                let done = endpoint.recv::<protocol::FdReaddirRetMsg>().await?;
+            (Self::FdRead(call), WasiImportCompletion::FdRead(done)) => {
+                expect_fd(WasiImport::FdRead, call.fd(), done.0.fd())?;
                 call.complete(guest, done.0.as_bytes(), done.0.errno() as u32)?;
             }
-            Self::PathOpen(call) => {
-                let opened = endpoint.recv::<protocol::PathOpenRetMsg>().await?;
+            (Self::FdReaddir(call), WasiImportCompletion::FdReaddir(done)) => {
+                expect_fd(WasiImport::FdReaddir, call.fd(), done.0.fd())?;
+                call.complete(guest, done.0.as_bytes(), done.0.errno() as u32)?;
+            }
+            (Self::PathOpen(call), WasiImportCompletion::PathOpen(opened)) => {
                 call.complete(guest, opened.0.fd() as u32, opened.0.errno() as u32)?;
-                if opened.0.errno() == 0
-                    && !opened.0.binding().is_empty()
-                    && !bindings.bind_fd(opened.0.fd(), opened.0.binding())
-                {
-                    return Err(ExchangeError::FdBindingCapacity);
+                if opened.0.errno() == 0 && !opened.0.binding().is_empty() {
+                    bindings.bind_fd(opened.0.fd(), opened.0.binding())?;
                 }
             }
-            Self::FdPrestatGet(call) => {
-                let prestat = endpoint.recv::<protocol::FdPrestatGetRetMsg>().await?;
+            (Self::FdPrestatGet(call), WasiImportCompletion::FdPrestatGet(prestat)) => {
+                expect_fd(WasiImport::FdPrestatGet, call.fd(), prestat.0.fd())?;
                 call.complete(guest, prestat.0.name_len() as u32, prestat.0.errno() as u32)?;
             }
-            Self::FdPrestatDirName(call) => {
-                let name = endpoint.recv::<protocol::FdPrestatDirNameRetMsg>().await?;
+            (Self::FdPrestatDirName(call), WasiImportCompletion::FdPrestatDirName(name)) => {
+                expect_fd(WasiImport::FdPrestatDirName, call.fd(), name.0.fd())?;
                 call.complete(guest, name.0.as_bytes(), name.0.errno() as u32)?;
             }
-            Self::FdFilestatGet(call) => {
-                let stat = endpoint.recv::<protocol::FdFilestatGetRetMsg>().await?;
+            (Self::FdFilestatGet(call), WasiImportCompletion::FdFilestatGet(stat)) => {
                 call.complete(guest, wasm_file_stat(stat.0), stat.0.errno() as u32)?;
             }
-            Self::ArgsSizesGet(call) => {
-                let sizes = endpoint.recv::<protocol::ArgsSizesGetRetMsg>().await?;
+            (Self::ArgsSizesGet(call), WasiImportCompletion::ArgsSizesGet(sizes)) => {
                 call.complete(guest, sizes.0.count() as u32, sizes.0.buf_size() as u32, 0)?;
             }
-            Self::ArgsGet(call) => {
-                let done = endpoint.recv::<protocol::ArgsGetRetMsg>().await?;
+            (Self::ArgsGet(call), WasiImportCompletion::ArgsGet(done)) => {
                 let mut args = [&[][..]; MAX_ARG_REFS];
                 let count = split_args(done.0.as_bytes(), &mut args);
                 call.complete(guest, &args[..count], 0)?;
             }
-            Self::EnvironSizesGet(call) => {
-                let sizes = endpoint.recv::<protocol::EnvironSizesGetRetMsg>().await?;
+            (Self::EnvironSizesGet(call), WasiImportCompletion::EnvironSizesGet(sizes)) => {
                 call.complete(guest, sizes.0.count() as u32, sizes.0.buf_size() as u32, 0)?;
             }
-            Self::EnvironGet(call) => {
-                let _done = endpoint.recv::<protocol::EnvironGetRetMsg>().await?;
+            (Self::EnvironGet(call), WasiImportCompletion::EnvironGet(_done)) => {
                 call.complete(guest, &[], 0)?;
             }
-            Self::FdFdstatGet(call) => {
-                let stat = endpoint.recv::<protocol::FdFdstatGetRetMsg>().await?;
-                call.complete(guest, wasm_fd_stat(stat.0), 0)?;
+            (Self::FdFdstatGet(call), WasiImportCompletion::FdFdstatGet(stat)) => {
+                expect_fd(WasiImport::FdFdstatGet, call.fd(), stat.0.fd())?;
+                call.complete(guest, wasm_fd_stat(stat.0), stat.0.errno() as u32)?;
             }
-            Self::PathFilestatGet(call) => {
-                let stat = endpoint.recv::<protocol::PathFilestatGetRetMsg>().await?;
+            (Self::PathFilestatGet(call), WasiImportCompletion::PathFilestatGet(stat)) => {
                 call.complete(guest, wasm_file_stat(stat.0), stat.0.errno() as u32)?;
             }
-            Self::FdClose(call) => {
-                let _closed = endpoint.recv::<protocol::FdCloseRetMsg>().await?;
-                bindings.remove_fd(call.fd());
-                call.complete(guest, 0)?;
+            (Self::FdClose(call), WasiImportCompletion::FdClose(closed)) => {
+                expect_fd(WasiImport::FdClose, call.fd(), closed.0.fd())?;
+                if closed.0.errno() == 0 {
+                    bindings.remove_fd(call.fd());
+                }
+                call.complete(guest, closed.0.errno() as u32)?;
             }
-            Self::ClockResGet(call) => {
-                let resolution = endpoint.recv::<protocol::ClockResGetRetMsg>().await?;
+            (Self::ClockResGet(call), WasiImportCompletion::ClockResGet(resolution)) => {
                 call.complete(guest, resolution.0.nanos(), 0)?;
             }
-            Self::ClockTimeGet(call) => {
-                let time = endpoint.recv::<protocol::ClockTimeGetRetMsg>().await?;
+            (Self::ClockTimeGet(call), WasiImportCompletion::ClockTimeGet(time)) => {
                 call.complete(guest, time.0.nanos(), 0)?;
             }
-            Self::PollOneoff(call) => {
-                let ready = endpoint.recv::<protocol::PollOneoffRetMsg>().await?;
+            (Self::PollOneoff(call), WasiImportCompletion::PollOneoff(ready)) => {
                 call.complete(guest, ready.0.ready() as u32, 0)?;
             }
-            Self::RandomGet(call) => {
-                let done = endpoint.recv::<protocol::RandomGetRetMsg>().await?;
+            (Self::RandomGet(call), WasiImportCompletion::RandomGet(done)) => {
                 call.complete(guest, done.0.as_bytes(), 0)?;
+            }
+            _ => {
+                return Err(ExchangeError::CompletionMismatch {
+                    pending,
+                    completion: completed,
+                });
             }
         }
         Ok(())
     }
 }
 
-async fn send_call<const ROLE: u8>(
+fn lower_call(
     guest: &Guest<'_>,
     call: Call,
-    endpoint: &mut Endpoint<'_, ROLE>,
     bindings: &FdBindingTable,
-) -> Result<PendingCall, ExchangeError> {
+) -> Result<WasiImportPending, ExchangeError> {
     match call {
         Call::FdWrite(call) => {
             let payload = call.payload(guest)?;
@@ -458,24 +590,27 @@ async fn send_call<const ROLE: u8>(
             let row = bindings
                 .bound_write_row(call.fd())
                 .ok_or(ExchangeError::UnboundFd(call.fd()))?;
-            if row == RowId::FdWriteRefined {
-                endpoint
-                    .send::<protocol::FdWriteRefinedReqMsg>(&request)
-                    .await?;
-                Ok(PendingCall::FdWriteRefined(call))
-            } else {
-                endpoint.send::<protocol::FdWriteReqMsg>(&request).await?;
-                Ok(PendingCall::FdWrite(call))
+            match row {
+                FdWriteRow::Base => Ok(WasiImportPending {
+                    request: WasiImportRequest::FdWrite(request),
+                    pending: PendingCall::FdWrite(call),
+                }),
+                FdWriteRow::Object => Ok(WasiImportPending {
+                    request: WasiImportRequest::FdWriteObject(request),
+                    pending: PendingCall::FdWriteObject(call),
+                }),
             }
         }
         Call::FdRead(call) => {
             bindings
                 .bound_read_row(call.fd())
                 .ok_or(ExchangeError::UnboundFd(call.fd()))?;
-            let max_len = bounded_u8(call.max_len(guest)?);
+            let max_len = inline_io_request_len(call.max_len(guest)?);
             let request = protocol::FdReadReq(protocol::FdRead::new(call.fd(), max_len)?);
-            endpoint.send::<protocol::FdReadReqMsg>(&request).await?;
-            Ok(PendingCall::FdRead(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::FdRead(request),
+                pending: PendingCall::FdRead(call),
+            })
         }
         Call::FdReaddir(call) => {
             bindings
@@ -484,10 +619,12 @@ async fn send_call<const ROLE: u8>(
             let request = protocol::FdReaddirReq(protocol::FdReaddir::new(
                 call.fd(),
                 call.cookie(),
-                bounded_u8(call.max_len()),
+                inline_io_request_len(call.max_len()),
             )?);
-            endpoint.send::<protocol::FdReaddirReqMsg>(&request).await?;
-            Ok(PendingCall::FdReaddir(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::FdReaddir(request),
+                pending: PendingCall::FdReaddir(call),
+            })
         }
         Call::PathOpen(call) => {
             let path = call.path_bytes(guest)?;
@@ -496,65 +633,69 @@ async fn send_call<const ROLE: u8>(
                 call.rights_base(),
                 path.as_bytes(),
             )?);
-            endpoint.send::<protocol::PathOpenReqMsg>(&request).await?;
-            Ok(PendingCall::PathOpen(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::PathOpen(request),
+                pending: PendingCall::PathOpen(call),
+            })
         }
         Call::FdPrestatGet(call) => {
             let request = protocol::FdPrestatGetReq(FdRequest::new(call.fd()));
-            endpoint
-                .send::<protocol::FdPrestatGetReqMsg>(&request)
-                .await?;
-            Ok(PendingCall::FdPrestatGet(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::FdPrestatGet(request),
+                pending: PendingCall::FdPrestatGet(call),
+            })
         }
         Call::FdPrestatDirName(call) => {
             let request = protocol::FdPrestatDirNameReq(protocol::FdPrestatDirName::new(
                 call.fd(),
-                bounded_u8(call.max_len()),
+                exact_path_reply_len(call.max_len())?,
             )?);
-            endpoint
-                .send::<protocol::FdPrestatDirNameReqMsg>(&request)
-                .await?;
-            Ok(PendingCall::FdPrestatDirName(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::FdPrestatDirName(request),
+                pending: PendingCall::FdPrestatDirName(call),
+            })
         }
         Call::FdFilestatGet(call) => {
             let request = protocol::FdFilestatGetReq(FdRequest::new(call.fd()));
-            endpoint
-                .send::<protocol::FdFilestatGetReqMsg>(&request)
-                .await?;
-            Ok(PendingCall::FdFilestatGet(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::FdFilestatGet(request),
+                pending: PendingCall::FdFilestatGet(call),
+            })
         }
         Call::ArgsSizesGet(call) => {
             let request = protocol::ArgsSizesGetReq(protocol::ArgsSizesGet);
-            endpoint
-                .send::<protocol::ArgsSizesGetReqMsg>(&request)
-                .await?;
-            Ok(PendingCall::ArgsSizesGet(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::ArgsSizesGet(request),
+                pending: PendingCall::ArgsSizesGet(call),
+            })
         }
         Call::ArgsGet(call) => {
             let request = protocol::ArgsGetReq(ArgsGet::new(WASIP1_IO_CHUNK_CAPACITY as u8)?);
-            endpoint.send::<protocol::ArgsGetReqMsg>(&request).await?;
-            Ok(PendingCall::ArgsGet(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::ArgsGet(request),
+                pending: PendingCall::ArgsGet(call),
+            })
         }
         Call::EnvironSizesGet(call) => {
             let request = protocol::EnvironSizesGetReq(protocol::EnvironSizesGet);
-            endpoint
-                .send::<protocol::EnvironSizesGetReqMsg>(&request)
-                .await?;
-            Ok(PendingCall::EnvironSizesGet(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::EnvironSizesGet(request),
+                pending: PendingCall::EnvironSizesGet(call),
+            })
         }
         Call::EnvironGet(call) => {
             let request = protocol::EnvironGetReq(EnvironGet::new(WASIP1_IO_CHUNK_CAPACITY as u8)?);
-            endpoint
-                .send::<protocol::EnvironGetReqMsg>(&request)
-                .await?;
-            Ok(PendingCall::EnvironGet(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::EnvironGet(request),
+                pending: PendingCall::EnvironGet(call),
+            })
         }
         Call::FdFdstatGet(call) => {
             let request = protocol::FdFdstatGetReq(FdRequest::new(call.fd()));
-            endpoint
-                .send::<protocol::FdFdstatGetReqMsg>(&request)
-                .await?;
-            Ok(PendingCall::FdFdstatGet(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::FdFdstatGet(request),
+                pending: PendingCall::FdFdstatGet(call),
+            })
         }
         Call::PathFilestatGet(call) => {
             let path = call.path_bytes(guest)?;
@@ -563,54 +704,92 @@ async fn send_call<const ROLE: u8>(
                 call.flags(),
                 path.as_bytes(),
             )?);
-            endpoint
-                .send::<protocol::PathFilestatGetReqMsg>(&request)
-                .await?;
-            Ok(PendingCall::PathFilestatGet(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::PathFilestatGet(request),
+                pending: PendingCall::PathFilestatGet(call),
+            })
         }
         Call::FdClose(call) => {
             let request = protocol::FdCloseReq(FdRequest::new(call.fd()));
-            endpoint.send::<protocol::FdCloseReqMsg>(&request).await?;
-            Ok(PendingCall::FdClose(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::FdClose(request),
+                pending: PendingCall::FdClose(call),
+            })
         }
         Call::ClockResGet(call) => {
-            let request = protocol::ClockResGetReq(ClockResGet::new(bounded_u8(call.clock_id())));
-            endpoint
-                .send::<protocol::ClockResGetReqMsg>(&request)
-                .await?;
-            Ok(PendingCall::ClockResGet(call))
+            let request = protocol::ClockResGetReq(ClockResGet::new(clock_id_u8(call.clock_id())?));
+            Ok(WasiImportPending {
+                request: WasiImportRequest::ClockResGet(request),
+                pending: PendingCall::ClockResGet(call),
+            })
         }
         Call::ClockTimeGet(call) => {
             let request = protocol::ClockTimeGetReq(ClockTimeGet::new(
-                bounded_u8(call.clock_id()),
+                clock_id_u8(call.clock_id())?,
                 call.precision(),
             ));
-            endpoint
-                .send::<protocol::ClockTimeGetReqMsg>(&request)
-                .await?;
-            Ok(PendingCall::ClockTimeGet(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::ClockTimeGet(request),
+                pending: PendingCall::ClockTimeGet(call),
+            })
         }
         Call::PollOneoff(call) => {
             let request = protocol::PollOneoffReq(PollOneoff::new(call.delay_ticks(guest)?));
-            endpoint
-                .send::<protocol::PollOneoffReqMsg>(&request)
-                .await?;
-            Ok(PendingCall::PollOneoff(call))
+            Ok(WasiImportPending {
+                request: WasiImportRequest::PollOneoff(request),
+                pending: PendingCall::PollOneoff(call),
+            })
         }
         Call::RandomGet(call) => {
-            let request = protocol::RandomGetReq(RandomGet::new(bounded_u8(call.buf_len()))?);
-            endpoint.send::<protocol::RandomGetReqMsg>(&request).await?;
-            Ok(PendingCall::RandomGet(call))
+            let request =
+                protocol::RandomGetReq(RandomGet::new(exact_io_reply_len(call.buf_len())?)?);
+            Ok(WasiImportPending {
+                request: WasiImportRequest::RandomGet(request),
+                pending: PendingCall::RandomGet(call),
+            })
         }
     }
 }
 
-fn bounded_u8(value: impl TryInto<usize>) -> u8 {
-    let value = match value.try_into() {
-        Ok(value) => value,
-        Err(_) => WASIP1_IO_CHUNK_CAPACITY,
-    };
+fn expect_fd(import: WasiImport, expected_fd: u8, actual_fd: u8) -> Result<(), ExchangeError> {
+    if expected_fd == actual_fd {
+        Ok(())
+    } else {
+        Err(ExchangeError::ReturnFdMismatch {
+            import,
+            expected_fd,
+            actual_fd,
+        })
+    }
+}
+
+fn inline_io_request_len(value: usize) -> u8 {
     value.min(WASIP1_IO_CHUNK_CAPACITY) as u8
+}
+
+fn exact_io_reply_len(value: u32) -> Result<u8, ExchangeError> {
+    let len = value as usize;
+    if len <= WASIP1_IO_CHUNK_CAPACITY {
+        Ok(len as u8)
+    } else {
+        Err(unsupported(UNSUPPORTED_WASIP1_INLINE_REPLY_TOO_LARGE))
+    }
+}
+
+fn exact_path_reply_len(value: usize) -> Result<u8, ExchangeError> {
+    if value <= WASIP1_PATH_CHUNK_CAPACITY {
+        Ok(value as u8)
+    } else {
+        Err(unsupported(UNSUPPORTED_WASIP1_PATH_REPLY_TOO_LARGE))
+    }
+}
+
+fn clock_id_u8(value: u32) -> Result<u8, ExchangeError> {
+    u8::try_from(value).map_err(|_| unsupported(UNSUPPORTED_WASIP1_CLOCK_ID_TOO_LARGE))
+}
+
+fn unsupported(code: u16) -> ExchangeError {
+    ExchangeError::Wasm(WasmError::Unsupported(code))
 }
 
 fn split_args<'a>(bytes: &'a [u8], out: &mut [&'a [u8]; MAX_ARG_REFS]) -> usize {
@@ -639,7 +818,13 @@ fn wasm_file_stat(stat: protocol::FileStat) -> WasmFileStat {
 
 #[cfg(test)]
 mod tests {
-    use super::{FdBindingTable, HibanaImportPending, PendingCall};
+    use super::{
+        ExchangeError, FdBindingTable, PendingCall, UNSUPPORTED_WASIP1_CLOCK_ID_TOO_LARGE,
+        UNSUPPORTED_WASIP1_INLINE_REPLY_TOO_LARGE, UNSUPPORTED_WASIP1_PATH_REPLY_TOO_LARGE,
+        WasiBoundaryStep, WasiImportPending, WasiImportRequest, clock_id_u8, exact_io_reply_len,
+        exact_path_reply_len, inline_io_request_len,
+    };
+    use crate::WasmError;
     use core::mem::size_of;
 
     #[test]
@@ -655,9 +840,50 @@ mod tests {
             size_of::<PendingCall>()
         );
         assert!(
-            size_of::<HibanaImportPending>() <= 64,
-            "HibanaImportPending uses {} bytes",
-            size_of::<HibanaImportPending>()
+            size_of::<WasiImportRequest>() <= 80,
+            "WasiImportRequest uses {} bytes",
+            size_of::<WasiImportRequest>()
         );
+        assert!(
+            size_of::<WasiImportPending>() <= 128,
+            "WasiImportPending uses {} bytes",
+            size_of::<WasiImportPending>()
+        );
+        assert!(
+            size_of::<WasiBoundaryStep>() <= 136,
+            "WasiBoundaryStep uses {} bytes",
+            size_of::<WasiBoundaryStep>()
+        );
+    }
+
+    #[test]
+    fn inline_io_len_only_clamps_partial_transfer_imports() {
+        assert_eq!(inline_io_request_len(0), 0);
+        assert_eq!(inline_io_request_len(64), 64);
+        assert_eq!(inline_io_request_len(65), 64);
+
+        assert!(matches!(exact_io_reply_len(64), Ok(64)));
+        assert!(matches!(
+            exact_io_reply_len(65),
+            Err(ExchangeError::Wasm(WasmError::Unsupported(code)))
+                if code == UNSUPPORTED_WASIP1_INLINE_REPLY_TOO_LARGE
+        ));
+    }
+
+    #[test]
+    fn exact_path_and_clock_values_fail_fast() {
+        assert!(matches!(exact_path_reply_len(40), Ok(40)));
+        assert!(matches!(
+            exact_path_reply_len(41),
+            Err(ExchangeError::Wasm(WasmError::Unsupported(code)))
+                if code == UNSUPPORTED_WASIP1_PATH_REPLY_TOO_LARGE
+        ));
+
+        assert!(matches!(clock_id_u8(255), Ok(255)));
+        assert!(matches!(
+            clock_id_u8(256),
+            Err(ExchangeError::Wasm(WasmError::Unsupported(code)))
+                if code == UNSUPPORTED_WASIP1_CLOCK_ID_TOO_LARGE
+        ));
     }
 }

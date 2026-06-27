@@ -2,7 +2,7 @@ use hibana::runtime::wire::CodecError;
 
 use crate::protocol::{
     self, FdBinding, FdClosed, FdReadDone, FdReaddirDone, FdStat, FdWriteDone, MemRights,
-    PathOpened, WASIP1_IO_CHUNK_CAPACITY,
+    PathOpened,
 };
 
 const ERRNO_SUCCESS: u16 = 0;
@@ -483,10 +483,10 @@ impl<'a> ChoreoFs<'a> {
 
     pub fn fd_read(&self, read: protocol::FdRead) -> ChoreoFsRead<'a> {
         let Some(material) = self.material_for_fd(read.fd()) else {
-            return ChoreoFsRead::empty(read, None);
+            return ChoreoFsRead::denied(read, None, ERRNO_BADF);
         };
         let ChoreoFsObjectMaterialKind::Readable(bytes) = material.kind else {
-            return ChoreoFsRead::empty(read, Some(material.object()));
+            return ChoreoFsRead::denied(read, Some(material.object()), ERRNO_BADF);
         };
         ChoreoFsRead::ready(read, material.object(), bytes)
     }
@@ -506,16 +506,22 @@ impl<'a> ChoreoFs<'a> {
 
     pub fn fd_fdstat_get(&self, request: protocol::FdRequest) -> protocol::FdStatRet {
         let fd = request.fd();
-        let rights = match self.material_for_fd(fd) {
-            Some(material) => rights_from_binding(material.binding()),
-            None => MemRights::Read,
-        };
-        protocol::FdStatRet(FdStat::new(fd, rights))
+        match self.material_for_fd(fd) {
+            Some(material) => {
+                protocol::FdStatRet(FdStat::new(fd, rights_from_binding(material.binding())))
+            }
+            None => protocol::FdStatRet(FdStat::new_with_errno(fd, MemRights::Read, ERRNO_BADF)),
+        }
     }
 
-    pub const fn fd_close(&self, request: protocol::FdRequest) -> protocol::FdClosedRet {
-        let _ = self;
-        protocol::FdClosedRet(FdClosed::new(request.fd()))
+    pub fn fd_close(&self, request: protocol::FdRequest) -> protocol::FdClosedRet {
+        let fd = request.fd();
+        let errno = if self.material_for_fd(fd).is_some() {
+            ERRNO_SUCCESS
+        } else {
+            ERRNO_BADF
+        };
+        protocol::FdClosedRet(FdClosed::new_with_errno(fd, errno))
     }
 
     fn material_for_fd(&self, fd: u8) -> Option<ChoreoFsObjectMaterial<'a>> {
@@ -602,6 +608,7 @@ pub struct ChoreoFsRead<'a> {
     request: protocol::FdRead,
     object: Option<ObjectId>,
     bytes: Option<&'a [u8]>,
+    errno: u16,
 }
 
 impl<'a> ChoreoFsRead<'a> {
@@ -610,14 +617,16 @@ impl<'a> ChoreoFsRead<'a> {
             request,
             object: Some(object),
             bytes: Some(bytes),
+            errno: ERRNO_SUCCESS,
         }
     }
 
-    const fn empty(request: protocol::FdRead, object: Option<ObjectId>) -> Self {
+    const fn denied(request: protocol::FdRead, object: Option<ObjectId>, errno: u16) -> Self {
         Self {
             request,
             object,
             bytes: None,
+            errno,
         }
     }
 
@@ -629,10 +638,18 @@ impl<'a> ChoreoFsRead<'a> {
         self.object
     }
 
+    pub const fn errno(&self) -> u16 {
+        self.errno
+    }
+
     pub fn read_from(self, offset: usize) -> Result<(protocol::FdReadDoneRet, usize), CodecError> {
         let Some(bytes) = self.bytes else {
             return Ok((
-                protocol::FdReadDoneRet(FdReadDone::new(self.request.fd(), b"")?),
+                protocol::FdReadDoneRet(FdReadDone::new_with_errno(
+                    self.request.fd(),
+                    b"",
+                    self.errno,
+                )?),
                 offset,
             ));
         };
@@ -760,7 +777,7 @@ impl ChoreoFsWrite {
         if self.errno == ERRNO_SUCCESS {
             protocol::FdWriteDoneRet(FdWriteDone::new(
                 self.request.fd(),
-                bounded_u8(self.request.len()),
+                self.request.len() as u8,
             ))
         } else {
             protocol::FdWriteDoneRet(FdWriteDone::new_with_errno(
@@ -814,14 +831,6 @@ const fn rights_from_binding(binding: FdBinding) -> MemRights {
     }
 }
 
-fn bounded_u8(value: impl TryInto<usize>) -> u8 {
-    let value = match value.try_into() {
-        Ok(value) => value,
-        Err(_) => WASIP1_IO_CHUNK_CAPACITY,
-    };
-    value.min(WASIP1_IO_CHUNK_CAPACITY) as u8
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,7 +863,7 @@ mod tests {
             b"outputs/led/green",
             ObjectId(12),
             FdSpec::new(6, FD_WRITE_RIGHT, 0),
-            FdBinding::write(protocol::FdWriteRow::Refined),
+            FdBinding::write(protocol::FdWriteRow::Object),
         ),
     ]);
 
@@ -928,6 +937,20 @@ mod tests {
         let (chunk, next_offset) = read.read_from(0).expect("fd_read ret");
         assert_eq!(chunk.0.as_bytes(), b"session=attached\n");
         assert_eq!(next_offset, b"session=attached\n".len());
+
+        let denied_read = choreofs.fd_read(protocol::FdRead::new(9, 30).expect("fd_read request"));
+        assert_eq!(denied_read.object(), None);
+        assert_eq!(denied_read.errno(), ERRNO_BADF);
+        let (denied_read, _) = denied_read.read_from(0).expect("fd_read ret");
+        assert_eq!(denied_read.0.errno(), ERRNO_BADF);
+
+        let denied_stat = choreofs.fd_fdstat_get(protocol::FdRequest::new(9));
+        assert_eq!(denied_stat.0.fd(), 9);
+        assert_eq!(denied_stat.0.errno(), ERRNO_BADF);
+
+        let denied_close = choreofs.fd_close(protocol::FdRequest::new(9));
+        assert_eq!(denied_close.0.fd(), 9);
+        assert_eq!(denied_close.0.errno(), ERRNO_BADF);
 
         let write = choreofs.fd_write(protocol::FdWrite::new(6, b"1").expect("fd_write request"));
         assert_eq!(write.object(), Some(ObjectId(12)));

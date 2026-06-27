@@ -16,6 +16,7 @@ pub use engine::wasm::{
     ImportPlanDiagnostics,
 };
 pub use exchange::{
-    FdBindingTable, HibanaImportPending, HibanaMemoryGrowPending, HibanaStep, HibanaWasiGuest,
-    HibanaWasiGuestStorage, WasiImport,
+    FdBindingCapacityError, FdBindingTable, HibanaWasiGuest, HibanaWasiGuestStorage,
+    WasiBoundaryStep, WasiImport, WasiImportCompletion, WasiImportPending, WasiImportRequest,
+    WasiMemoryGrowPending,
 };

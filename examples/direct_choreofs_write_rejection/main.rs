@@ -17,7 +17,10 @@ use hibana::{
 };
 use hibana_wasip1_runtime::{
     DEFAULT_GUEST_MEMORY_BYTES, GuestMemory,
-    exchange::{ExchangeError, HibanaStep, HibanaWasiGuest, HibanaWasiGuestStorage, WasiImport},
+    exchange::{
+        HibanaWasiGuest, HibanaWasiGuestStorage, WasiBoundaryStep, WasiImport,
+        WasiImportCompletion, WasiImportPending, WasiImportRequest,
+    },
     protocol,
 };
 
@@ -54,17 +57,12 @@ fn run() -> DemoResult<i32> {
             print_output_state(&shell_env);
             Ok(0)
         }
-        Err(DemoError::Exchange(ExchangeError::Endpoint(error))) => {
-            println!("Hibana: ChoreoFS write did not advance on this localside -> {error:?}");
-            print_output_state(&shell_env);
-            Ok(0)
-        }
         result => result,
     }
 }
 
 // Global choreography. It contains ordinary read/write/open rows, but no
-// refined ChoreoFS write row, so the direct output write cannot advance.
+// ChoreoFS object write row, so the direct output write cannot advance.
 fn direct_choreofs_write_blocked_choreography() -> impl hibana::runtime::program::Projectable {
     let memory_grow = g::seq(
         g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, protocol::MemoryGrowReqMsg>(),
@@ -104,27 +102,201 @@ async fn run_shell_app_engine(
 ) -> DemoResult<i32> {
     let mut run_id = 1u16;
     loop {
-        match guest
-            .resume_hibana(
-                shell_app_endpoint,
-                protocol::BudgetRun::new(run_id, 0, 100_000),
-            )
-            .await?
-        {
-            HibanaStep::ImportPending(pending) => {
-                pending.complete(guest, shell_app_endpoint).await?;
+        match guest.resume_wasi_boundary(protocol::BudgetRun::new(run_id, 0, 100_000))? {
+            WasiBoundaryStep::ImportPending(pending) => {
+                complete_pending_import(guest, shell_app_endpoint, pending).await?;
             }
-            HibanaStep::MemoryGrowPending(pending) => {
-                pending.complete(guest, shell_app_endpoint).await?;
+            WasiBoundaryStep::MemoryGrowPending(pending) => {
+                let request = pending.request();
+                shell_app_endpoint
+                    .send::<protocol::MemoryGrowReqMsg>(&request)
+                    .await?;
+                let decision = shell_app_endpoint
+                    .recv::<protocol::MemoryGrowRetMsg>()
+                    .await?;
+                pending.complete(guest, decision)?;
             }
-            HibanaStep::BudgetExpired(_) => {
+            WasiBoundaryStep::BudgetExpired(_) => {
                 run_id = run_id.wrapping_add(1);
             }
-            HibanaStep::Exit(exit) => {
+            WasiBoundaryStep::Exit(exit) => {
                 return Ok(exit.status() as i32);
             }
         }
     }
+}
+
+async fn complete_pending_import(
+    guest: &mut HibanaWasiGuest<'_>,
+    shell_app_endpoint: &mut hibana::Endpoint<'_, SHELL_APP_ROLE>,
+    pending: WasiImportPending,
+) -> DemoResult<()> {
+    match pending.request() {
+        WasiImportRequest::FdWrite(request) => {
+            shell_app_endpoint
+                .send::<protocol::FdWriteReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint.recv::<protocol::FdWriteRetMsg>().await?;
+            pending.complete(guest, WasiImportCompletion::FdWrite(completion))?;
+        }
+        WasiImportRequest::FdWriteObject(request) => {
+            shell_app_endpoint
+                .send::<protocol::FdWriteObjectReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::FdWriteObjectRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::FdWriteObject(completion))?;
+        }
+        WasiImportRequest::FdRead(request) => {
+            shell_app_endpoint
+                .send::<protocol::FdReadReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint.recv::<protocol::FdReadRetMsg>().await?;
+            pending.complete(guest, WasiImportCompletion::FdRead(completion))?;
+        }
+        WasiImportRequest::FdReaddir(request) => {
+            shell_app_endpoint
+                .send::<protocol::FdReaddirReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::FdReaddirRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::FdReaddir(completion))?;
+        }
+        WasiImportRequest::PathOpen(request) => {
+            shell_app_endpoint
+                .send::<protocol::PathOpenReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::PathOpenRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::PathOpen(completion))?;
+        }
+        WasiImportRequest::FdPrestatGet(request) => {
+            shell_app_endpoint
+                .send::<protocol::FdPrestatGetReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::FdPrestatGetRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::FdPrestatGet(completion))?;
+        }
+        WasiImportRequest::FdPrestatDirName(request) => {
+            shell_app_endpoint
+                .send::<protocol::FdPrestatDirNameReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::FdPrestatDirNameRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::FdPrestatDirName(completion))?;
+        }
+        WasiImportRequest::FdFilestatGet(request) => {
+            shell_app_endpoint
+                .send::<protocol::FdFilestatGetReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::FdFilestatGetRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::FdFilestatGet(completion))?;
+        }
+        WasiImportRequest::ArgsSizesGet(request) => {
+            shell_app_endpoint
+                .send::<protocol::ArgsSizesGetReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::ArgsSizesGetRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::ArgsSizesGet(completion))?;
+        }
+        WasiImportRequest::ArgsGet(request) => {
+            shell_app_endpoint
+                .send::<protocol::ArgsGetReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint.recv::<protocol::ArgsGetRetMsg>().await?;
+            pending.complete(guest, WasiImportCompletion::ArgsGet(completion))?;
+        }
+        WasiImportRequest::EnvironSizesGet(request) => {
+            shell_app_endpoint
+                .send::<protocol::EnvironSizesGetReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::EnvironSizesGetRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::EnvironSizesGet(completion))?;
+        }
+        WasiImportRequest::EnvironGet(request) => {
+            shell_app_endpoint
+                .send::<protocol::EnvironGetReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::EnvironGetRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::EnvironGet(completion))?;
+        }
+        WasiImportRequest::FdFdstatGet(request) => {
+            shell_app_endpoint
+                .send::<protocol::FdFdstatGetReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::FdFdstatGetRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::FdFdstatGet(completion))?;
+        }
+        WasiImportRequest::PathFilestatGet(request) => {
+            shell_app_endpoint
+                .send::<protocol::PathFilestatGetReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::PathFilestatGetRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::PathFilestatGet(completion))?;
+        }
+        WasiImportRequest::FdClose(request) => {
+            shell_app_endpoint
+                .send::<protocol::FdCloseReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint.recv::<protocol::FdCloseRetMsg>().await?;
+            pending.complete(guest, WasiImportCompletion::FdClose(completion))?;
+        }
+        WasiImportRequest::ClockResGet(request) => {
+            shell_app_endpoint
+                .send::<protocol::ClockResGetReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::ClockResGetRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::ClockResGet(completion))?;
+        }
+        WasiImportRequest::ClockTimeGet(request) => {
+            shell_app_endpoint
+                .send::<protocol::ClockTimeGetReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::ClockTimeGetRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::ClockTimeGet(completion))?;
+        }
+        WasiImportRequest::PollOneoff(request) => {
+            shell_app_endpoint
+                .send::<protocol::PollOneoffReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::PollOneoffRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::PollOneoff(completion))?;
+        }
+        WasiImportRequest::RandomGet(request) => {
+            shell_app_endpoint
+                .send::<protocol::RandomGetReqMsg>(&request)
+                .await?;
+            let completion = shell_app_endpoint
+                .recv::<protocol::RandomGetRetMsg>()
+                .await?;
+            pending.complete(guest, WasiImportCompletion::RandomGet(completion))?;
+        }
+    }
+    Ok(())
 }
 
 // Shell environment role. `offer()` appears only at route boundaries; once an

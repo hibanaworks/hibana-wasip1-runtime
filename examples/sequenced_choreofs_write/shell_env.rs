@@ -11,7 +11,6 @@ use hibana_wasip1_runtime::{
         self, FdBinding, FdClosed, FdPrestat, FdPrestatDirNameDone, FdReadDone, FdReadRow,
         FdReaddirDone, FdReaddirRow, FdRequest, FdStat, FdWriteDone, FdWriteRow, FileStat,
         MemRights, WASIP1_FILETYPE_DIRECTORY, WASIP1_FILETYPE_REGULAR_FILE,
-        WASIP1_IO_CHUNK_CAPACITY,
     },
 };
 
@@ -65,7 +64,7 @@ static CHOREOFS_OBJECTS: ChoreoFsObjectSet<3> = ChoreoFsObjectSet::new([
         b"outputs/led/green",
         LED_GREEN_ID,
         FdSpec::new(LED_GREEN_FD as u32, FD_WRITE_RIGHT, 1),
-        FdBinding::write(FdWriteRow::Refined),
+        FdBinding::write(FdWriteRow::Object),
     ),
 ]);
 
@@ -98,7 +97,7 @@ impl ShellEnv {
             }) => {
                 let _ = io::stdout().write_all(write.as_bytes());
                 let _ = io::stdout().flush();
-                protocol::FdWriteDoneRet(FdWriteDone::new(write.fd(), bounded_u8(write.len())))
+                protocol::FdWriteDoneRet(FdWriteDone::new(write.fd(), write.len() as u8))
             }
             Some(FdEntry {
                 kind: FdKind::ErrorOutput,
@@ -106,7 +105,7 @@ impl ShellEnv {
             }) => {
                 let _ = io::stderr().write_all(write.as_bytes());
                 let _ = io::stderr().flush();
-                protocol::FdWriteDoneRet(FdWriteDone::new(write.fd(), bounded_u8(write.len())))
+                protocol::FdWriteDoneRet(FdWriteDone::new(write.fd(), write.len() as u8))
             }
             Some(FdEntry {
                 kind: FdKind::OutputLedGreen,
@@ -134,10 +133,7 @@ impl ShellEnv {
 
     pub fn prestat_fd(&self, request: FdRequest) -> protocol::FdPrestatRet {
         if request.fd() == ROOT_FD {
-            protocol::FdPrestatRet(FdPrestat::new(
-                request.fd(),
-                bounded_u8(ROOT_PREOPEN_NAME.len()),
-            ))
+            protocol::FdPrestatRet(FdPrestat::new(request.fd(), ROOT_PREOPEN_NAME.len() as u8))
         } else {
             protocol::FdPrestatRet(FdPrestat::new_with_errno(request.fd(), 0, ERRNO_BADF))
         }
@@ -216,7 +212,11 @@ impl ShellEnv {
 
     pub fn read_fd(&mut self, read: protocol::FdRead) -> DemoResult<protocol::FdReadDoneRet> {
         let Some(index) = self.entries.iter().position(|entry| entry.fd == read.fd()) else {
-            return Ok(protocol::FdReadDoneRet(FdReadDone::new(read.fd(), b"")?));
+            return Ok(protocol::FdReadDoneRet(FdReadDone::new_with_errno(
+                read.fd(),
+                b"",
+                ERRNO_BADF,
+            )?));
         };
         if matches!(self.entries[index].kind, FdKind::Input) {
             return self.read_terminal_input(read);
@@ -227,17 +227,24 @@ impl ShellEnv {
                 *cursor = next_cursor;
                 Ok(response)
             }
-            _ => Ok(protocol::FdReadDoneRet(FdReadDone::new(read.fd(), b"")?)),
+            _ => Ok(protocol::FdReadDoneRet(FdReadDone::new_with_errno(
+                read.fd(),
+                b"",
+                ERRNO_BADF,
+            )?)),
         }
     }
 
     pub fn stat_fd(&self, request: FdRequest) -> protocol::FdStatRet {
         let fd = request.fd();
-        let rights = match self.entries.iter().find(|entry| entry.fd == fd) {
-            Some(FdEntry {
+        let Some(entry) = self.entries.iter().find(|entry| entry.fd == fd) else {
+            return protocol::FdStatRet(FdStat::new_with_errno(fd, MemRights::Read, ERRNO_BADF));
+        };
+        let rights = match entry {
+            FdEntry {
                 kind: FdKind::Output | FdKind::ErrorOutput | FdKind::OutputLedGreen,
                 ..
-            }) => MemRights::Write,
+            } => MemRights::Write,
             _ => MemRights::Read,
         };
         protocol::FdStatRet(FdStat::new(fd, rights))
@@ -245,6 +252,9 @@ impl ShellEnv {
 
     pub fn close_fd(&mut self, request: FdRequest) -> protocol::FdClosedRet {
         let fd = request.fd();
+        if !self.entries.iter().any(|entry| entry.fd == fd) {
+            return protocol::FdClosedRet(FdClosed::new_with_errno(fd, ERRNO_BADF));
+        }
         self.entries.retain(|entry| entry.fd != fd);
         protocol::FdClosedRet(FdClosed::new(fd))
     }
@@ -305,23 +315,23 @@ impl ShellEnv {
 
 pub fn initial_bindings() -> FdBindingTable {
     let mut bindings = FdBindingTable::empty();
-    let _ = bindings.bind_fd(0, FdBinding::read(FdReadRow::Base));
-    let _ = bindings.bind_fd(1, FdBinding::write(FdWriteRow::Base));
-    let _ = bindings.bind_fd(2, FdBinding::write(FdWriteRow::Base));
-    let _ = bindings.bind_fd(ROOT_FD, FdBinding::readdir(FdReaddirRow::Base));
+    bindings
+        .bind_fd(0, FdBinding::read(FdReadRow::Base))
+        .expect("stdin fd fits binding table");
+    bindings
+        .bind_fd(1, FdBinding::write(FdWriteRow::Base))
+        .expect("stdout fd fits binding table");
+    bindings
+        .bind_fd(2, FdBinding::write(FdWriteRow::Base))
+        .expect("stderr fd fits binding table");
+    bindings
+        .bind_fd(ROOT_FD, FdBinding::readdir(FdReaddirRow::Base))
+        .expect("root fd fits binding table");
     bindings
 }
 
 fn choreofs() -> ChoreoFs<'static> {
     CHOREOFS_OBJECTS.choreofs()
-}
-
-fn bounded_u8(value: impl TryInto<usize>) -> u8 {
-    let value = match value.try_into() {
-        Ok(value) => value,
-        Err(_) => WASIP1_IO_CHUNK_CAPACITY,
-    };
-    value.min(WASIP1_IO_CHUNK_CAPACITY) as u8
 }
 
 fn normalize_choreofs_path(path: &[u8]) -> &[u8] {

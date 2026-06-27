@@ -225,6 +225,7 @@ const CORE_WASM_LOCAL_CAPACITY: usize = 32;
 const CORE_WASM_CALL_STACK_CAPACITY: usize = 16;
 const CORE_WASM_CONTROL_STACK_CAPACITY: usize = 128;
 const CORE_WASM_CONTROL_TARGET_CAPACITY: usize = 192;
+const CORE_WASM_CONTROL_TARGET_FRAME_NONE: u8 = u8::MAX;
 const CORE_WASM_BR_TABLE_CAPACITY: usize = 8;
 const CORE_WASIP1_PATH_CAPACITY: usize = 64;
 const CORE_WASM_TABLE_CAPACITY: usize = 64;
@@ -448,49 +449,6 @@ impl Value {
             Self::FuncRef(_) => ValueKind::FuncRef,
         }
     }
-
-    fn as_i32(self) -> Result<u32, WasmError> {
-        match self {
-            Self::I32(value) => Ok(value),
-            _ => Err(invalid!("expected i32 core value")),
-        }
-    }
-
-    fn as_i64(self) -> Result<u64, WasmError> {
-        match self {
-            Self::I64(value) => Ok(value),
-            _ => Err(invalid!("expected i64 core value")),
-        }
-    }
-
-    fn as_f32_bits(self) -> Result<u32, WasmError> {
-        match self {
-            Self::F32(value) => Ok(value),
-            _ => Err(invalid!("expected f32 core value")),
-        }
-    }
-
-    fn as_f64_bits(self) -> Result<u64, WasmError> {
-        match self {
-            Self::F64(value) => Ok(value),
-            _ => Err(invalid!("expected f64 core value")),
-        }
-    }
-
-    fn as_f32(self) -> Result<f32, WasmError> {
-        Ok(f32::from_bits(self.as_f32_bits()?))
-    }
-
-    fn as_f64(self) -> Result<f64, WasmError> {
-        Ok(f64::from_bits(self.as_f64_bits()?))
-    }
-
-    fn as_funcref(self) -> Result<u32, WasmError> {
-        match self {
-            Self::FuncRef(value) => Ok(value),
-            _ => Err(invalid!("expected funcref core value")),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -546,45 +504,17 @@ pub(super) enum Wasip1Row {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImportSignatureId {
-    FdWrite,
-    FdRead,
-    FdFdstatGet,
-    FdPrestatGet,
-    FdPrestatDirName,
-    FdFilestatGet,
-    FdClose,
-    FdReaddir,
-    ClockResGet,
-    ClockTimeGet,
-    PollOneoff,
-    RandomGet,
-    PathOpen,
-    PathFilestatGet,
-    ArgsSizesGet,
-    ArgsGet,
-    EnvironSizesGet,
-    EnvironGet,
-    ProcExit,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ImportPlanEntry {
     row: Wasip1Row,
-    signature: ImportSignatureId,
 }
 
 impl ImportPlanEntry {
-    const fn new(row: Wasip1Row, signature: ImportSignatureId) -> Self {
-        Self { row, signature }
+    const fn new(row: Wasip1Row) -> Self {
+        Self { row }
     }
 
     const fn row(self) -> Wasip1Row {
         self.row
-    }
-
-    const fn signature(self) -> ImportSignatureId {
-        self.signature
     }
 }
 
@@ -619,11 +549,11 @@ impl ImportPlan {
         row: Wasip1Row,
         ty: FuncType,
     ) -> Result<(), WasmError> {
-        let signature = row.validate_signature(ty)?;
+        row.validate_signature(ty)?;
         let Some(slot) = self.entries.get_mut(function_index) else {
             return Err(unsupported!("too many core wasm imports"));
         };
-        *slot = Some(ImportPlanEntry::new(row, signature));
+        *slot = Some(ImportPlanEntry::new(row));
         self.import_count = self
             .import_count
             .checked_add(1)
@@ -672,7 +602,7 @@ impl Wasip1Row {
         }
     }
 
-    fn validate_signature(self, ty: FuncType) -> Result<ImportSignatureId, WasmError> {
+    fn validate_signature(self, ty: FuncType) -> Result<(), WasmError> {
         match self {
             Self::FdWrite => {
                 Interpreter::expect_import_signature(
@@ -686,7 +616,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("fd_write import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::FdWrite)
+                Ok(())
             }
             Self::FdRead => {
                 Interpreter::expect_import_signature(
@@ -700,7 +630,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("fd_read import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::FdRead)
+                Ok(())
             }
             Self::FdFdstatGet => {
                 Interpreter::expect_import_signature(
@@ -709,7 +639,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("fd_fdstat_get import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::FdFdstatGet)
+                Ok(())
             }
             Self::FdPrestatGet => {
                 Interpreter::expect_import_signature(
@@ -718,7 +648,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("fd_prestat_get import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::FdPrestatGet)
+                Ok(())
             }
             Self::FdPrestatDirName => {
                 Interpreter::expect_import_signature(
@@ -727,7 +657,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("fd_prestat_dir_name import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::FdPrestatDirName)
+                Ok(())
             }
             Self::FdFilestatGet => {
                 Interpreter::expect_import_signature(
@@ -736,7 +666,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("fd_filestat_get import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::FdFilestatGet)
+                Ok(())
             }
             Self::FdClose => {
                 Interpreter::expect_import_signature(
@@ -745,7 +675,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("fd_close import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::FdClose)
+                Ok(())
             }
             Self::FdReaddir => {
                 Interpreter::expect_import_signature(
@@ -760,7 +690,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("fd_readdir import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::FdReaddir)
+                Ok(())
             }
             Self::ClockResGet => {
                 Interpreter::expect_import_signature(
@@ -769,7 +699,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("clock_res_get import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::ClockResGet)
+                Ok(())
             }
             Self::ClockTimeGet => {
                 Interpreter::expect_import_signature(
@@ -778,7 +708,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("clock_time_get import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::ClockTimeGet)
+                Ok(())
             }
             Self::PollOneoff => {
                 Interpreter::expect_import_signature(
@@ -792,7 +722,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("poll_oneoff import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::PollOneoff)
+                Ok(())
             }
             Self::RandomGet => {
                 Interpreter::expect_import_signature(
@@ -801,7 +731,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("random_get import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::RandomGet)
+                Ok(())
             }
             Self::PathOpen => {
                 Interpreter::expect_import_signature(
@@ -820,7 +750,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("path_open import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::PathOpen)
+                Ok(())
             }
             Self::PathFilestatGet => {
                 Interpreter::expect_import_signature(
@@ -835,7 +765,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("path_filestat_get import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::PathFilestatGet)
+                Ok(())
             }
             Self::ArgsSizesGet => {
                 Interpreter::expect_import_signature(
@@ -844,7 +774,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("args_sizes_get import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::ArgsSizesGet)
+                Ok(())
             }
             Self::ArgsGet => {
                 Interpreter::expect_import_signature(
@@ -853,7 +783,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("args_get import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::ArgsGet)
+                Ok(())
             }
             Self::EnvironSizesGet => {
                 Interpreter::expect_import_signature(
@@ -862,7 +792,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("environ_sizes_get import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::EnvironSizesGet)
+                Ok(())
             }
             Self::EnvironGet => {
                 Interpreter::expect_import_signature(
@@ -871,7 +801,7 @@ impl Wasip1Row {
                     1,
                     diagnostic!("environ_get import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::EnvironGet)
+                Ok(())
             }
             Self::ProcExit => {
                 Interpreter::expect_import_signature(
@@ -880,7 +810,7 @@ impl Wasip1Row {
                     0,
                     diagnostic!("proc_exit import signature mismatch"),
                 )?;
-                Ok(ImportSignatureId::ProcExit)
+                Ok(())
             }
         }
     }
@@ -1486,6 +1416,7 @@ pub(super) struct Interpreter<'a> {
     control_len: usize,
     control_targets: [CoreControlTarget; CORE_WASM_CONTROL_TARGET_CAPACITY],
     control_target_count: usize,
+    control_target_frame: u8,
     pending: Option<PendingExecution>,
     done: bool,
 }
@@ -1771,9 +1702,7 @@ impl<'a> Module<'a> {
                 SECTION_CODE => self.parse_core_code_section(&mut section)?,
                 SECTION_DATA => self.parse_core_data_section(&mut section)?,
                 SECTION_CUSTOM => {
-                    let custom_section =
-                        section.read_bytes(section.bytes.len().saturating_sub(section.pos))?;
-                    core::hint::black_box(custom_section);
+                    section.read_bytes(section.bytes.len().saturating_sub(section.pos))?;
                 }
                 _ => return Err(unsupported!("unsupported core wasm section")),
             }
@@ -1876,8 +1805,7 @@ impl<'a> Module<'a> {
         if count > 1 {
             return Err(unsupported!("too many core wasm tables"));
         }
-        for table_index in 0..count {
-            core::hint::black_box(table_index);
+        for _ in 0..count {
             if section.read_u8()? != VALTYPE_FUNCREF {
                 return Err(unsupported!("only funcref tables are supported"));
             }
@@ -2060,8 +1988,7 @@ impl<'a> Module<'a> {
 
     fn parse_core_export_section(&mut self, section: &mut Reader<'a>) -> Result<(), WasmError> {
         let count = section.read_var_u32()?;
-        for export_index in 0..count {
-            core::hint::black_box(export_index);
+        for _ in 0..count {
             let name = section.read_name()?;
             let kind = section.read_u8()?;
             let index = section.read_var_u32()?;
@@ -2100,8 +2027,7 @@ impl<'a> Module<'a> {
             local_count += function_type.param_count;
 
             let local_decl_count = body_reader.read_var_u32()?;
-            for local_decl_index in 0..local_decl_count {
-                core::hint::black_box(local_decl_index);
+            for _ in 0..local_decl_count {
                 let count = body_reader.read_var_u32()? as usize;
                 let kind = ValueKind::decode(body_reader.read_u8()?)?;
                 let end = local_count
@@ -2238,6 +2164,8 @@ impl<'a> Interpreter<'a> {
             core::ptr::addr_of_mut!((*dst).control_targets)
                 .write([CoreControlTarget::EMPTY; CORE_WASM_CONTROL_TARGET_CAPACITY]);
             core::ptr::addr_of_mut!((*dst).control_target_count).write(0);
+            core::ptr::addr_of_mut!((*dst).control_target_frame)
+                .write(CORE_WASM_CONTROL_TARGET_FRAME_NONE);
             core::ptr::addr_of_mut!((*dst).pending).write(None);
             core::ptr::addr_of_mut!((*dst).done).write(false);
         }
@@ -2318,8 +2246,7 @@ fn decode_core_control_targets(
         let opcode = reader.read_u8()?;
         match opcode {
             OPCODE_BLOCK | OPCODE_LOOP | OPCODE_IF => {
-                let block_type = reader.read_u8()?;
-                core::hint::black_box(block_type);
+                reader.read_u8()?;
                 let target_index = count;
                 let slot = targets
                     .get_mut(target_index)
@@ -2382,8 +2309,7 @@ fn skip_core_immediates(reader: &mut Reader<'_>, opcode: u8) -> Result<(), WasmE
         }
         OPCODE_BR_TABLE => {
             let count = reader.read_var_u32()? as usize;
-            for branch_index in 0..count {
-                core::hint::black_box(branch_index);
+            for _ in 0..count {
                 reader.read_var_u32()?;
             }
             reader.read_var_u32()?;
@@ -2532,9 +2458,9 @@ impl<'a> Interpreter<'a> {
                 return Err(WasmError::FuelExhausted);
             }
             fuel -= 1;
-
             let instr = self.current_instr()?;
-            if let Some(event) = self.exec_instr(instr)? {
+            let event = self.exec_instr(instr)?;
+            if let Some(event) = event {
                 return Ok(event);
             }
         }
@@ -2731,7 +2657,7 @@ impl<'a> Interpreter<'a> {
                 if value != 0 {
                     return Err(invalid!("core table instruction index must be zero"));
                 }
-                let value_to_set = self.pop_core_value()?.as_funcref()?;
+                let value_to_set = self.pop_core_funcref()?;
                 let index = self.pop_core_i32()? as usize;
                 if index >= self.table_size {
                     return Err(invalid!("core table.set out of range"));
@@ -2893,8 +2819,7 @@ impl<'a> Interpreter<'a> {
             OPCODE_NOP => {}
             OPCODE_RETURN => self.pop_frame()?,
             OPCODE_DROP => {
-                let dropped_value = self.pop_core_value()?;
-                core::hint::black_box(dropped_value);
+                self.pop_core_value()?;
             }
             OPCODE_SELECT => {
                 let condition = self.pop_core_i32()?;
@@ -3227,7 +3152,7 @@ impl<'a> Interpreter<'a> {
                 self.push_core_value(Value::I64(value))?;
             }
             OPCODE_REF_IS_NULL => {
-                let value = self.pop_core_value()?.as_funcref()?;
+                let value = self.pop_core_funcref()?;
                 self.push_core_value(Value::I32((value == u32::MAX) as u32))?;
             }
             _ => return Err(WasmError::UnsupportedOpcode(opcode)),
@@ -3304,7 +3229,7 @@ impl<'a> Interpreter<'a> {
                     return Err(invalid!("core table instruction index must be zero"));
                 }
                 let delta = self.pop_core_i32()? as usize;
-                let init = self.pop_core_value()?.as_funcref()?;
+                let init = self.pop_core_funcref()?;
                 if init != u32::MAX {
                     self.module.core_func_type_index(init)?;
                 }
@@ -3339,7 +3264,7 @@ impl<'a> Interpreter<'a> {
                     return Err(invalid!("core table instruction index must be zero"));
                 }
                 let len = self.pop_core_i32()? as usize;
-                let value = self.pop_core_value()?.as_funcref()?;
+                let value = self.pop_core_funcref()?;
                 let start = self.pop_core_i32()? as usize;
                 if value != u32::MAX {
                     self.module.core_func_type_index(value)?;
@@ -3535,7 +3460,7 @@ impl<'a> Interpreter<'a> {
             }
         }
         self.frame_len += 1;
-        self.decode_current_frame_control_targets()?;
+        self.control_target_frame = CORE_WASM_CONTROL_TARGET_FRAME_NONE;
         Ok(())
     }
 
@@ -3550,8 +3475,9 @@ impl<'a> Interpreter<'a> {
             self.done = true;
             self.control_len = 0;
             self.control_target_count = 0;
+            self.control_target_frame = CORE_WASM_CONTROL_TARGET_FRAME_NONE;
         } else {
-            self.decode_current_frame_control_targets()?;
+            self.control_target_frame = CORE_WASM_CONTROL_TARGET_FRAME_NONE;
         }
         Ok(())
     }
@@ -3764,14 +3690,6 @@ impl<'a> Interpreter<'a> {
 
     fn call_core_import(&mut self, function_index: u32) -> Result<ExecutionEvent, WasmError> {
         let entry = self.module.import_plan.entry(function_index)?;
-        #[cfg(debug_assertions)]
-        {
-            let type_index = self.module.import_type_indices[function_index as usize];
-            let signature = entry
-                .row()
-                .validate_signature(self.module.core_func_type(type_index)?)?;
-            debug_assert_eq!(entry.signature(), signature);
-        }
         let call = self.begin_wasip1_import(entry.row())?;
         self.pending = Some(PendingExecution::Wasip1(call));
         Ok(ExecutionEvent::Wasip1Call)
@@ -3801,6 +3719,7 @@ impl<'a> Interpreter<'a> {
             OPCODE_BLOCK | OPCODE_LOOP | OPCODE_IF => {
                 let block_type = self.current_read_u8()?;
                 let (result_count, result_kind) = decode_core_block_type(block_type)?;
+                self.ensure_current_frame_control_targets()?;
                 let target = self.current_control_target(self.current_frame()?.pc)?;
                 let mut control = ControlInstr::new(result_count, result_kind);
                 if target.end_pos == CoreControlTarget::NONE {
@@ -3837,8 +3756,7 @@ impl<'a> Interpreter<'a> {
             | OPCODE_I64_LOAD32_U | OPCODE_I32_STORE | OPCODE_I64_STORE | OPCODE_F32_STORE
             | OPCODE_F64_STORE | OPCODE_I32_STORE8 | OPCODE_I32_STORE16 | OPCODE_I64_STORE8
             | OPCODE_I64_STORE16 | OPCODE_I64_STORE32 => {
-                let align = self.current_read_var_u32()?;
-                core::hint::black_box(align);
+                self.current_read_var_u32()?;
                 Ok(Instr::Mem {
                     opcode,
                     offset: self.current_read_var_u32()?,
@@ -3864,72 +3782,111 @@ impl<'a> Interpreter<'a> {
             .ok_or(invalid!("core control target missing"))
     }
 
-    fn decode_current_frame_control_targets(&mut self) -> Result<(), WasmError> {
-        let code: &'a [u8] = self.current_frame()?.code;
+    fn ensure_current_frame_control_targets(&mut self) -> Result<(), WasmError> {
+        let frame_index = self.current_frame_index()?;
+        if self.control_target_frame == frame_index as u8 {
+            return Ok(());
+        }
+        let code: &'a [u8] = self.frames[frame_index].code;
         self.control_target_count = decode_core_control_targets(code, &mut self.control_targets)?;
+        self.control_target_frame = frame_index as u8;
         Ok(())
     }
 
     fn current_read_u8(&mut self) -> Result<u8, WasmError> {
-        let frame = self.current_frame_mut()?;
+        let frame_index = self.current_frame_index()?;
+        let frame = &mut self.frames[frame_index];
         let byte = *frame.code.get(frame.pc).ok_or(WasmError::Truncated)?;
         frame.pc += 1;
         Ok(byte)
     }
 
     fn current_read_var_u32(&mut self) -> Result<u32, WasmError> {
-        let frame = self.current_frame_mut()?;
-        let mut reader = Reader {
-            bytes: frame.code,
-            pos: frame.pc,
-        };
-        let value = reader.read_var_u32()?;
-        frame.pc = reader.pos;
+        let frame_index = self.current_frame_index()?;
+        let frame = &mut self.frames[frame_index];
+        let mut shift = 0u32;
+        let mut value = 0u32;
+        loop {
+            if shift >= 35 {
+                return Err(invalid!("u32 leb too wide"));
+            }
+            let byte = *frame.code.get(frame.pc).ok_or(WasmError::Truncated)?;
+            frame.pc += 1;
+            value |= ((byte & 0x7f) as u32) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
         Ok(value)
     }
 
     fn current_read_var_i32(&mut self) -> Result<i32, WasmError> {
-        let frame = self.current_frame_mut()?;
-        let mut reader = Reader {
-            bytes: frame.code,
-            pos: frame.pc,
-        };
-        let value = reader.read_var_i32()?;
-        frame.pc = reader.pos;
+        let frame_index = self.current_frame_index()?;
+        let frame = &mut self.frames[frame_index];
+        let mut shift = 0u32;
+        let mut value = 0i32;
+        let mut byte;
+        loop {
+            if shift >= 35 {
+                return Err(invalid!("i32 leb too wide"));
+            }
+            byte = *frame.code.get(frame.pc).ok_or(WasmError::Truncated)?;
+            frame.pc += 1;
+            value |= ((byte & 0x7f) as i32) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        if shift < 32 && (byte & 0x40) != 0 {
+            value |= (!0i32) << shift;
+        }
         Ok(value)
     }
 
     fn current_read_var_i64(&mut self) -> Result<i64, WasmError> {
-        let frame = self.current_frame_mut()?;
-        let mut reader = Reader {
-            bytes: frame.code,
-            pos: frame.pc,
-        };
-        let value = reader.read_var_i64()?;
-        frame.pc = reader.pos;
+        let frame_index = self.current_frame_index()?;
+        let frame = &mut self.frames[frame_index];
+        let mut shift = 0u32;
+        let mut value = 0i64;
+        let mut byte;
+        loop {
+            if shift >= 70 {
+                return Err(invalid!("i64 leb too wide"));
+            }
+            byte = *frame.code.get(frame.pc).ok_or(WasmError::Truncated)?;
+            frame.pc += 1;
+            value |= ((byte & 0x7f) as i64) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        if shift < 64 && (byte & 0x40) != 0 {
+            value |= (!0i64) << shift;
+        }
         Ok(value)
     }
 
     fn current_read_fixed_u32(&mut self) -> Result<u32, WasmError> {
-        let frame = self.current_frame_mut()?;
-        let mut reader = Reader {
-            bytes: frame.code,
-            pos: frame.pc,
-        };
-        let value = reader.read_fixed_u32()?;
-        frame.pc = reader.pos;
-        Ok(value)
+        let frame_index = self.current_frame_index()?;
+        let frame = &mut self.frames[frame_index];
+        let end = frame.pc.checked_add(4).ok_or(WasmError::Truncated)?;
+        let bytes = frame.code.get(frame.pc..end).ok_or(WasmError::Truncated)?;
+        frame.pc = end;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn current_read_fixed_u64(&mut self) -> Result<u64, WasmError> {
-        let frame = self.current_frame_mut()?;
-        let mut reader = Reader {
-            bytes: frame.code,
-            pos: frame.pc,
-        };
-        let value = reader.read_fixed_u64()?;
-        frame.pc = reader.pos;
-        Ok(value)
+        let frame_index = self.current_frame_index()?;
+        let frame = &mut self.frames[frame_index];
+        let end = frame.pc.checked_add(8).ok_or(WasmError::Truncated)?;
+        let bytes = frame.code.get(frame.pc..end).ok_or(WasmError::Truncated)?;
+        frame.pc = end;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
     }
 
     fn current_br_table(&mut self) -> Result<BrTableInstr, WasmError> {
@@ -3973,27 +3930,66 @@ impl<'a> Interpreter<'a> {
     }
 
     fn pop_core_i32(&mut self) -> Result<u32, WasmError> {
-        self.pop_core_value()?.as_i32()
+        if self.value_len == 0 {
+            return Err(WasmError::StackUnderflow);
+        }
+        self.value_len -= 1;
+        match self.values[self.value_len] {
+            Value::I32(value) => Ok(value),
+            _ => Err(invalid!("expected i32 core value")),
+        }
     }
 
     fn pop_core_i64(&mut self) -> Result<u64, WasmError> {
-        self.pop_core_value()?.as_i64()
+        if self.value_len == 0 {
+            return Err(WasmError::StackUnderflow);
+        }
+        self.value_len -= 1;
+        match self.values[self.value_len] {
+            Value::I64(value) => Ok(value),
+            _ => Err(invalid!("expected i64 core value")),
+        }
     }
 
     fn pop_core_f32_bits(&mut self) -> Result<u32, WasmError> {
-        self.pop_core_value()?.as_f32_bits()
+        if self.value_len == 0 {
+            return Err(WasmError::StackUnderflow);
+        }
+        self.value_len -= 1;
+        match self.values[self.value_len] {
+            Value::F32(value) => Ok(value),
+            _ => Err(invalid!("expected f32 core value")),
+        }
     }
 
     fn pop_core_f64_bits(&mut self) -> Result<u64, WasmError> {
-        self.pop_core_value()?.as_f64_bits()
+        if self.value_len == 0 {
+            return Err(WasmError::StackUnderflow);
+        }
+        self.value_len -= 1;
+        match self.values[self.value_len] {
+            Value::F64(value) => Ok(value),
+            _ => Err(invalid!("expected f64 core value")),
+        }
     }
 
     fn pop_core_f32(&mut self) -> Result<f32, WasmError> {
-        self.pop_core_value()?.as_f32()
+        Ok(f32::from_bits(self.pop_core_f32_bits()?))
     }
 
     fn pop_core_f64(&mut self) -> Result<f64, WasmError> {
-        self.pop_core_value()?.as_f64()
+        Ok(f64::from_bits(self.pop_core_f64_bits()?))
+    }
+
+    fn pop_core_funcref(&mut self) -> Result<u32, WasmError> {
+        if self.value_len == 0 {
+            return Err(WasmError::StackUnderflow);
+        }
+        self.value_len -= 1;
+        match self.values[self.value_len] {
+            Value::FuncRef(value) => Ok(value),
+            _ => Err(invalid!("expected funcref core value")),
+        }
     }
 
     fn set_core_local(&mut self, local: usize, value: Value) -> Result<(), WasmError> {
@@ -4318,53 +4314,53 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
-    fn core_binary_i32(&mut self, op: fn(u32, u32) -> u32) -> Result<(), WasmError> {
+    fn core_binary_i32(&mut self, op: impl FnOnce(u32, u32) -> u32) -> Result<(), WasmError> {
         let rhs = self.pop_core_i32()?;
         let lhs = self.pop_core_i32()?;
         self.push_core_value(Value::I32(op(lhs, rhs)))
     }
 
-    fn core_binary_i64(&mut self, op: fn(u64, u64) -> u64) -> Result<(), WasmError> {
+    fn core_binary_i64(&mut self, op: impl FnOnce(u64, u64) -> u64) -> Result<(), WasmError> {
         let rhs = self.pop_core_i64()?;
         let lhs = self.pop_core_i64()?;
         self.push_core_value(Value::I64(op(lhs, rhs)))
     }
 
-    fn core_binary_i64_cmp(&mut self, op: fn(u64, u64) -> bool) -> Result<(), WasmError> {
+    fn core_binary_i64_cmp(&mut self, op: impl FnOnce(u64, u64) -> bool) -> Result<(), WasmError> {
         let rhs = self.pop_core_i64()?;
         let lhs = self.pop_core_i64()?;
         self.push_core_value(Value::I32(op(lhs, rhs) as u32))
     }
 
-    fn core_unary_f32(&mut self, op: fn(f32) -> f32) -> Result<(), WasmError> {
+    fn core_unary_f32(&mut self, op: impl FnOnce(f32) -> f32) -> Result<(), WasmError> {
         let value = self.pop_core_f32()?;
         self.push_core_value(Value::F32(op(value).to_bits()))
     }
 
-    fn core_binary_f32(&mut self, op: fn(f32, f32) -> f32) -> Result<(), WasmError> {
+    fn core_binary_f32(&mut self, op: impl FnOnce(f32, f32) -> f32) -> Result<(), WasmError> {
         let rhs = self.pop_core_f32()?;
         let lhs = self.pop_core_f32()?;
         self.push_core_value(Value::F32(op(lhs, rhs).to_bits()))
     }
 
-    fn core_binary_f32_cmp(&mut self, op: fn(f32, f32) -> bool) -> Result<(), WasmError> {
+    fn core_binary_f32_cmp(&mut self, op: impl FnOnce(f32, f32) -> bool) -> Result<(), WasmError> {
         let rhs = self.pop_core_f32()?;
         let lhs = self.pop_core_f32()?;
         self.push_core_value(Value::I32(op(lhs, rhs) as u32))
     }
 
-    fn core_unary_f64(&mut self, op: fn(f64) -> f64) -> Result<(), WasmError> {
+    fn core_unary_f64(&mut self, op: impl FnOnce(f64) -> f64) -> Result<(), WasmError> {
         let value = self.pop_core_f64()?;
         self.push_core_value(Value::F64(op(value).to_bits()))
     }
 
-    fn core_binary_f64(&mut self, op: fn(f64, f64) -> f64) -> Result<(), WasmError> {
+    fn core_binary_f64(&mut self, op: impl FnOnce(f64, f64) -> f64) -> Result<(), WasmError> {
         let rhs = self.pop_core_f64()?;
         let lhs = self.pop_core_f64()?;
         self.push_core_value(Value::F64(op(lhs, rhs).to_bits()))
     }
 
-    fn core_binary_f64_cmp(&mut self, op: fn(f64, f64) -> bool) -> Result<(), WasmError> {
+    fn core_binary_f64_cmp(&mut self, op: impl FnOnce(f64, f64) -> bool) -> Result<(), WasmError> {
         let rhs = self.pop_core_f64()?;
         let lhs = self.pop_core_f64()?;
         self.push_core_value(Value::I32(op(lhs, rhs) as u32))
@@ -4439,8 +4435,7 @@ fn wasm_f32_sqrt(value: f32) -> f32 {
         return value;
     }
     let mut x = if value >= 1.0 { value } else { 1.0 };
-    for sqrt_iteration in 0..8 {
-        core::hint::black_box(sqrt_iteration);
+    for _ in 0..8 {
         x = 0.5 * (x + value / x);
     }
     x
@@ -4526,8 +4521,7 @@ fn wasm_f64_sqrt(value: f64) -> f64 {
         return value;
     }
     let mut x = if value >= 1.0 { value } else { 1.0 };
-    for sqrt_iteration in 0..12 {
-        core::hint::black_box(sqrt_iteration);
+    for _ in 0..12 {
         x = 0.5 * (x + value / x);
     }
     x
@@ -4623,7 +4617,8 @@ impl<'a> Vm<'a> {
         if self.done {
             return Ok(VmEvent::Done);
         }
-        match self.core.run(budget.fuel()) {
+        let run_result = self.core.run(budget.fuel());
+        match run_result {
             Ok(ExecutionEvent::Done) => {
                 self.done = true;
                 Ok(VmEvent::Done)
@@ -5536,8 +5531,7 @@ mod tests {
 
         let mut code = Vec::new();
         push_test_u32(&mut code, 2);
-        for body_index in 0..2 {
-            core::hint::black_box(body_index);
+        for _ in 0..2 {
             push_test_u32(&mut code, 2);
             code.push(0);
             code.push(OPCODE_END);
