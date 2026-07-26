@@ -49,13 +49,13 @@ impl<'a> ChoreoFsFact<'a> {
 /// progress, route selection, or boundary authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdSpec {
-    fd: u32,
+    fd: u8,
     rights: u64,
     generation: u32,
 }
 
 impl FdSpec {
-    pub const fn new(fd: u32, rights: u64, generation: u32) -> Self {
+    pub const fn new(fd: u8, rights: u64, generation: u32) -> Self {
         Self {
             fd,
             rights,
@@ -63,7 +63,7 @@ impl FdSpec {
         }
     }
 
-    pub const fn fd(&self) -> u32 {
+    pub const fn fd(&self) -> u8 {
         self.fd
     }
 
@@ -332,7 +332,7 @@ impl<'a> ChoreoFsFacts<'a> {
 /// Immutable fd/object materialization fact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LedgerFdFact {
-    fd: u32,
+    fd: u8,
     object: ObjectId,
     rights: u64,
     generation: u32,
@@ -346,7 +346,7 @@ impl LedgerFdFact {
         generation: 0,
     };
 
-    pub const fn new(fd: u32, object: ObjectId, rights: u64, generation: u32) -> Self {
+    pub const fn new(fd: u8, object: ObjectId, rights: u64, generation: u32) -> Self {
         Self {
             fd,
             object,
@@ -355,7 +355,7 @@ impl LedgerFdFact {
         }
     }
 
-    pub const fn fd(&self) -> u32 {
+    pub const fn fd(&self) -> u8 {
         self.fd
     }
 
@@ -387,7 +387,7 @@ impl<'a> LedgerFacts<'a> {
         self.fds
     }
 
-    pub fn fd(&self, fd: u32) -> Option<LedgerFdFact> {
+    pub fn fd(&self, fd: u8) -> Option<LedgerFdFact> {
         let mut idx = 0usize;
         while idx < self.fds.len() {
             let fact = self.fds[idx];
@@ -468,7 +468,7 @@ impl<'a> ChoreoFs<'a> {
         let Some(fact) = self.ledger.object_with_rights(object, required_rights) else {
             return ChoreoFsOpen::denied(open, Some(object), ERRNO_ACCES);
         };
-        ChoreoFsOpen::opened(open, object, fact.fd() as u8, material.binding())
+        ChoreoFsOpen::opened(open, object, fact.fd(), material.binding())
     }
 
     pub fn fd_readdir(&self, read: protocol::FdReaddir) -> ChoreoFsReadDir<'a> {
@@ -526,7 +526,7 @@ impl<'a> ChoreoFs<'a> {
 
     fn material_for_fd(&self, fd: u8) -> Option<ChoreoFsObjectMaterial<'a>> {
         self.ledger
-            .fd(fd as u32)
+            .fd(fd)
             .and_then(|fact| self.materials.object(fact.object()))
     }
 }

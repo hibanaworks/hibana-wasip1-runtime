@@ -1,5 +1,5 @@
 use crate::{
-    protocol::{BudgetExpired, BudgetRun, WASIP1_IO_CHUNK_CAPACITY},
+    protocol::{BudgetExpired, BudgetRun, WASIP1_IO_CHUNK_CAPACITY, WASIP1_PATH_CHUNK_CAPACITY},
     wasip1::{WASIP1_PREVIEW1_MODULE, Wasip1ImportName},
 };
 
@@ -12,8 +12,10 @@ const SECTION_FUNCTION: u8 = 3;
 const SECTION_TABLE: u8 = 4;
 const SECTION_ELEMENT: u8 = 9;
 const SECTION_EXPORT: u8 = 7;
+const SECTION_START: u8 = 8;
 const SECTION_CODE: u8 = 10;
 const SECTION_DATA: u8 = 11;
+const SECTION_DATA_COUNT: u8 = 12;
 const SECTION_CUSTOM: u8 = 0;
 
 const EXTERNAL_KIND_FUNC: u8 = 0;
@@ -226,13 +228,13 @@ const CORE_WASM_CALL_STACK_CAPACITY: usize = 16;
 const CORE_WASM_CONTROL_STACK_CAPACITY: usize = 128;
 const CORE_WASM_CONTROL_TARGET_CAPACITY: usize = 192;
 const CORE_WASM_CONTROL_TARGET_FRAME_NONE: u8 = u8::MAX;
-const CORE_WASM_BR_TABLE_CAPACITY: usize = 8;
-const CORE_WASIP1_PATH_CAPACITY: usize = 64;
+const CORE_WASM_BR_TABLE_CAPACITY: usize = 64;
 const CORE_WASM_TABLE_CAPACITY: usize = 64;
 const CORE_WASM_MAX_ELEMENT_SEGMENTS: usize = 8;
+const CORE_WASM_DATA_COUNT_NONE: u8 = u8::MAX;
 const CORE_WASM_PAGE_SIZE: usize = 64 * 1024;
 #[cfg(any(test, target_arch = "arm"))]
-const CORE1_VM_OBJECT_BUDGET_BYTES: usize = 96 * 1024;
+const VM_OBJECT_BUDGET_BYTES: usize = 32 * 1024;
 const WASIP1_EVENTTYPE_CLOCK: u8 = 0;
 const WASIP1_SUBSCRIPTION_USERDATA_OFFSET: u32 = 0;
 const WASIP1_SUBSCRIPTION_EVENTTYPE_OFFSET: u32 = 8;
@@ -259,21 +261,15 @@ pub const GUEST_MEMORY_PAGE_SIZE: usize = CORE_WASM_PAGE_SIZE;
 pub const DEFAULT_GUEST_MEMORY_BYTES: usize = CORE_WASM_PAGE_SIZE;
 
 pub struct GuestMemory<'a> {
-    ptr: core::ptr::NonNull<u8>,
-    len: usize,
+    bytes: &'a mut [u8],
     committed_pages: u32,
-    _borrow: core::marker::PhantomData<&'a mut [u8]>,
 }
 
 impl<'a> GuestMemory<'a> {
     pub fn new(bytes: &'a mut [u8]) -> Self {
-        // Slice pointers are non-null, including the dangling pointer for empty slices.
-        let ptr = unsafe { core::ptr::NonNull::new_unchecked(bytes.as_mut_ptr()) };
         Self {
-            ptr,
-            len: bytes.len(),
+            bytes,
             committed_pages: 0,
-            _borrow: core::marker::PhantomData,
         }
     }
 
@@ -282,12 +278,12 @@ impl<'a> GuestMemory<'a> {
     }
 
     pub fn capacity_pages(&self) -> u32 {
-        let pages = self.len / CORE_WASM_PAGE_SIZE;
+        let pages = self.bytes.len() / CORE_WASM_PAGE_SIZE;
         pages.min(u32::MAX as usize) as u32
     }
 
     pub const fn capacity_bytes(&self) -> usize {
-        self.len
+        self.bytes.len()
     }
 
     pub(super) fn committed_len(&self) -> Result<usize, WasmError> {
@@ -309,12 +305,17 @@ impl<'a> GuestMemory<'a> {
         Ok(())
     }
 
+    fn commit_initial_layout(&mut self, layout: InitialMemoryLayout) {
+        debug_assert!(layout.pages <= self.capacity_pages());
+        self.committed_pages = layout.pages;
+    }
+
     fn as_slice(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        self.bytes
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        self.bytes
     }
 }
 
@@ -469,18 +470,6 @@ impl FuncType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Import<'a> {
-    pub function_index: u32,
-    pub host: HostImport,
-    module_bytes: core::marker::PhantomData<&'a [u8]>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum HostImport {
-    Wasip1(Wasip1ImportName),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Wasip1Row {
     FdWrite,
     FdRead,
@@ -504,21 +493,6 @@ pub(super) enum Wasip1Row {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ImportPlanEntry {
-    row: Wasip1Row,
-}
-
-impl ImportPlanEntry {
-    const fn new(row: Wasip1Row) -> Self {
-        Self { row }
-    }
-
-    const fn row(self) -> Wasip1Row {
-        self.row
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImportPlanDiagnostics {
     import_count: u16,
 }
@@ -531,7 +505,7 @@ impl ImportPlanDiagnostics {
 
 #[derive(Clone, Copy)]
 struct ImportPlan {
-    entries: [Option<ImportPlanEntry>; CORE_WASM_MAX_IMPORTS],
+    entries: [Option<Wasip1Row>; CORE_WASM_MAX_IMPORTS],
     import_count: u16,
 }
 
@@ -553,7 +527,7 @@ impl ImportPlan {
         let Some(slot) = self.entries.get_mut(function_index) else {
             return Err(unsupported!("too many core wasm imports"));
         };
-        *slot = Some(ImportPlanEntry::new(row));
+        *slot = Some(row);
         self.import_count = self
             .import_count
             .checked_add(1)
@@ -561,7 +535,7 @@ impl ImportPlan {
         Ok(())
     }
 
-    fn entry(&self, function_index: u32) -> Result<ImportPlanEntry, WasmError> {
+    fn entry(&self, function_index: u32) -> Result<Wasip1Row, WasmError> {
         self.entries
             .get(function_index as usize)
             .copied()
@@ -850,10 +824,9 @@ pub(super) enum VmEvent {
     ArgsGet(ArgsGetCall),
     EnvironSizesGet(EnvironSizesGetCall),
     EnvironGet(EnvironGetCall),
-    ProcExit(u32),
     MemoryGrow(MemoryGrowEvent),
     BudgetExpired(BudgetExpired),
-    Done,
+    Exit(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -907,7 +880,7 @@ impl PendingWasip1Call {
             Self::ArgsGet(call) => VmEvent::ArgsGet(call),
             Self::EnvironSizesGet(call) => VmEvent::EnvironSizesGet(call),
             Self::EnvironGet(call) => VmEvent::EnvironGet(call),
-            Self::ProcExit(code) => VmEvent::ProcExit(code),
+            Self::ProcExit(code) => VmEvent::Exit(code),
         }
     }
 }
@@ -992,7 +965,7 @@ impl FdPrestatDirNameCall {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathBytes {
-    bytes: [u8; CORE_WASIP1_PATH_CAPACITY],
+    bytes: [u8; WASIP1_PATH_CHUNK_CAPACITY],
     len: usize,
 }
 
@@ -1165,15 +1138,11 @@ pub(super) struct ArgsSizesGetCall {
     argv_buf_size_ptr: u32,
 }
 
-impl ArgsSizesGetCall {}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ArgsGetCall {
     argv: u32,
     argv_buf: u32,
 }
-
-impl ArgsGetCall {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct EnvironSizesGetCall {
@@ -1181,15 +1150,11 @@ pub(super) struct EnvironSizesGetCall {
     environ_buf_size_ptr: u32,
 }
 
-impl EnvironSizesGetCall {}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct EnvironGetCall {
     environ: u32,
     environ_buf: u32,
 }
-
-impl EnvironGetCall {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CodeBody<'a> {
@@ -1375,10 +1340,77 @@ enum PendingExecution {
 }
 
 #[derive(Clone, Copy)]
+enum Wasip1Result {
+    None,
+    I32(u32),
+}
+
+impl Wasip1Result {
+    const fn count(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::I32(_) => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreparedWasip1Completion {
+    call: PendingWasip1Call,
+    result: Wasip1Result,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WasiVectorLayout {
+    count: u8,
+    bytes: u8,
+}
+
+impl WasiVectorLayout {
+    fn arguments(count: u32, bytes: u32) -> Result<Self, WasmError> {
+        let layout = Self::bounded(count, bytes)?;
+        if layout.count > layout.bytes {
+            return Err(invalid!("argument sizes cannot describe canonical strings"));
+        }
+        Ok(layout)
+    }
+
+    fn environment(count: u32, bytes: u32) -> Result<Self, WasmError> {
+        let layout = Self::bounded(count, bytes)?;
+        let minimum = layout
+            .count
+            .checked_mul(3)
+            .ok_or(invalid!("environment size count overflow"))?;
+        if minimum > layout.bytes {
+            return Err(invalid!(
+                "environment sizes cannot describe canonical entries"
+            ));
+        }
+        Ok(layout)
+    }
+
+    fn bounded(count: u32, bytes: u32) -> Result<Self, WasmError> {
+        let count = u8::try_from(count)
+            .map_err(|_| unsupported!("WASI vector count exceeds compact capacity"))?;
+        let bytes = u8::try_from(bytes)
+            .map_err(|_| unsupported!("WASI vector bytes exceed compact capacity"))?;
+        if bytes as usize > WASIP1_IO_CHUNK_CAPACITY {
+            return Err(unsupported!(
+                "WASI vector bytes exceed transport payload capacity"
+            ));
+        }
+        Ok(Self { count, bytes })
+    }
+
+    fn matches(self, count: usize, bytes: usize) -> bool {
+        count == self.count as usize && bytes == self.bytes as usize
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct Module<'a> {
     types: [FuncType; CORE_WASM_MAX_TYPES],
     type_count: usize,
-    imports: [Option<Import<'a>>; CORE_WASM_MAX_IMPORTS],
     import_type_indices: [u32; CORE_WASM_MAX_IMPORTS],
     import_plan: ImportPlan,
     import_count: usize,
@@ -1388,13 +1420,17 @@ pub(super) struct Module<'a> {
     global_count: usize,
     code_bodies: [Option<CodeBody<'a>>; CORE_WASM_MAX_FUNCTIONS],
     data_segments: [Option<DataSegment<'a>>; WASM_MAX_DATA_SEGMENTS],
+    declared_data_count: u8,
     element_segments: [Option<ElementSegment>; CORE_WASM_MAX_ELEMENT_SEGMENTS],
     table_functions: [u32; CORE_WASM_TABLE_CAPACITY],
-    table_function_count: usize,
+    element_active_mask: u8,
     table_min: usize,
+    table_max: usize,
+    table_present: bool,
     start_function_index: u32,
     memory_min_pages: u32,
     memory_max_pages: u32,
+    memory_present: bool,
 }
 
 pub(super) struct Interpreter<'a> {
@@ -1423,11 +1459,21 @@ pub(super) struct Interpreter<'a> {
 
 pub(super) struct Vm<'a> {
     core: Interpreter<'a>,
-    done: bool,
+    args_layout: Option<WasiVectorLayout>,
+    environ_layout: Option<WasiVectorLayout>,
+    state: VmState,
+}
+
+#[derive(Clone, Copy)]
+enum VmState {
+    Running,
+    Exited(u32),
+    Faulted(WasmError),
 }
 
 #[cfg(target_arch = "arm")]
-const _: () = assert!(core::mem::size_of::<Vm<'static>>() <= CORE1_VM_OBJECT_BUDGET_BYTES);
+const _: () = assert!(core::mem::size_of::<Vm<'static>>() <= VM_OBJECT_BUDGET_BYTES);
+const _: () = assert!(!core::mem::needs_drop::<Vm<'static>>());
 
 static EMPTY_MODULE: Module<'static> = Module::empty();
 
@@ -1583,6 +1629,9 @@ impl<'a> Reader<'a> {
                 return Err(invalid!("u32 leb too wide"));
             }
             let byte = self.read_u8()?;
+            if shift == 28 && byte & 0xf0 != 0 {
+                return Err(invalid!("u32 leb exceeds value width"));
+            }
             value |= ((byte & 0x7f) as u32) << shift;
             if byte & 0x80 == 0 {
                 return Ok(value);
@@ -1600,6 +1649,13 @@ impl<'a> Reader<'a> {
                 return Err(invalid!("i32 leb too wide"));
             }
             byte = self.read_u8()?;
+            if shift == 28 {
+                let payload = byte & 0x7f;
+                let unused = payload & 0x70;
+                if (payload & 0x08 == 0 && unused != 0) || (payload & 0x08 != 0 && unused != 0x70) {
+                    return Err(invalid!("i32 leb exceeds value width"));
+                }
+            }
             value |= ((byte & 0x7f) as i32) << shift;
             shift += 7;
             if byte & 0x80 == 0 {
@@ -1621,6 +1677,9 @@ impl<'a> Reader<'a> {
                 return Err(invalid!("i64 leb too wide"));
             }
             byte = self.read_u8()?;
+            if shift == 63 && !matches!(byte & 0x7f, 0x00 | 0x7f) {
+                return Err(invalid!("i64 leb exceeds value width"));
+            }
             value |= ((byte & 0x7f) as i64) << shift;
             shift += 7;
             if byte & 0x80 == 0 {
@@ -1634,12 +1693,29 @@ impl<'a> Reader<'a> {
     }
 }
 
+fn core_section_rank(section_id: u8) -> Result<u8, WasmError> {
+    match section_id {
+        SECTION_TYPE => Ok(1),
+        SECTION_IMPORT => Ok(2),
+        SECTION_FUNCTION => Ok(3),
+        SECTION_TABLE => Ok(4),
+        SECTION_MEMORY => Ok(5),
+        SECTION_GLOBAL => Ok(6),
+        SECTION_EXPORT => Ok(7),
+        SECTION_START => Ok(8),
+        SECTION_ELEMENT => Ok(9),
+        SECTION_DATA_COUNT => Ok(10),
+        SECTION_CODE => Ok(11),
+        SECTION_DATA => Ok(12),
+        _ => Err(unsupported!("unsupported core wasm section")),
+    }
+}
+
 impl<'a> Module<'a> {
     const fn empty() -> Self {
         Self {
             types: [FuncType::EMPTY; CORE_WASM_MAX_TYPES],
             type_count: 0,
-            imports: [None; CORE_WASM_MAX_IMPORTS],
             import_type_indices: [0; CORE_WASM_MAX_IMPORTS],
             import_plan: ImportPlan::empty(),
             import_count: 0,
@@ -1649,17 +1725,28 @@ impl<'a> Module<'a> {
             global_count: 0,
             code_bodies: [None; CORE_WASM_MAX_FUNCTIONS],
             data_segments: [None; WASM_MAX_DATA_SEGMENTS],
+            declared_data_count: CORE_WASM_DATA_COUNT_NONE,
             element_segments: [None; CORE_WASM_MAX_ELEMENT_SEGMENTS],
             table_functions: [u32::MAX; CORE_WASM_TABLE_CAPACITY],
-            table_function_count: 0,
+            element_active_mask: 0,
             table_min: 0,
+            table_max: 0,
+            table_present: false,
             start_function_index: u32::MAX,
             memory_min_pages: 0,
             memory_max_pages: 0,
+            memory_present: false,
         }
     }
 
+    /// # Safety
+    ///
+    /// `dst` must point to aligned writable storage for `Self` that is not read
+    /// or dropped unless this function returns `Ok(())`.
     unsafe fn parse_in_place(dst: *mut Self, bytes: &'a [u8]) -> Result<(), WasmError> {
+        // SAFETY: the caller owns valid unpublished storage. Copying
+        // `EMPTY_MODULE` establishes a fully initialized `Module` before
+        // `parse_from` obtains the only mutable reference to it.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 core::ptr::addr_of!(EMPTY_MODULE).cast::<Self>(),
@@ -1681,9 +1768,17 @@ impl<'a> Module<'a> {
         }
 
         let mut saw_export = false;
+        let mut last_section_rank = 0;
 
         while !reader.is_empty() {
             let section_id = reader.read_u8()?;
+            if section_id != SECTION_CUSTOM {
+                let section_rank = core_section_rank(section_id)?;
+                if section_rank <= last_section_rank {
+                    return Err(invalid!("core wasm section order invalid or duplicated"));
+                }
+                last_section_rank = section_rank;
+            }
             let section_len = reader.read_var_u32()? as usize;
             let section_bytes = reader.read_bytes(section_len)?;
             let mut section = Reader::new(section_bytes);
@@ -1699,10 +1794,16 @@ impl<'a> Module<'a> {
                     saw_export = true;
                 }
                 SECTION_ELEMENT => self.parse_core_element_section(&mut section)?,
+                SECTION_DATA_COUNT => self.parse_core_data_count_section(&mut section)?,
                 SECTION_CODE => self.parse_core_code_section(&mut section)?,
                 SECTION_DATA => self.parse_core_data_section(&mut section)?,
                 SECTION_CUSTOM => {
-                    section.read_bytes(section.bytes.len().saturating_sub(section.pos))?;
+                    let remaining = section
+                        .bytes
+                        .len()
+                        .checked_sub(section.pos)
+                        .ok_or(WasmError::Truncated)?;
+                    section.read_bytes(remaining)?;
                 }
                 _ => return Err(unsupported!("unsupported core wasm section")),
             }
@@ -1721,6 +1822,21 @@ impl<'a> Module<'a> {
         {
             return Err(invalid!("missing core wasm code body"));
         }
+        if self.declared_data_count != CORE_WASM_DATA_COUNT_NONE
+            && self.declared_data_count as usize != self.data_segments.iter().flatten().count()
+        {
+            return Err(invalid!("core data count does not match data section"));
+        }
+        Ok(())
+    }
+
+    fn parse_core_data_count_section(&mut self, section: &mut Reader<'a>) -> Result<(), WasmError> {
+        let count = section.read_var_u32()?;
+        if count > WASM_MAX_DATA_SEGMENTS as u32 {
+            return Err(unsupported!("too many core wasm data segments"));
+        }
+        self.declared_data_count =
+            u8::try_from(count).map_err(|_| unsupported!("too many core wasm data segments"))?;
         Ok(())
     }
 
@@ -1766,21 +1882,15 @@ impl<'a> Module<'a> {
         for index in 0..count {
             let module = section.read_name()?;
             let name = section.read_name()?;
-            let host = decode_host_import(module, name)?;
+            let name = decode_host_import(module, name)?;
             if section.read_u8()? != EXTERNAL_KIND_FUNC {
                 return Err(unsupported!("core wasm only supports function imports"));
             }
             let type_index = section.read_var_u32()?;
             let ty = self.core_func_type(type_index)?;
-            let HostImport::Wasip1(name) = host;
             let row = Wasip1Row::from_import(name)
                 .ok_or(WasmError::Unsupported(UNSUPPORTED_WASIP1_IMPORT))?;
             self.import_plan.push(index, row, ty)?;
-            self.imports[index] = Some(Import {
-                function_index: index as u32,
-                host,
-                module_bytes: core::marker::PhantomData,
-            });
             self.import_type_indices[index] = type_index;
         }
         Ok(())
@@ -1805,6 +1915,7 @@ impl<'a> Module<'a> {
         if count > 1 {
             return Err(unsupported!("too many core wasm tables"));
         }
+        self.table_present = count == 1;
         for _ in 0..count {
             if section.read_u8()? != VALTYPE_FUNCREF {
                 return Err(unsupported!("only funcref tables are supported"));
@@ -1818,12 +1929,15 @@ impl<'a> Module<'a> {
                 return Err(unsupported!("core table too large"));
             }
             self.table_min = min;
-            if flags & 0x01 != 0 {
+            self.table_max = if flags & 0x01 != 0 {
                 let max = section.read_var_u32()? as usize;
                 if max < min || max > CORE_WASM_TABLE_CAPACITY {
                     return Err(unsupported!("core table limit too large"));
                 }
-            }
+                max
+            } else {
+                CORE_WASM_TABLE_CAPACITY
+            };
         }
         Ok(())
     }
@@ -1836,6 +1950,7 @@ impl<'a> Module<'a> {
         for slot in self.element_segments.iter_mut() {
             *slot = None;
         }
+        self.element_active_mask = 0;
         for segment_index in 0..count {
             let kind = section.read_var_u32()?;
             match kind {
@@ -1844,6 +1959,7 @@ impl<'a> Module<'a> {
                     let segment = self.parse_core_funcidx_element_payload(section)?;
                     self.install_core_element_segment(offset, segment)?;
                     self.element_segments[segment_index] = Some(segment);
+                    self.element_active_mask |= 1u8 << segment_index;
                 }
                 1 => {
                     if section.read_u8()? != 0 {
@@ -1863,6 +1979,7 @@ impl<'a> Module<'a> {
                     let segment = self.parse_core_funcidx_element_payload(section)?;
                     self.install_core_element_segment(offset, segment)?;
                     self.element_segments[segment_index] = Some(segment);
+                    self.element_active_mask |= 1u8 << segment_index;
                 }
                 _ => {
                     return Err(unsupported!("unsupported core element section mode"));
@@ -1899,9 +2016,9 @@ impl<'a> Module<'a> {
     ) -> Result<(), WasmError> {
         let end = offset
             .checked_add(segment.function_count)
-            .ok_or(unsupported!("core element table too large"))?;
-        if end > CORE_WASM_TABLE_CAPACITY {
-            return Err(unsupported!("core element table too large"));
+            .ok_or(invalid!("active element segment exceeds initial table"))?;
+        if !self.table_present || end > self.table_min {
+            return Err(invalid!("active element segment exceeds initial table"));
         }
         for (dst, function_index) in self
             .table_functions
@@ -1912,7 +2029,6 @@ impl<'a> Module<'a> {
         {
             *dst = function_index;
         }
-        self.table_function_count = self.table_function_count.max(end);
         Ok(())
     }
 
@@ -1934,6 +2050,7 @@ impl<'a> Module<'a> {
         if min > max {
             return Err(unsupported!("core wasm memory minimum exceeds maximum"));
         }
+        self.memory_present = true;
         self.memory_min_pages = min;
         self.memory_max_pages = max;
         Ok(())
@@ -1988,23 +2105,42 @@ impl<'a> Module<'a> {
 
     fn parse_core_export_section(&mut self, section: &mut Reader<'a>) -> Result<(), WasmError> {
         let count = section.read_var_u32()?;
+        let mut start_export = None;
+        let mut main_export = None;
         for _ in 0..count {
             let name = section.read_name()?;
             let kind = section.read_u8()?;
             let index = section.read_var_u32()?;
             if name == b"_start" {
-                if kind != EXTERNAL_KIND_FUNC {
-                    return Err(invalid!("_start must export a function"));
+                if start_export.is_some() {
+                    return Err(invalid!("duplicate _start export"));
                 }
-                self.core_func_type_index(index)?;
-                self.start_function_index = index;
-            } else if name == b"__main_void" && self.start_function_index == u32::MAX {
-                if kind != EXTERNAL_KIND_FUNC {
-                    return Err(invalid!("__main_void must export a function"));
+                start_export = Some((kind, index));
+            } else if name == b"__main_void" {
+                if main_export.is_some() {
+                    return Err(invalid!("duplicate __main_void export"));
                 }
-                self.core_func_type_index(index)?;
-                self.start_function_index = index;
+                main_export = Some((kind, index));
             }
+        }
+        if let Some((kind, index)) = start_export.or(main_export) {
+            self.require_start_export(kind, index)?;
+            self.start_function_index = index;
+        }
+        Ok(())
+    }
+
+    fn require_start_export(&self, kind: u8, index: u32) -> Result<(), WasmError> {
+        if kind != EXTERNAL_KIND_FUNC {
+            return Err(invalid!("start entry must export a function"));
+        }
+        if index < self.import_count as u32 {
+            return Err(invalid!("start entry must be a local function"));
+        }
+        let type_index = self.core_func_type_index(index)?;
+        let ty = self.core_func_type(type_index)?;
+        if ty.param_count != 0 || ty.result_count != 0 {
+            return Err(invalid!("start entry must have type () -> ()"));
         }
         Ok(())
     }
@@ -2124,24 +2260,72 @@ impl<'a> Module<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct InitialMemoryLayout {
+    pages: u32,
+    committed_len: usize,
+}
+
+impl InitialMemoryLayout {
+    fn prepare(module: &Module<'_>, memory: &GuestMemory<'_>) -> Result<Self, WasmError> {
+        if module.memory_min_pages > memory.capacity_pages() {
+            return Err(unsupported!("core wasm memory too large"));
+        }
+        let committed_len = (module.memory_min_pages as usize)
+            .checked_mul(CORE_WASM_PAGE_SIZE)
+            .ok_or(WasmError::Truncated)?;
+        for segment in module.data_segments.iter().copied().flatten() {
+            if !segment.active {
+                continue;
+            }
+            if !module.memory_present {
+                return Err(invalid!("active data segment requires memory"));
+            }
+            let start = segment.offset as usize;
+            let end = start
+                .checked_add(segment.bytes.len())
+                .ok_or(WasmError::Truncated)?;
+            if end > committed_len {
+                return Err(WasmError::Truncated);
+            }
+        }
+        Ok(Self {
+            pages: module.memory_min_pages,
+            committed_len,
+        })
+    }
+}
+
 impl<'a> Interpreter<'a> {
+    /// # Safety
+    ///
+    /// `dst` must point to aligned writable storage whose `module` field is an
+    /// initialized `Module<'a>`. No other field may be read or dropped unless
+    /// this function returns `Ok(())`.
     unsafe fn init_from_parsed_module_in_place(
         dst: *mut Interpreter<'a>,
         memory: GuestMemory<'a>,
     ) -> Result<(), WasmError> {
+        // SAFETY: the function's contract requires this field to have been
+        // initialized by `Module::parse_in_place` and keeps `dst` exclusive.
         let module = unsafe { &*core::ptr::addr_of!((*dst).module) };
-        if module.memory_min_pages > memory.capacity_pages() {
-            return Err(unsupported!("core wasm memory too large"));
-        }
-        let memory_min_pages = module.memory_min_pages;
+        let memory_layout = InitialMemoryLayout::prepare(module, &memory)?;
         let global_count = module.global_count;
-        let table_size = module.table_min.max(module.table_function_count);
+        let table_size = module.table_min;
         let start_function_index = module.start_function_index;
+        let mut data_dropped = [false; WASM_MAX_DATA_SEGMENTS];
+        for (index, segment) in module.data_segments.iter().copied().enumerate() {
+            data_dropped[index] = segment.is_some_and(|segment| segment.active);
+        }
+        let mut element_dropped = [false; CORE_WASM_MAX_ELEMENT_SEGMENTS];
+        for (index, dropped) in element_dropped.iter_mut().enumerate() {
+            *dropped = module.element_active_mask & (1u8 << index) != 0;
+        }
+        // SAFETY: all destinations are distinct fields in the caller-owned
+        // unpublished allocation. Every field other than `module` is written
+        // here before a reference to the complete `Interpreter` is formed.
         unsafe {
             core::ptr::addr_of_mut!((*dst).memory).write(memory);
-            let memory = &mut *core::ptr::addr_of_mut!((*dst).memory);
-            memory.clear();
-            memory.commit_pages(memory_min_pages)?;
             write_empty_frames(core::ptr::addr_of_mut!((*dst).frames));
             core::ptr::addr_of_mut!((*dst).frame_len).write(0);
             core::ptr::addr_of_mut!((*dst).values)
@@ -2152,9 +2336,8 @@ impl<'a> Interpreter<'a> {
                 .write([ValueKind::I32; CORE_WASM_MAX_GLOBALS]);
             core::ptr::addr_of_mut!((*dst).global_mutable).write([false; CORE_WASM_MAX_GLOBALS]);
             core::ptr::addr_of_mut!((*dst).global_count).write(global_count);
-            core::ptr::addr_of_mut!((*dst).data_dropped).write([false; WASM_MAX_DATA_SEGMENTS]);
-            core::ptr::addr_of_mut!((*dst).element_dropped)
-                .write([false; CORE_WASM_MAX_ELEMENT_SEGMENTS]);
+            core::ptr::addr_of_mut!((*dst).data_dropped).write(data_dropped);
+            core::ptr::addr_of_mut!((*dst).element_dropped).write(element_dropped);
             core::ptr::addr_of_mut!((*dst).table_functions)
                 .write([u32::MAX; CORE_WASM_TABLE_CAPACITY]);
             core::ptr::addr_of_mut!((*dst).table_size).write(table_size);
@@ -2169,6 +2352,9 @@ impl<'a> Interpreter<'a> {
             core::ptr::addr_of_mut!((*dst).pending).write(None);
             core::ptr::addr_of_mut!((*dst).done).write(false);
         }
+        // SAFETY: `module` was initialized by contract and the block above
+        // initialized every remaining field, so `dst` now contains a valid
+        // exclusively owned `Interpreter`.
         let instance = unsafe { &mut *dst };
         for index in 0..CORE_WASM_TABLE_CAPACITY {
             instance.table_functions[index] = instance.module.table_functions[index];
@@ -2186,14 +2372,22 @@ impl<'a> Interpreter<'a> {
             instance.global_kinds[index] = global.kind;
             instance.global_mutable[index] = global.mutable;
         }
-        instance.init_core_data_segments()?;
         instance.push_frame(start_function_index)?;
+        instance.memory.clear();
+        instance.memory.commit_initial_layout(memory_layout);
+        instance.publish_initial_data_segments(memory_layout);
         Ok(())
     }
 }
 
+/// # Safety
+///
+/// `dst` must point to aligned writable unpublished storage for a complete
+/// `Frames<'a>` array.
 unsafe fn write_empty_frames<'a>(dst: *mut Frames<'a>) {
     for index in 0..CORE_WASM_CALL_STACK_CAPACITY {
+        // SAFETY: the caller guarantees the complete array is writable, and
+        // each loop iteration initializes one distinct in-bounds element.
         unsafe {
             core::ptr::addr_of_mut!((*dst)[index]).write(Frame::empty());
         }
@@ -2214,13 +2408,13 @@ fn parse_core_i32_offset_expr(section: &mut Reader<'_>) -> Result<i32, WasmError
     Ok(offset)
 }
 
-fn decode_host_import(module: &[u8], name: &[u8]) -> Result<HostImport, WasmError> {
+fn decode_host_import(module: &[u8], name: &[u8]) -> Result<Wasip1ImportName, WasmError> {
     if module != WASIP1_PREVIEW1_MODULE.as_bytes() {
         return Err(unsupported!("unsupported host import module"));
     }
     let name =
         Wasip1ImportName::from_bytes(name).ok_or(unsupported!("unsupported wasi p1 import"))?;
-    Ok(HostImport::Wasip1(name))
+    Ok(name)
 }
 
 fn decode_core_block_type(byte: u8) -> Result<(usize, ValueKind), WasmError> {
@@ -2429,11 +2623,18 @@ impl<'a> Interpreter<'a> {
     }
 
     #[cfg(test)]
+    /// # Safety
+    ///
+    /// `dst` must point to aligned writable storage for `Self` that is not read
+    /// or dropped unless this function returns `Ok(())`.
     unsafe fn init_in_place(
         dst: *mut Self,
         module: &'a [u8],
         memory: GuestMemory<'a>,
     ) -> Result<(), WasmError> {
+        // SAFETY: the caller provides exclusive unpublished storage. Parsing
+        // initializes `module`, then the shared initializer writes every
+        // remaining interpreter field.
         unsafe {
             Module::parse_in_place(core::ptr::addr_of_mut!((*dst).module), module)?;
             Self::init_from_parsed_module_in_place(dst, memory)?;
@@ -2485,6 +2686,7 @@ impl<'a> Interpreter<'a> {
                 if table_index != 0 {
                     return Err(invalid!("core table instruction index must be zero"));
                 }
+                self.require_table()?;
                 let table_index = self.pop_core_i32()? as usize;
                 let function_index = *self
                     .table_functions
@@ -2546,17 +2748,19 @@ impl<'a> Interpreter<'a> {
                         stack_height,
                     )?)?;
                 } else if else_pos != usize::MAX {
+                    let else_start = else_pos.checked_add(1).ok_or(WasmError::Truncated)?;
                     self.push_core_control(ControlFrame::new(
                         ControlKind::If,
-                        else_pos.saturating_add(1),
+                        else_start,
                         end_pos,
                         target.result_count,
                         target.result_kind,
                         stack_height,
                     )?)?;
-                    self.current_frame_mut()?.pc = else_pos.saturating_add(1);
+                    self.current_frame_mut()?.pc = else_start;
                 } else if target.result_count == 0 {
-                    self.current_frame_mut()?.pc = end_pos.saturating_add(1);
+                    self.current_frame_mut()?.pc =
+                        end_pos.checked_add(1).ok_or(WasmError::Truncated)?;
                 } else {
                     return Err(invalid!("if result requires else arm"));
                 }
@@ -2612,9 +2816,13 @@ impl<'a> Interpreter<'a> {
                 self.set_core_local(value as usize, value_to_set)?;
             }
             OPCODE_LOCAL_TEE => {
+                let value_index = self
+                    .value_len
+                    .checked_sub(1)
+                    .ok_or(WasmError::StackUnderflow)?;
                 let value_to_set = *self
                     .values
-                    .get(self.value_len.saturating_sub(1))
+                    .get(value_index)
                     .ok_or(WasmError::StackUnderflow)?;
                 self.set_core_local(value as usize, value_to_set)?;
             }
@@ -2647,6 +2855,7 @@ impl<'a> Interpreter<'a> {
                 if value != 0 {
                     return Err(invalid!("core table instruction index must be zero"));
                 }
+                self.require_table()?;
                 let index = self.pop_core_i32()? as usize;
                 if index >= self.table_size {
                     return Err(invalid!("core table.get out of range"));
@@ -2657,6 +2866,7 @@ impl<'a> Interpreter<'a> {
                 if value != 0 {
                     return Err(invalid!("core table instruction index must be zero"));
                 }
+                self.require_table()?;
                 let value_to_set = self.pop_core_funcref()?;
                 let index = self.pop_core_i32()? as usize;
                 if index >= self.table_size {
@@ -2681,12 +2891,14 @@ impl<'a> Interpreter<'a> {
                 if value != 0 {
                     return Err(invalid!("core memory instruction index must be zero"));
                 }
+                self.require_memory()?;
                 self.push_core_value(Value::I32(self.memory.committed_pages()))?;
             }
             OPCODE_MEMORY_GROW => {
                 if value != 0 {
                     return Err(invalid!("core memory instruction index must be zero"));
                 }
+                self.require_memory()?;
                 let requested_pages = self.pop_core_i32()?;
                 let previous_pages = self.memory.committed_pages();
                 let event = MemoryGrowEvent {
@@ -2825,6 +3037,9 @@ impl<'a> Interpreter<'a> {
                 let condition = self.pop_core_i32()?;
                 let alternate = self.pop_core_value()?;
                 let consequent = self.pop_core_value()?;
+                if consequent.kind() != alternate.kind() {
+                    return Err(invalid!("core select operand type mismatch"));
+                }
                 self.push_core_value(if condition != 0 {
                     consequent
                 } else {
@@ -3009,7 +3224,9 @@ impl<'a> Interpreter<'a> {
             OPCODE_F32_FLOOR => self.core_unary_f32(wasm_f32_floor)?,
             OPCODE_F32_TRUNC => self.core_unary_f32(wasm_f32_trunc)?,
             OPCODE_F32_NEAREST => self.core_unary_f32(wasm_f32_nearest)?,
-            OPCODE_F32_SQRT => self.core_unary_f32(wasm_f32_sqrt)?,
+            OPCODE_F32_SQRT | OPCODE_F64_SQRT => {
+                return Err(WasmError::UnsupportedOpcode(opcode));
+            }
             OPCODE_F32_ADD => self.core_binary_f32(|a, b| a + b)?,
             OPCODE_F32_SUB => self.core_binary_f32(|a, b| a - b)?,
             OPCODE_F32_MUL => self.core_binary_f32(|a, b| a * b)?,
@@ -3023,7 +3240,6 @@ impl<'a> Interpreter<'a> {
             OPCODE_F64_FLOOR => self.core_unary_f64(wasm_f64_floor)?,
             OPCODE_F64_TRUNC => self.core_unary_f64(wasm_f64_trunc)?,
             OPCODE_F64_NEAREST => self.core_unary_f64(wasm_f64_nearest)?,
-            OPCODE_F64_SQRT => self.core_unary_f64(wasm_f64_sqrt)?,
             OPCODE_F64_ADD => self.core_binary_f64(|a, b| a + b)?,
             OPCODE_F64_SUB => self.core_binary_f64(|a, b| a - b)?,
             OPCODE_F64_MUL => self.core_binary_f64(|a, b| a * b)?,
@@ -3163,13 +3379,15 @@ impl<'a> Interpreter<'a> {
     fn exec_misc(&mut self, instr: MiscInstr) -> Result<(), WasmError> {
         match instr {
             MiscInstr::MemoryInit { data_index } => {
+                self.require_data_count()?;
                 let len = self.pop_core_i32()? as usize;
                 let src_addr = self.pop_core_i32()? as usize;
-                let dst_addr = self.pop_core_i32()?;
-                let dst = self.core_translate_addr(dst_addr)?;
+                let dst =
+                    usize::try_from(self.pop_core_i32()?).map_err(|_| WasmError::Truncated)?;
                 self.core_memory_init(data_index, dst, src_addr, len)?;
             }
             MiscInstr::DataDrop { data_index } => {
+                self.require_data_count()?;
                 if data_index >= self.data_dropped.len()
                     || self.module.data_segments[data_index].is_none()
                 {
@@ -3179,17 +3397,17 @@ impl<'a> Interpreter<'a> {
             }
             MiscInstr::MemoryCopy => {
                 let len = self.pop_core_i32()? as usize;
-                let src_addr = self.pop_core_i32()?;
-                let dst_addr = self.pop_core_i32()?;
-                let src = self.core_translate_addr(src_addr)?;
-                let dst = self.core_translate_addr(dst_addr)?;
+                let src =
+                    usize::try_from(self.pop_core_i32()?).map_err(|_| WasmError::Truncated)?;
+                let dst =
+                    usize::try_from(self.pop_core_i32()?).map_err(|_| WasmError::Truncated)?;
                 self.core_memory_copy(dst, src, len)?;
             }
             MiscInstr::MemoryFill => {
                 let len = self.pop_core_i32()? as usize;
                 let value = self.pop_core_i32()? as u8;
-                let dst_addr = self.pop_core_i32()?;
-                let dst = self.core_translate_addr(dst_addr)?;
+                let dst =
+                    usize::try_from(self.pop_core_i32()?).map_err(|_| WasmError::Truncated)?;
                 self.core_memory_fill(dst, value, len)?;
             }
             MiscInstr::TableInit {
@@ -3199,6 +3417,7 @@ impl<'a> Interpreter<'a> {
                 if table_index != 0 {
                     return Err(invalid!("core table instruction index must be zero"));
                 }
+                self.require_table()?;
                 let len = self.pop_core_i32()? as usize;
                 let src = self.pop_core_i32()? as usize;
                 let dst = self.pop_core_i32()? as usize;
@@ -3219,6 +3438,7 @@ impl<'a> Interpreter<'a> {
                 if dst_table != 0 || src_table != 0 {
                     return Err(invalid!("core table instruction index must be zero"));
                 }
+                self.require_table()?;
                 let len = self.pop_core_i32()? as usize;
                 let src = self.pop_core_i32()? as usize;
                 let dst = self.pop_core_i32()? as usize;
@@ -3228,6 +3448,7 @@ impl<'a> Interpreter<'a> {
                 if table_index != 0 {
                     return Err(invalid!("core table instruction index must be zero"));
                 }
+                self.require_table()?;
                 let delta = self.pop_core_i32()? as usize;
                 let init = self.pop_core_funcref()?;
                 if init != u32::MAX {
@@ -3238,7 +3459,7 @@ impl<'a> Interpreter<'a> {
                     self.push_core_value(Value::I32(u32::MAX))?;
                     return Ok(());
                 };
-                if new_size > CORE_WASM_TABLE_CAPACITY {
+                if new_size > self.module.table_max {
                     self.push_core_value(Value::I32(u32::MAX))?;
                 } else {
                     for slot in self
@@ -3257,12 +3478,14 @@ impl<'a> Interpreter<'a> {
                 if table_index != 0 {
                     return Err(invalid!("core table instruction index must be zero"));
                 }
+                self.require_table()?;
                 self.push_core_value(Value::I32(self.table_size as u32))?;
             }
             MiscInstr::TableFill { table_index } => {
                 if table_index != 0 {
                     return Err(invalid!("core table instruction index must be zero"));
                 }
+                self.require_table()?;
                 let len = self.pop_core_i32()? as usize;
                 let value = self.pop_core_funcref()?;
                 let start = self.pop_core_i32()? as usize;
@@ -3275,38 +3498,37 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
-    fn require_matching_host_import(&self, expected: PendingWasip1Call) -> Result<(), WasmError> {
+    fn prepare_wasip1_completion(
+        &self,
+        expected: PendingWasip1Call,
+        result: Wasip1Result,
+    ) -> Result<PreparedWasip1Completion, WasmError> {
         match self.pending.as_ref() {
-            Some(PendingExecution::Wasip1(call)) if *call == expected => Ok(()),
-            Some(_) => Err(WasmError::PendingMismatch),
-            None => Err(WasmError::PendingRequired),
+            Some(PendingExecution::Wasip1(call)) if *call == expected => {}
+            Some(_) => return Err(WasmError::PendingMismatch),
+            None => return Err(WasmError::PendingRequired),
         }
+        if result.count() != expected.result_count() {
+            return Err(WasmError::PendingMismatch);
+        }
+        self.value_len
+            .checked_add(result.count())
+            .filter(|len| *len <= CORE_WASM_VALUE_STACK_CAPACITY)
+            .ok_or(WasmError::StackOverflow)?;
+        Ok(PreparedWasip1Completion {
+            call: expected,
+            result,
+        })
     }
 
-    fn finish_matching_host_import(
-        &mut self,
-        expected: PendingWasip1Call,
-        results: &[Value],
-    ) -> Result<(), WasmError> {
-        let pending = self.pending.take().ok_or(WasmError::PendingRequired)?;
-        let PendingExecution::Wasip1(call) = pending else {
-            self.pending = Some(pending);
-            return Err(WasmError::PendingMismatch);
-        };
-        if call != expected {
-            self.pending = Some(PendingExecution::Wasip1(call));
-            return Err(WasmError::PendingMismatch);
+    fn commit_wasip1_completion(&mut self, prepared: PreparedWasip1Completion) {
+        debug_assert_eq!(self.pending, Some(PendingExecution::Wasip1(prepared.call)));
+        self.pending = None;
+        if let Wasip1Result::I32(value) = prepared.result {
+            debug_assert!(self.value_len < CORE_WASM_VALUE_STACK_CAPACITY);
+            self.values[self.value_len] = Value::I32(value);
+            self.value_len += 1;
         }
-        if results.len() != call.result_count() {
-            return Err(WasmError::PendingMismatch);
-        }
-        for result in results.iter().copied() {
-            if result.kind() != ValueKind::I32 {
-                return Err(invalid!("core import result type mismatch"));
-            }
-            self.push_core_value(result)?;
-        }
-        Ok(())
     }
 
     pub(super) fn finish_memory_grow_event(
@@ -3354,26 +3576,15 @@ impl<'a> Interpreter<'a> {
     }
 
     pub(super) fn read_memory(&self, addr: u32, out: &mut [u8]) -> Result<(), WasmError> {
-        let start = self.core_translate_addr(addr)?;
-        let end = start.checked_add(out.len()).ok_or(WasmError::Truncated)?;
-        if end > self.core_memory_len()? {
-            return Err(WasmError::Truncated);
-        }
-        let bytes = self.memory.get(start..end).ok_or(WasmError::Truncated)?;
+        let range = self.core_memory_range(addr, out.len())?;
+        let bytes = self.memory.get(range).ok_or(WasmError::Truncated)?;
         out.copy_from_slice(bytes);
         Ok(())
     }
 
     pub(super) fn write_memory(&mut self, addr: u32, bytes: &[u8]) -> Result<(), WasmError> {
-        let start = self.core_translate_addr(addr)?;
-        let end = start.checked_add(bytes.len()).ok_or(WasmError::Truncated)?;
-        if end > self.core_memory_len()? {
-            return Err(WasmError::Truncated);
-        }
-        let dst = self
-            .memory
-            .get_mut(start..end)
-            .ok_or(WasmError::Truncated)?;
+        let range = self.core_memory_range(addr, bytes.len())?;
+        let dst = self.memory.get_mut(range).ok_or(WasmError::Truncated)?;
         dst.copy_from_slice(bytes);
         Ok(())
     }
@@ -3398,27 +3609,17 @@ impl<'a> Interpreter<'a> {
         self.write_memory(addr, &bytes)
     }
 
-    fn init_core_data_segments(&mut self) -> Result<(), WasmError> {
+    fn publish_initial_data_segments(&mut self, layout: InitialMemoryLayout) {
         let segments = self.module.data_segments;
-        for (index, segment) in segments.into_iter().flatten().enumerate() {
+        for segment in segments.into_iter().flatten() {
             if !segment.active {
                 continue;
             }
-            let start = self.core_translate_addr(segment.offset)?;
-            let end = start
-                .checked_add(segment.bytes.len())
-                .ok_or(WasmError::Truncated)?;
-            if end > self.core_memory_len()? {
-                return Err(WasmError::Truncated);
-            }
-            let dst = self
-                .memory
-                .get_mut(start..end)
-                .ok_or(WasmError::Truncated)?;
-            dst.copy_from_slice(segment.bytes);
-            self.data_dropped[index] = false;
+            let start = segment.offset as usize;
+            let end = start + segment.bytes.len();
+            debug_assert!(end <= layout.committed_len);
+            self.memory[start..end].copy_from_slice(segment.bytes);
         }
-        Ok(())
     }
 
     fn push_frame(&mut self, function_index: u32) -> Result<(), WasmError> {
@@ -3689,8 +3890,8 @@ impl<'a> Interpreter<'a> {
     }
 
     fn call_core_import(&mut self, function_index: u32) -> Result<ExecutionEvent, WasmError> {
-        let entry = self.module.import_plan.entry(function_index)?;
-        let call = self.begin_wasip1_import(entry.row())?;
+        let row = self.module.import_plan.entry(function_index)?;
+        let call = self.begin_wasip1_import(row)?;
         self.pending = Some(PendingExecution::Wasip1(call));
         Ok(ExecutionEvent::Wasip1Call)
     }
@@ -3793,122 +3994,50 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
+    fn decode_current<T>(
+        &mut self,
+        decode: impl FnOnce(&mut Reader<'a>) -> Result<T, WasmError>,
+    ) -> Result<T, WasmError> {
+        let frame = self.current_frame_mut()?;
+        let mut reader = Reader {
+            bytes: frame.code,
+            pos: frame.pc,
+        };
+        let value = decode(&mut reader)?;
+        frame.pc = reader.pos;
+        Ok(value)
+    }
+
     fn current_read_u8(&mut self) -> Result<u8, WasmError> {
-        let frame_index = self.current_frame_index()?;
-        let frame = &mut self.frames[frame_index];
-        let byte = *frame.code.get(frame.pc).ok_or(WasmError::Truncated)?;
-        frame.pc += 1;
-        Ok(byte)
+        self.decode_current(Reader::read_u8)
     }
 
     fn current_read_var_u32(&mut self) -> Result<u32, WasmError> {
-        let frame_index = self.current_frame_index()?;
-        let frame = &mut self.frames[frame_index];
-        let mut shift = 0u32;
-        let mut value = 0u32;
-        loop {
-            if shift >= 35 {
-                return Err(invalid!("u32 leb too wide"));
-            }
-            let byte = *frame.code.get(frame.pc).ok_or(WasmError::Truncated)?;
-            frame.pc += 1;
-            value |= ((byte & 0x7f) as u32) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-        }
-        Ok(value)
+        self.decode_current(Reader::read_var_u32)
     }
 
     fn current_read_var_i32(&mut self) -> Result<i32, WasmError> {
-        let frame_index = self.current_frame_index()?;
-        let frame = &mut self.frames[frame_index];
-        let mut shift = 0u32;
-        let mut value = 0i32;
-        let mut byte;
-        loop {
-            if shift >= 35 {
-                return Err(invalid!("i32 leb too wide"));
-            }
-            byte = *frame.code.get(frame.pc).ok_or(WasmError::Truncated)?;
-            frame.pc += 1;
-            value |= ((byte & 0x7f) as i32) << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                break;
-            }
-        }
-        if shift < 32 && (byte & 0x40) != 0 {
-            value |= (!0i32) << shift;
-        }
-        Ok(value)
+        self.decode_current(Reader::read_var_i32)
     }
 
     fn current_read_var_i64(&mut self) -> Result<i64, WasmError> {
-        let frame_index = self.current_frame_index()?;
-        let frame = &mut self.frames[frame_index];
-        let mut shift = 0u32;
-        let mut value = 0i64;
-        let mut byte;
-        loop {
-            if shift >= 70 {
-                return Err(invalid!("i64 leb too wide"));
-            }
-            byte = *frame.code.get(frame.pc).ok_or(WasmError::Truncated)?;
-            frame.pc += 1;
-            value |= ((byte & 0x7f) as i64) << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                break;
-            }
-        }
-        if shift < 64 && (byte & 0x40) != 0 {
-            value |= (!0i64) << shift;
-        }
-        Ok(value)
+        self.decode_current(Reader::read_var_i64)
     }
 
     fn current_read_fixed_u32(&mut self) -> Result<u32, WasmError> {
-        let frame_index = self.current_frame_index()?;
-        let frame = &mut self.frames[frame_index];
-        let end = frame.pc.checked_add(4).ok_or(WasmError::Truncated)?;
-        let bytes = frame.code.get(frame.pc..end).ok_or(WasmError::Truncated)?;
-        frame.pc = end;
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        self.decode_current(Reader::read_fixed_u32)
     }
 
     fn current_read_fixed_u64(&mut self) -> Result<u64, WasmError> {
-        let frame_index = self.current_frame_index()?;
-        let frame = &mut self.frames[frame_index];
-        let end = frame.pc.checked_add(8).ok_or(WasmError::Truncated)?;
-        let bytes = frame.code.get(frame.pc..end).ok_or(WasmError::Truncated)?;
-        frame.pc = end;
-        Ok(u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
+        self.decode_current(Reader::read_fixed_u64)
     }
 
     fn current_br_table(&mut self) -> Result<BrTableInstr, WasmError> {
-        let frame = self.current_frame_mut()?;
-        let mut reader = Reader {
-            bytes: frame.code,
-            pos: frame.pc,
-        };
-        let table = decode_core_br_table(&mut reader)?;
-        frame.pc = reader.pos;
-        Ok(table)
+        self.decode_current(decode_core_br_table)
     }
 
     fn current_misc_instr(&mut self) -> Result<MiscInstr, WasmError> {
-        let frame = self.current_frame_mut()?;
-        let mut reader = Reader {
-            bytes: frame.code,
-            pos: frame.pc,
-        };
-        let instr = decode_core_misc_instr(&mut reader)?;
-        frame.pc = reader.pos;
-        Ok(instr)
+        self.decode_current(decode_core_misc_instr)
     }
 
     fn push_core_value(&mut self, value: Value) -> Result<(), WasmError> {
@@ -4060,7 +4189,10 @@ impl<'a> Interpreter<'a> {
     fn core_branch(&mut self, depth: usize) -> Result<(), WasmError> {
         let frame_index = self.current_frame_index()?;
         let frame = self.frames[frame_index];
-        let Some(target_index) = frame.control_len.checked_sub(depth.saturating_add(1)) else {
+        let target_depth = depth
+            .checked_add(1)
+            .ok_or(invalid!("core branch target out of range"))?;
+        let Some(target_index) = frame.control_len.checked_sub(target_depth) else {
             return Err(invalid!("core branch target out of range"));
         };
         let pool_index = frame
@@ -4107,17 +4239,50 @@ impl<'a> Interpreter<'a> {
     }
 
     fn core_translate_addr(&self, addr: u32) -> Result<usize, WasmError> {
-        let len = self.core_memory_len()?;
-        let offset = addr as usize;
-        if offset < len {
-            Ok(offset)
-        } else {
-            Err(WasmError::Truncated)
+        Ok(self.core_memory_range(addr, 1)?.start)
+    }
+
+    fn core_memory_range(
+        &self,
+        addr: u32,
+        len: usize,
+    ) -> Result<core::ops::Range<usize>, WasmError> {
+        let start = usize::try_from(addr).map_err(|_| WasmError::Truncated)?;
+        let end = start.checked_add(len).ok_or(WasmError::Truncated)?;
+        if end > self.core_memory_len()? {
+            return Err(WasmError::Truncated);
         }
+        Ok(start..end)
+    }
+
+    fn require_memory_range(&self, addr: u32, len: usize) -> Result<(), WasmError> {
+        self.core_memory_range(addr, len).map(drop)
     }
 
     fn core_memory_len(&self) -> Result<usize, WasmError> {
+        self.require_memory()?;
         self.memory.committed_len()
+    }
+
+    fn require_memory(&self) -> Result<(), WasmError> {
+        if !self.module.memory_present {
+            return Err(invalid!("core memory instruction requires memory"));
+        }
+        Ok(())
+    }
+
+    fn require_table(&self) -> Result<(), WasmError> {
+        if !self.module.table_present {
+            return Err(invalid!("core table instruction requires table"));
+        }
+        Ok(())
+    }
+
+    fn require_data_count(&self) -> Result<(), WasmError> {
+        if self.module.declared_data_count == CORE_WASM_DATA_COUNT_NONE {
+            return Err(invalid!("bulk data instruction requires data count"));
+        }
+        Ok(())
     }
 
     fn core_read_u8(&self, offset: usize) -> Result<u8, WasmError> {
@@ -4232,8 +4397,8 @@ impl<'a> Interpreter<'a> {
         src: usize,
         len: usize,
     ) -> Result<(), WasmError> {
-        if data_index >= self.data_dropped.len() || self.data_dropped[data_index] {
-            return Err(invalid!("core memory.init data dropped"));
+        if data_index >= self.data_dropped.len() {
+            return Err(invalid!("core memory.init data out of range"));
         }
         let segment = self
             .module
@@ -4244,7 +4409,12 @@ impl<'a> Interpreter<'a> {
             .ok_or(invalid!("core memory.init data out of range"))?;
         let src_end = src.checked_add(len).ok_or(WasmError::Truncated)?;
         let dst_end = dst.checked_add(len).ok_or(WasmError::Truncated)?;
-        if src_end > segment.bytes.len() || dst_end > self.core_memory_len()? {
+        let source_len = if self.data_dropped[data_index] {
+            0
+        } else {
+            segment.bytes.len()
+        };
+        if src_end > source_len || dst_end > self.core_memory_len()? {
             return Err(WasmError::Truncated);
         }
         let src_bytes = segment
@@ -4276,8 +4446,8 @@ impl<'a> Interpreter<'a> {
         src: usize,
         len: usize,
     ) -> Result<(), WasmError> {
-        if elem_index >= self.element_dropped.len() || self.element_dropped[elem_index] {
-            return Err(invalid!("core table.init element dropped"));
+        if elem_index >= self.element_dropped.len() {
+            return Err(invalid!("core table.init element out of range"));
         }
         let segment = self
             .module
@@ -4288,7 +4458,12 @@ impl<'a> Interpreter<'a> {
             .ok_or(invalid!("core table.init element out of range"))?;
         let src_end = src.checked_add(len).ok_or(WasmError::Truncated)?;
         let dst_end = dst.checked_add(len).ok_or(WasmError::Truncated)?;
-        if src_end > segment.function_count || dst_end > self.table_size {
+        let source_len = if self.element_dropped[elem_index] {
+            0
+        } else {
+            segment.function_count
+        };
+        if src_end > source_len || dst_end > self.table_size {
             return Err(invalid!("core table.init out of range"));
         }
         for (dst_slot, function_index) in self
@@ -4387,7 +4562,12 @@ fn wasm_f32_trunc(value: f32) -> f32 {
     if !value.is_finite() || wasm_f32_abs(value) >= 9_223_372_036_854_775_808.0 {
         return value;
     }
-    (value as i64) as f32
+    let truncated = (value as i64) as f32;
+    if truncated == 0.0 {
+        f32::from_bits(value.to_bits() & 0x8000_0000)
+    } else {
+        truncated
+    }
 }
 
 fn wasm_f32_floor(value: f32) -> f32 {
@@ -4427,20 +4607,6 @@ fn wasm_f32_nearest(value: f32) -> f32 {
     }
 }
 
-fn wasm_f32_sqrt(value: f32) -> f32 {
-    if value.is_nan() || value < 0.0 {
-        return f32::NAN;
-    }
-    if value == 0.0 || !value.is_finite() {
-        return value;
-    }
-    let mut x = if value >= 1.0 { value } else { 1.0 };
-    for _ in 0..8 {
-        x = 0.5 * (x + value / x);
-    }
-    x
-}
-
 fn wasm_f32_max(lhs: f32, rhs: f32) -> f32 {
     if lhs.is_nan() || rhs.is_nan() {
         f32::NAN
@@ -4473,7 +4639,12 @@ fn wasm_f64_trunc(value: f64) -> f64 {
     if !value.is_finite() || wasm_f64_abs(value) >= 9_223_372_036_854_775_808.0 {
         return value;
     }
-    (value as i64) as f64
+    let truncated = (value as i64) as f64;
+    if truncated == 0.0 {
+        f64::from_bits(value.to_bits() & 0x8000_0000_0000_0000)
+    } else {
+        truncated
+    }
 }
 
 fn wasm_f64_floor(value: f64) -> f64 {
@@ -4513,20 +4684,6 @@ fn wasm_f64_nearest(value: f64) -> f64 {
     }
 }
 
-fn wasm_f64_sqrt(value: f64) -> f64 {
-    if value.is_nan() || value < 0.0 {
-        return f64::NAN;
-    }
-    if value == 0.0 || !value.is_finite() {
-        return value;
-    }
-    let mut x = if value >= 1.0 { value } else { 1.0 };
-    for _ in 0..12 {
-        x = 0.5 * (x + value / x);
-    }
-    x
-}
-
 fn wasm_f64_max(lhs: f64, rhs: f64) -> f64 {
     if lhs.is_nan() || rhs.is_nan() {
         f64::NAN
@@ -4542,94 +4699,123 @@ fn wasm_f64_copysign(lhs: f64, rhs: f64) -> f64 {
 }
 
 fn trunc_f32_to_i32_s(value: f32) -> Result<u32, WasmError> {
-    if !value.is_finite() || value <= i32::MIN as f32 - 1.0 || value >= i32::MAX as f32 + 1.0 {
+    let truncated = wasm_f32_trunc(value);
+    if !(i32::MIN as f32..2_147_483_648.0_f32).contains(&truncated) {
         return Err(WasmError::Trap);
     }
-    Ok(wasm_f32_trunc(value) as i32 as u32)
+    Ok(truncated as i32 as u32)
 }
 
 fn trunc_f32_to_i32_u(value: f32) -> Result<u32, WasmError> {
-    if !value.is_finite() || value <= -1.0 || value >= (u32::MAX as f32) + 1.0 {
+    let truncated = wasm_f32_trunc(value);
+    if !(0.0..4_294_967_296.0_f32).contains(&truncated) {
         return Err(WasmError::Trap);
     }
-    Ok(wasm_f32_trunc(value) as u32)
+    Ok(truncated as u32)
 }
 
 fn trunc_f64_to_i32_s(value: f64) -> Result<u32, WasmError> {
-    if !value.is_finite() || value <= i32::MIN as f64 - 1.0 || value >= i32::MAX as f64 + 1.0 {
+    let truncated = wasm_f64_trunc(value);
+    if !(i32::MIN as f64..2_147_483_648.0_f64).contains(&truncated) {
         return Err(WasmError::Trap);
     }
-    Ok(wasm_f64_trunc(value) as i32 as u32)
+    Ok(truncated as i32 as u32)
 }
 
 fn trunc_f64_to_i32_u(value: f64) -> Result<u32, WasmError> {
-    if !value.is_finite() || value <= -1.0 || value >= (u32::MAX as f64) + 1.0 {
+    let truncated = wasm_f64_trunc(value);
+    if !(0.0..4_294_967_296.0_f64).contains(&truncated) {
         return Err(WasmError::Trap);
     }
-    Ok(wasm_f64_trunc(value) as u32)
+    Ok(truncated as u32)
 }
 
 fn trunc_f32_to_i64_s(value: f32) -> Result<u64, WasmError> {
-    if !value.is_finite() || value <= i64::MIN as f32 - 1.0 || value >= i64::MAX as f32 + 1.0 {
+    let truncated = wasm_f32_trunc(value);
+    if !(i64::MIN as f32..9_223_372_036_854_775_808.0_f32).contains(&truncated) {
         return Err(WasmError::Trap);
     }
-    Ok(wasm_f32_trunc(value) as i64 as u64)
+    Ok(truncated as i64 as u64)
 }
 
 fn trunc_f32_to_i64_u(value: f32) -> Result<u64, WasmError> {
-    if !value.is_finite() || value <= -1.0 || value >= (u64::MAX as f32) + 1.0 {
+    let truncated = wasm_f32_trunc(value);
+    if !(0.0..18_446_744_073_709_551_616.0_f32).contains(&truncated) {
         return Err(WasmError::Trap);
     }
-    Ok(wasm_f32_trunc(value) as u64)
+    Ok(truncated as u64)
 }
 
 fn trunc_f64_to_i64_s(value: f64) -> Result<u64, WasmError> {
-    if !value.is_finite() || value <= i64::MIN as f64 - 1.0 || value >= i64::MAX as f64 + 1.0 {
+    let truncated = wasm_f64_trunc(value);
+    if !(i64::MIN as f64..9_223_372_036_854_775_808.0_f64).contains(&truncated) {
         return Err(WasmError::Trap);
     }
-    Ok(wasm_f64_trunc(value) as i64 as u64)
+    Ok(truncated as i64 as u64)
 }
 
 fn trunc_f64_to_i64_u(value: f64) -> Result<u64, WasmError> {
-    if !value.is_finite() || value <= -1.0 || value >= (u64::MAX as f64) + 1.0 {
+    let truncated = wasm_f64_trunc(value);
+    if !(0.0..18_446_744_073_709_551_616.0_f64).contains(&truncated) {
         return Err(WasmError::Trap);
     }
-    Ok(wasm_f64_trunc(value) as u64)
+    Ok(truncated as u64)
 }
 
 impl<'a> Vm<'a> {
+    /// # Safety
+    ///
+    /// `dst` must point to aligned writable storage for `Self` that is not read
+    /// or dropped unless this function returns `Ok(())`.
     pub(super) unsafe fn init_in_place(
         dst: *mut Self,
         module: &'a [u8],
         memory: GuestMemory<'a>,
     ) -> Result<(), WasmError> {
+        // SAFETY: the caller supplies exclusive unpublished storage. The core
+        // module is initialized first, the remaining interpreter fields next,
+        // and the three outer `Vm` fields last.
         unsafe {
             let core = core::ptr::addr_of_mut!((*dst).core);
             let core_module = core::ptr::addr_of_mut!((*core).module);
             Module::parse_in_place(core_module, module)?;
             Interpreter::init_from_parsed_module_in_place(core, memory)?;
-            core::ptr::addr_of_mut!((*dst).done).write(false);
+            core::ptr::addr_of_mut!((*dst).args_layout).write(None);
+            core::ptr::addr_of_mut!((*dst).environ_layout).write(None);
+            core::ptr::addr_of_mut!((*dst).state).write(VmState::Running);
         }
         Ok(())
     }
 
     pub(super) fn resume(&mut self, budget: BudgetRun) -> Result<VmEvent, WasmError> {
-        if self.done {
-            return Ok(VmEvent::Done);
+        match self.state {
+            VmState::Running => {}
+            VmState::Exited(status) => return Ok(VmEvent::Exit(status)),
+            VmState::Faulted(error) => return Err(error),
         }
         let run_result = self.core.run(budget.fuel());
         match run_result {
             Ok(ExecutionEvent::Done) => {
-                self.done = true;
-                Ok(VmEvent::Done)
+                self.state = VmState::Exited(0);
+                Ok(VmEvent::Exit(0))
             }
             Ok(ExecutionEvent::MemoryGrow(event)) => Ok(VmEvent::MemoryGrow(event)),
-            Ok(ExecutionEvent::Wasip1Call) => self.translate_wasip1_import(),
+            Ok(ExecutionEvent::Wasip1Call) => match self.translate_wasip1_import() {
+                Ok(event) => Ok(event),
+                Err(error) => {
+                    self.state = VmState::Faulted(error);
+                    Err(error)
+                }
+            },
             Err(WasmError::FuelExhausted) => Ok(VmEvent::BudgetExpired(BudgetExpired::new(
                 budget.run_id(),
                 budget.generation(),
             ))),
-            Err(error) => Err(error),
+            Err(WasmError::PendingCall) => Err(WasmError::PendingCall),
+            Err(error) => {
+                self.state = VmState::Faulted(error);
+                Err(error)
+            }
         }
     }
 
@@ -4650,25 +4836,37 @@ impl<'a> Vm<'a> {
         call: FdRequestCall,
         errno: u32,
     ) -> Result<(), WasmError> {
-        self.core
-            .finish_matching_host_import(PendingWasip1Call::FdClose(call), &[Value::I32(errno)])
+        let completion = self.core.prepare_wasip1_completion(
+            PendingWasip1Call::FdClose(call),
+            Wasip1Result::I32(errno),
+        )?;
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_fd_write(
         &mut self,
         call: FdWriteCall,
+        written: u32,
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::FdWrite(call);
-        self.core.require_matching_host_import(pending)?;
-        let written = if errno == 0 {
-            self.fd_write_total_len(call)?
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
+        let published = if errno == 0 {
+            let requested = self.fd_write_total_len(call)?;
+            if written > requested {
+                return Err(unsupported!("fd_write reply exceeds requested bytes"));
+            }
+            written
         } else {
             0
         };
-        self.core.write_memory_u32(call.nwritten, written)?;
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.require_memory_range(call.nwritten, 4)?;
+        self.core.write_memory_u32(call.nwritten, published)?;
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_fd_read(
@@ -4678,19 +4876,24 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::FdRead(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
             let (dst, max_len) = self.fd_read_iovec(call)?;
             if bytes.len() > max_len as usize {
                 return Err(unsupported!("fd_read reply exceeds iovec"));
             }
+            self.core.require_memory_range(dst, bytes.len())?;
+            self.core.require_memory_range(call.nread, 4)?;
             self.core.write_memory(dst, bytes)?;
             self.core.write_memory_u32(call.nread, bytes.len() as u32)?;
         } else {
+            self.core.require_memory_range(call.nread, 4)?;
             self.core.write_memory_u32(call.nread, 0)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_fd_fdstat_get(
@@ -4700,7 +4903,9 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::FdFdstatGet(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
             let mut bytes = [0u8; WASIP1_FDSTAT_SIZE];
             bytes[WASIP1_FDSTAT_FILETYPE_OFFSET as usize] = stat.filetype();
@@ -4714,8 +4919,8 @@ impl<'a> Vm<'a> {
                 .copy_from_slice(&stat.rights_inheriting().to_le_bytes());
             self.core.write_memory(call.out_ptr, &bytes)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_fd_filestat_get(
@@ -4725,12 +4930,14 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::FdFilestatGet(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
             self.core.write_filestat(call.out_ptr, stat)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_fd_prestat_get(
@@ -4740,7 +4947,9 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::FdPrestatGet(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
             let mut bytes = [0u8; WASIP1_PRESTAT_SIZE];
             bytes[0] = WASIP1_PRESTAT_TAG_DIR;
@@ -4748,8 +4957,8 @@ impl<'a> Vm<'a> {
                 .copy_from_slice(&name_len.to_le_bytes());
             self.core.write_memory(call.out_ptr, &bytes)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_fd_prestat_dir_name(
@@ -4759,15 +4968,17 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::FdPrestatDirName(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
             if bytes.len() > call.path_len as usize {
                 return Err(unsupported!("fd_prestat_dir_name reply exceeds buffer"));
             }
             self.core.write_memory(call.path_ptr, bytes)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_clock_time_get(
@@ -4777,13 +4988,15 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::ClockTimeGet(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
             self.core
                 .write_memory(call.time_ptr, &nanos.to_le_bytes())?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_clock_res_get(
@@ -4793,13 +5006,15 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::ClockResGet(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
             self.core
                 .write_memory(call.resolution_ptr, &resolution_nanos.to_le_bytes())?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_poll_oneoff(
@@ -4809,28 +5024,39 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::PollOneoff(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
+        let mut event = None;
         if errno == 0 {
-            self.core.write_memory_u32(call.nevents, ready)?;
-            if ready > 0 && call.out_ptr != 0 {
-                let mut event = [0u8; WASIP1_EVENT_SIZE];
+            if ready > 0 {
+                let mut bytes = [0u8; WASIP1_EVENT_SIZE];
                 self.core.read_memory(
                     call.in_ptr
-                        .saturating_add(WASIP1_SUBSCRIPTION_USERDATA_OFFSET),
-                    &mut event[..8],
+                        .checked_add(WASIP1_SUBSCRIPTION_USERDATA_OFFSET)
+                        .ok_or(WasmError::Truncated)?,
+                    &mut bytes[..8],
                 )?;
                 let event_type = self.read_memory_u8(
                     call.in_ptr
-                        .saturating_add(WASIP1_SUBSCRIPTION_EVENTTYPE_OFFSET),
+                        .checked_add(WASIP1_SUBSCRIPTION_EVENTTYPE_OFFSET)
+                        .ok_or(WasmError::Truncated)?,
                 )?;
-                event[WASIP1_EVENT_ERROR_OFFSET as usize..WASIP1_EVENT_ERROR_OFFSET as usize + 2]
+                bytes[WASIP1_EVENT_ERROR_OFFSET as usize..WASIP1_EVENT_ERROR_OFFSET as usize + 2]
                     .copy_from_slice(&(0u16).to_le_bytes());
-                event[WASIP1_EVENT_TYPE_OFFSET as usize] = event_type;
-                self.core.write_memory(call.out_ptr, &event)?;
+                bytes[WASIP1_EVENT_TYPE_OFFSET as usize] = event_type;
+                self.core
+                    .require_memory_range(call.out_ptr, WASIP1_EVENT_SIZE)?;
+                event = Some(bytes);
             }
+            self.core.require_memory_range(call.nevents, 4)?;
+            if let Some(bytes) = event {
+                self.core.write_memory(call.out_ptr, &bytes)?;
+            }
+            self.core.write_memory_u32(call.nevents, ready)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_random_get(
@@ -4840,41 +5066,35 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::RandomGet(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
             if bytes.len() > call.buf_len as usize {
                 return Err(unsupported!("random_get reply too large"));
             }
             self.core.write_memory(call.buf, bytes)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn path_bytes(&self, call: PathOpenCall) -> Result<PathBytes, WasmError> {
-        let ptr = call.path_ptr;
-        let len = call.path_len;
-        if len as usize > CORE_WASIP1_PATH_CAPACITY {
-            return Err(unsupported!("path import path too long"));
-        }
-        let mut bytes = [0u8; CORE_WASIP1_PATH_CAPACITY];
-        self.core.read_memory(ptr, &mut bytes[..len as usize])?;
-        Ok(PathBytes {
-            bytes,
-            len: len as usize,
-        })
+        self.read_path_bytes(call.path_ptr, call.path_len)
     }
 
     pub(super) fn path_filestat_bytes(
         &self,
         call: PathFilestatGetCall,
     ) -> Result<PathBytes, WasmError> {
-        let ptr = call.path_ptr;
-        let len = call.path_len;
-        if len as usize > CORE_WASIP1_PATH_CAPACITY {
+        self.read_path_bytes(call.path_ptr, call.path_len)
+    }
+
+    fn read_path_bytes(&self, ptr: u32, len: u32) -> Result<PathBytes, WasmError> {
+        if len as usize > WASIP1_PATH_CHUNK_CAPACITY {
             return Err(unsupported!("path import path too long"));
         }
-        let mut bytes = [0u8; CORE_WASIP1_PATH_CAPACITY];
+        let mut bytes = [0u8; WASIP1_PATH_CHUNK_CAPACITY];
         self.core.read_memory(ptr, &mut bytes[..len as usize])?;
         Ok(PathBytes {
             bytes,
@@ -4889,12 +5109,14 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::PathOpen(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
             self.core.write_memory_u32(call.opened_fd_ptr, opened_fd)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_path_filestat_get(
@@ -4904,12 +5126,14 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::PathFilestatGet(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
             self.core.write_filestat(call.stat_ptr, stat)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_fd_readdir(
@@ -4919,19 +5143,24 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::FdReaddir(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
             if bytes.len() > call.buf_len as usize {
                 return Err(unsupported!("fd_readdir reply exceeds buffer"));
             }
+            self.core.require_memory_range(call.buf, bytes.len())?;
+            self.core.require_memory_range(call.bufused, 4)?;
             self.core.write_memory(call.buf, bytes)?;
             self.core
                 .write_memory_u32(call.bufused, bytes.len() as u32)?;
         } else {
+            self.core.require_memory_range(call.bufused, 4)?;
             self.core.write_memory_u32(call.bufused, 0)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        Ok(())
     }
 
     pub(super) fn finish_args_sizes_get(
@@ -4942,14 +5171,24 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::ArgsSizesGet(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
+        let layout = if errno == 0 {
+            Some(WasiVectorLayout::arguments(argc, argv_buf_size)?)
+        } else {
+            None
+        };
         if errno == 0 {
+            self.core.require_memory_range(call.argc_ptr, 4)?;
+            self.core.require_memory_range(call.argv_buf_size_ptr, 4)?;
             self.core.write_memory_u32(call.argc_ptr, argc)?;
             self.core
                 .write_memory_u32(call.argv_buf_size_ptr, argv_buf_size)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        self.args_layout = layout;
+        Ok(())
     }
 
     pub(super) fn finish_environ_sizes_get(
@@ -4960,15 +5199,29 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::EnvironSizesGet(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
+        let layout = if errno == 0 {
+            Some(WasiVectorLayout::environment(
+                environ_count,
+                environ_buf_size,
+            )?)
+        } else {
+            None
+        };
         if errno == 0 {
+            self.core.require_memory_range(call.environ_count_ptr, 4)?;
+            self.core
+                .require_memory_range(call.environ_buf_size_ptr, 4)?;
             self.core
                 .write_memory_u32(call.environ_count_ptr, environ_count)?;
             self.core
                 .write_memory_u32(call.environ_buf_size_ptr, environ_buf_size)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        self.environ_layout = layout;
+        Ok(())
     }
 
     pub(super) fn finish_args_get(
@@ -4978,12 +5231,18 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::ArgsGet(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
-            self.write_cstr_vector(call.argv, call.argv_buf, args)?;
+            let layout = self.args_layout.ok_or(invalid!(
+                "args_get completion requires successful args_sizes_get"
+            ))?;
+            self.write_cstr_vector(call.argv, call.argv_buf, args, layout)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        self.args_layout = None;
+        Ok(())
     }
 
     pub(super) fn finish_environ_get(
@@ -4993,12 +5252,18 @@ impl<'a> Vm<'a> {
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::EnvironGet(call);
-        self.core.require_matching_host_import(pending)?;
+        let completion = self
+            .core
+            .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         if errno == 0 {
-            self.write_env_vector(call.environ, call.environ_buf, environ)?;
+            let layout = self.environ_layout.ok_or(invalid!(
+                "environ_get completion requires successful environ_sizes_get"
+            ))?;
+            self.write_env_vector(call.environ, call.environ_buf, environ, layout)?;
         }
-        self.core
-            .finish_matching_host_import(pending, &[Value::I32(errno)])
+        self.core.commit_wasip1_completion(completion);
+        self.environ_layout = None;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -5039,10 +5304,8 @@ impl<'a> Vm<'a> {
         } else {
             let mut copied = 0usize;
             for index in 0..call.iovs_len {
-                let iov = call
-                    .iovs
-                    .checked_add(index.saturating_mul(8))
-                    .ok_or(WasmError::Truncated)?;
+                let offset = index.checked_mul(8).ok_or(WasmError::Truncated)?;
+                let iov = call.iovs.checked_add(offset).ok_or(WasmError::Truncated)?;
                 let ptr = self.core.read_memory_u32(iov)?;
                 let len = self
                     .core
@@ -5062,17 +5325,17 @@ impl<'a> Vm<'a> {
         }
         let mut total = 0u32;
         for index in 0..call.iovs_len {
-            let iov = call
-                .iovs
-                .checked_add(index.saturating_mul(8))
-                .ok_or(WasmError::Truncated)?;
-            let len = self.core.read_memory_u32(iov.saturating_add(4))?;
+            let offset = index.checked_mul(8).ok_or(WasmError::Truncated)?;
+            let iov = call.iovs.checked_add(offset).ok_or(WasmError::Truncated)?;
+            let len = self
+                .core
+                .read_memory_u32(iov.checked_add(4).ok_or(WasmError::Truncated)?)?;
             total = total.checked_add(len).ok_or(WasmError::Truncated)?;
         }
         Ok(total)
     }
 
-    pub(super) fn poll_oneoff_delay_ticks(&self, call: PollOneoffCall) -> Result<u64, WasmError> {
+    pub(super) fn poll_oneoff_timeout_nanos(&self, call: PollOneoffCall) -> Result<u64, WasmError> {
         if call.nsubscriptions != 1 {
             return Err(unsupported!(
                 "only one poll_oneoff subscription is supported"
@@ -5080,7 +5343,8 @@ impl<'a> Vm<'a> {
         }
         let event_type = self.read_memory_u8(
             call.in_ptr
-                .saturating_add(WASIP1_SUBSCRIPTION_EVENTTYPE_OFFSET),
+                .checked_add(WASIP1_SUBSCRIPTION_EVENTTYPE_OFFSET)
+                .ok_or(WasmError::Truncated)?,
         )?;
         if event_type != WASIP1_EVENTTYPE_CLOCK {
             return Err(unsupported!(
@@ -5089,12 +5353,10 @@ impl<'a> Vm<'a> {
         }
         let timeout_nanos = self.read_core_u64(
             call.in_ptr
-                .saturating_add(WASIP1_SUBSCRIPTION_CLOCK_TIMEOUT_OFFSET),
+                .checked_add(WASIP1_SUBSCRIPTION_CLOCK_TIMEOUT_OFFSET)
+                .ok_or(WasmError::Truncated)?,
         )?;
-        if timeout_nanos == 0 {
-            return Err(WasmError::Truncated);
-        }
-        Ok(timeout_nanos / 1_000_000)
+        Ok(timeout_nanos)
     }
 
     fn read_memory_u8(&self, addr: u32) -> Result<u8, WasmError> {
@@ -5107,10 +5369,13 @@ impl<'a> Vm<'a> {
         let call = self.core.pending_wasip1_call()?;
         match call {
             PendingWasip1Call::ProcExit(code) => {
-                self.core
-                    .finish_matching_host_import(PendingWasip1Call::ProcExit(code), &[])?;
-                self.done = true;
-                Ok(VmEvent::ProcExit(code))
+                let completion = self.core.prepare_wasip1_completion(
+                    PendingWasip1Call::ProcExit(code),
+                    Wasip1Result::None,
+                )?;
+                self.core.commit_wasip1_completion(completion);
+                self.state = VmState::Exited(code);
+                Ok(VmEvent::Exit(code))
             }
             _ => Ok(call.into_event()),
         }
@@ -5126,9 +5391,10 @@ impl<'a> Vm<'a> {
         if call.iovs_len != 1 {
             return Err(unsupported!("only one fd_read iovec is supported"));
         }
+        let len_addr = call.iovs.checked_add(4).ok_or(WasmError::Truncated)?;
         Ok((
             self.core.read_memory_u32(call.iovs)?,
-            self.core.read_memory_u32(call.iovs.saturating_add(4))?,
+            self.core.read_memory_u32(len_addr)?,
         ))
     }
 
@@ -5137,13 +5403,31 @@ impl<'a> Vm<'a> {
         ptrs: u32,
         mut buf: u32,
         items: &[&[u8]],
+        expected: WasiVectorLayout,
     ) -> Result<(), WasmError> {
+        let mut data_len = 0usize;
+        for item in items {
+            if item.contains(&0) {
+                return Err(invalid!("argument contains an embedded nul byte"));
+            }
+            data_len = data_len
+                .checked_add(item.len())
+                .and_then(|len| len.checked_add(1))
+                .ok_or(WasmError::Truncated)?;
+        }
+        if !expected.matches(items.len(), data_len) {
+            return Err(invalid!("argument payload does not match advertised sizes"));
+        }
+        self.require_vector_ranges(ptrs, buf, items.len(), data_len)?;
+
         for (index, item) in items.iter().enumerate() {
-            self.core
-                .write_memory_u32(ptrs.saturating_add((index as u32).saturating_mul(4)), buf)?;
+            let ptr_offset = index.checked_mul(4).ok_or(WasmError::Truncated)?;
+            let ptr_offset = u32::try_from(ptr_offset).map_err(|_| WasmError::Truncated)?;
+            let ptr = ptrs.checked_add(ptr_offset).ok_or(WasmError::Truncated)?;
+            self.core.write_memory_u32(ptr, buf)?;
             self.core.write_memory(buf, item)?;
             buf = buf
-                .checked_add(item.len() as u32)
+                .checked_add(u32::try_from(item.len()).map_err(|_| WasmError::Truncated)?)
                 .ok_or(WasmError::Truncated)?;
             self.core.write_memory(buf, &[0])?;
             buf = buf.checked_add(1).ok_or(WasmError::Truncated)?;
@@ -5156,23 +5440,62 @@ impl<'a> Vm<'a> {
         ptrs: u32,
         mut buf: u32,
         items: &[(&[u8], &[u8])],
+        expected: WasiVectorLayout,
     ) -> Result<(), WasmError> {
+        let mut data_len = 0usize;
+        for (key, value) in items {
+            if key.is_empty() || key.contains(&0) || key.contains(&b'=') || value.contains(&0) {
+                return Err(invalid!("environment entry is not canonical"));
+            }
+            data_len = data_len
+                .checked_add(key.len())
+                .and_then(|len| len.checked_add(value.len()))
+                .and_then(|len| len.checked_add(2))
+                .ok_or(WasmError::Truncated)?;
+        }
+        if !expected.matches(items.len(), data_len) {
+            return Err(invalid!(
+                "environment payload does not match advertised sizes"
+            ));
+        }
+        self.require_vector_ranges(ptrs, buf, items.len(), data_len)?;
+
         for (index, (key, value)) in items.iter().enumerate() {
-            self.core
-                .write_memory_u32(ptrs.saturating_add((index as u32).saturating_mul(4)), buf)?;
+            let ptr_offset = index.checked_mul(4).ok_or(WasmError::Truncated)?;
+            let ptr_offset = u32::try_from(ptr_offset).map_err(|_| WasmError::Truncated)?;
+            let ptr = ptrs.checked_add(ptr_offset).ok_or(WasmError::Truncated)?;
+            self.core.write_memory_u32(ptr, buf)?;
             self.core.write_memory(buf, key)?;
             buf = buf
-                .checked_add(key.len() as u32)
+                .checked_add(u32::try_from(key.len()).map_err(|_| WasmError::Truncated)?)
                 .ok_or(WasmError::Truncated)?;
             self.core.write_memory(buf, b"=")?;
             buf = buf.checked_add(1).ok_or(WasmError::Truncated)?;
             self.core.write_memory(buf, value)?;
             buf = buf
-                .checked_add(value.len() as u32)
+                .checked_add(u32::try_from(value.len()).map_err(|_| WasmError::Truncated)?)
                 .ok_or(WasmError::Truncated)?;
             self.core.write_memory(buf, &[0])?;
             buf = buf.checked_add(1).ok_or(WasmError::Truncated)?;
         }
+        Ok(())
+    }
+
+    fn require_vector_ranges(
+        &self,
+        ptrs: u32,
+        buf: u32,
+        item_count: usize,
+        data_len: usize,
+    ) -> Result<(), WasmError> {
+        let ptrs_len = item_count.checked_mul(4).ok_or(WasmError::Truncated)?;
+        self.core.require_memory_range(ptrs, ptrs_len)?;
+        self.core.require_memory_range(buf, data_len)?;
+
+        let ptrs_len = u32::try_from(ptrs_len).map_err(|_| WasmError::Truncated)?;
+        let data_len = u32::try_from(data_len).map_err(|_| WasmError::Truncated)?;
+        ptrs.checked_add(ptrs_len).ok_or(WasmError::Truncated)?;
+        buf.checked_add(data_len).ok_or(WasmError::Truncated)?;
         Ok(())
     }
 }
@@ -5180,12 +5503,13 @@ impl<'a> Vm<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CORE1_VM_OBJECT_BUDGET_BYTES, DEFAULT_GUEST_MEMORY_BYTES, EXTERNAL_KIND_FUNC,
+        CORE_WASM_BR_TABLE_CAPACITY, DEFAULT_GUEST_MEMORY_BYTES, EXTERNAL_KIND_FUNC,
         ExecutionEvent, GuestMemory, ImportPlan, Interpreter, Module, OPCODE_CALL, OPCODE_DROP,
-        OPCODE_END, OPCODE_I32_CONST, OPCODE_I64_CONST, SECTION_CODE, SECTION_EXPORT,
+        OPCODE_END, OPCODE_I32_CONST, OPCODE_I64_CONST, Reader, SECTION_CODE, SECTION_EXPORT,
         SECTION_FUNCTION, SECTION_IMPORT, SECTION_MEMORY, SECTION_TYPE, TEST_RESUME_FUEL,
-        VALTYPE_I32, VALTYPE_I64, Vm, VmEvent, WASIP1_FILETYPE_REGULAR_FILE, WasmError,
-        diagnostic_message_code,
+        VALTYPE_I32, VALTYPE_I64, VM_OBJECT_BUDGET_BYTES, Vm, VmEvent, WASIP1_EVENT_SIZE,
+        WASIP1_EVENTTYPE_CLOCK, WASIP1_FILETYPE_REGULAR_FILE, WasiVectorLayout, WasmError,
+        decode_core_br_table, diagnostic_message_code,
     };
     use super::{
         FdStat, FileStat, WASIP1_FDSTAT_RIGHTS_BASE_OFFSET, WASIP1_FILESTAT_FILETYPE_OFFSET,
@@ -5199,20 +5523,41 @@ mod tests {
     use core::mem::size_of;
     use std::boxed::Box;
     use std::ops::{Deref, DerefMut};
+    use std::vec;
     use std::vec::Vec;
 
     struct TestInterpreter<'a> {
-        storage: Box<MaybeUninit<Interpreter<'a>>>,
+        storage: Option<Box<MaybeUninit<Interpreter<'a>>>>,
+        memory: Option<*mut [u8; DEFAULT_GUEST_MEMORY_BYTES]>,
     }
 
     impl<'a> TestInterpreter<'a> {
         fn new(module: &'a [u8]) -> Result<Self, WasmError> {
             let mut storage = Box::new(MaybeUninit::<Interpreter<'a>>::uninit());
-            let memory = test_guest_memory();
-            unsafe {
-                Interpreter::init_in_place(storage.as_mut_ptr(), module, memory)?;
+            // Keep ownership raw so moving the harness cannot retag the live memory borrow.
+            let memory = Box::into_raw(Box::new([0u8; DEFAULT_GUEST_MEMORY_BYTES]));
+            // SAFETY: both allocations are uniquely owned, aligned, and live
+            // for the harness lifetime; storage remains unpublished until
+            // initialization succeeds.
+            let init = unsafe {
+                Interpreter::init_in_place(
+                    storage.as_mut_ptr(),
+                    module,
+                    GuestMemory::new(&mut *memory),
+                )
+            };
+            if let Err(error) = init {
+                // SAFETY: initialization did not publish a reference and this
+                // is the unique pointer returned by `Box::into_raw`.
+                unsafe {
+                    drop(Box::from_raw(memory));
+                }
+                return Err(error);
             }
-            Ok(Self { storage })
+            Ok(Self {
+                storage: Some(storage),
+                memory: Some(memory),
+            })
         }
     }
 
@@ -5220,28 +5565,72 @@ mod tests {
         type Target = Interpreter<'a>;
 
         fn deref(&self) -> &Self::Target {
-            unsafe { self.storage.assume_init_ref() }
+            // SAFETY: construction stores this allocation only after complete
+            // initialization, and it remains live until `Drop`.
+            unsafe {
+                self.storage
+                    .as_ref()
+                    .expect("test interpreter storage")
+                    .assume_init_ref()
+            }
         }
     }
 
     impl<'a> DerefMut for TestInterpreter<'a> {
         fn deref_mut(&mut self) -> &mut Self::Target {
-            unsafe { self.storage.assume_init_mut() }
+            // SAFETY: construction completed initialization and `&mut self`
+            // provides exclusive access to the live storage.
+            unsafe {
+                self.storage
+                    .as_mut()
+                    .expect("test interpreter storage")
+                    .assume_init_mut()
+            }
+        }
+    }
+
+    impl Drop for TestInterpreter<'_> {
+        fn drop(&mut self) {
+            drop(self.storage.take());
+            if let Some(memory) = self.memory.take() {
+                // SAFETY: the interpreter storage, which held the only borrow
+                // of this allocation, was discarded first; this pointer came
+                // from `Box::into_raw` and is reconstructed exactly once.
+                unsafe {
+                    drop(Box::from_raw(memory));
+                }
+            }
         }
     }
 
     struct TestVm<'a> {
-        storage: Box<MaybeUninit<Vm<'a>>>,
+        storage: Option<Box<MaybeUninit<Vm<'a>>>>,
+        memory: Option<*mut [u8; DEFAULT_GUEST_MEMORY_BYTES]>,
     }
 
     impl<'a> TestVm<'a> {
         fn new(module: &'a [u8]) -> Result<Self, WasmError> {
             let mut storage = Box::new(MaybeUninit::<Vm<'a>>::uninit());
-            let memory = test_guest_memory();
-            unsafe {
-                Vm::init_in_place(storage.as_mut_ptr(), module, memory)?;
+            // Keep ownership raw so moving the harness cannot retag the live memory borrow.
+            let memory = Box::into_raw(Box::new([0u8; DEFAULT_GUEST_MEMORY_BYTES]));
+            // SAFETY: both allocations are uniquely owned, aligned, and live
+            // for the harness lifetime; storage remains unpublished until
+            // initialization succeeds.
+            let init = unsafe {
+                Vm::init_in_place(storage.as_mut_ptr(), module, GuestMemory::new(&mut *memory))
+            };
+            if let Err(error) = init {
+                // SAFETY: initialization did not publish a reference and this
+                // is the unique pointer returned by `Box::into_raw`.
+                unsafe {
+                    drop(Box::from_raw(memory));
+                }
+                return Err(error);
             }
-            Ok(Self { storage })
+            Ok(Self {
+                storage: Some(storage),
+                memory: Some(memory),
+            })
         }
     }
 
@@ -5249,28 +5638,106 @@ mod tests {
         type Target = Vm<'a>;
 
         fn deref(&self) -> &Self::Target {
-            unsafe { self.storage.assume_init_ref() }
+            // SAFETY: construction stores this allocation only after complete
+            // initialization, and it remains live until `Drop`.
+            unsafe {
+                self.storage
+                    .as_ref()
+                    .expect("test VM storage")
+                    .assume_init_ref()
+            }
         }
     }
 
     impl<'a> DerefMut for TestVm<'a> {
         fn deref_mut(&mut self) -> &mut Self::Target {
-            unsafe { self.storage.assume_init_mut() }
+            // SAFETY: construction completed initialization and `&mut self`
+            // provides exclusive access to the live storage.
+            unsafe {
+                self.storage
+                    .as_mut()
+                    .expect("test VM storage")
+                    .assume_init_mut()
+            }
+        }
+    }
+
+    impl Drop for TestVm<'_> {
+        fn drop(&mut self) {
+            drop(self.storage.take());
+            if let Some(memory) = self.memory.take() {
+                // SAFETY: the VM storage, which held the only borrow of this
+                // allocation, was discarded first; this pointer came from
+                // `Box::into_raw` and is reconstructed exactly once.
+                unsafe {
+                    drop(Box::from_raw(memory));
+                }
+            }
         }
     }
 
     #[test]
-    fn vm_object_stays_within_core1_side_budget() {
+    fn vm_object_stays_within_embedded_budget() {
         assert!(
-            size_of::<Vm<'static>>() <= CORE1_VM_OBJECT_BUDGET_BYTES,
+            size_of::<Vm<'static>>() <= VM_OBJECT_BUDGET_BYTES,
             "Vm object uses {} bytes, budget is {} bytes",
             size_of::<Vm<'static>>(),
-            CORE1_VM_OBJECT_BUDGET_BYTES
+            VM_OBJECT_BUDGET_BYTES
         );
         assert!(
             size_of::<ImportPlan>() <= 128,
             "ImportPlan uses {} bytes",
             size_of::<ImportPlan>()
+        );
+    }
+
+    #[test]
+    fn br_table_capacity_accepts_the_boundary_and_rejects_one_more() {
+        let mut encoded = vec![CORE_WASM_BR_TABLE_CAPACITY as u8];
+        encoded.resize(CORE_WASM_BR_TABLE_CAPACITY + 1, 0);
+        encoded.push(7);
+
+        let mut reader = Reader::new(&encoded);
+        let table = decode_core_br_table(&mut reader).expect("maximum br_table");
+        assert_eq!(table.label_count as usize, CORE_WASM_BR_TABLE_CAPACITY);
+        assert_eq!(table.default, 7);
+        assert!(reader.is_empty());
+
+        let mut reader = Reader::new(&[(CORE_WASM_BR_TABLE_CAPACITY + 1) as u8]);
+        assert!(matches!(
+            decode_core_br_table(&mut reader),
+            Err(WasmError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn leb_decoders_reject_bits_outside_the_declared_integer_width() {
+        let mut reader = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
+        assert_eq!(reader.read_var_u32(), Ok(u32::MAX));
+        let mut reader = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0x1f]);
+        assert_eq!(
+            reader.read_var_u32(),
+            Err(invalid!("u32 leb exceeds value width"))
+        );
+
+        let mut reader = Reader::new(&[0x80, 0x80, 0x80, 0x80, 0x78]);
+        assert_eq!(reader.read_var_i32(), Ok(i32::MIN));
+        let mut reader = Reader::new(&[0x80, 0x80, 0x80, 0x80, 0x10]);
+        assert_eq!(
+            reader.read_var_i32(),
+            Err(invalid!("i32 leb exceeds value width"))
+        );
+
+        let mut minimum_i64 = [0x80; 10];
+        minimum_i64[9] = 0x7f;
+        let mut reader = Reader::new(&minimum_i64);
+        assert_eq!(reader.read_var_i64(), Ok(i64::MIN));
+        let mut overflowing_i64 = [0x80; 10];
+        overflowing_i64[9] = 0x01;
+        let mut reader = Reader::new(&overflowing_i64);
+        assert_eq!(
+            reader.read_var_i64(),
+            Err(invalid!("i64 leb exceeds value width"))
         );
     }
 
@@ -5282,11 +5749,6 @@ mod tests {
 
     fn test_budget() -> BudgetRun {
         BudgetRun::new(1, 1, TEST_RESUME_FUEL)
-    }
-
-    fn test_guest_memory<'a>() -> GuestMemory<'a> {
-        let bytes = Box::leak(Box::new([0u8; DEFAULT_GUEST_MEMORY_BYTES]));
-        GuestMemory::new(&mut bytes[..])
     }
 
     fn push_test_u32(out: &mut Vec<u8>, mut value: u32) {
@@ -5441,7 +5903,7 @@ mod tests {
     fn core_test_module(
         body_instrs: &[u8],
         memory: bool,
-        table_min: Option<u32>,
+        table_limits: Option<(u32, Option<u32>)>,
         data_section: Option<&[u8]>,
         element_section: Option<&[u8]>,
     ) -> Vec<u8> {
@@ -5460,12 +5922,15 @@ mod tests {
         push_test_u32(&mut functions, 0);
         push_test_section(&mut module, SECTION_FUNCTION, &functions);
 
-        if let Some(min) = table_min {
+        if let Some((min, max)) = table_limits {
             let mut table = Vec::new();
             push_test_u32(&mut table, 1);
             table.push(super::VALTYPE_FUNCREF);
-            table.push(0x00);
+            table.push(u8::from(max.is_some()));
             push_test_u32(&mut table, min);
+            if let Some(max) = max {
+                push_test_u32(&mut table, max);
+            }
             push_test_section(&mut module, super::SECTION_TABLE, &table);
         }
 
@@ -5482,6 +5947,14 @@ mod tests {
 
         if let Some(elements) = element_section {
             push_test_section(&mut module, super::SECTION_ELEMENT, elements);
+        }
+
+        if let Some(data) = data_section {
+            let mut data_reader = Reader::new(data);
+            let data_count = data_reader.read_var_u32().expect("test data segment count");
+            let mut count = Vec::new();
+            push_test_u32(&mut count, data_count);
+            push_test_section(&mut module, super::SECTION_DATA_COUNT, &count);
         }
 
         let mut code = Vec::new();
@@ -5502,47 +5975,60 @@ mod tests {
     }
 
     #[test]
-    fn core_wasm_prefers_wasi_start_over_rust_main_export() {
-        let mut module = Vec::new();
-        module.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
-
+    fn core_wasm_prefers_wasi_start_over_incompatible_rust_main_export_in_any_order() {
         let mut types = Vec::new();
-        push_test_u32(&mut types, 1);
+        push_test_u32(&mut types, 2);
         types.push(0x60);
         push_test_u32(&mut types, 0);
         push_test_u32(&mut types, 0);
-        push_test_section(&mut module, SECTION_TYPE, &types);
+        types.push(0x60);
+        push_test_u32(&mut types, 0);
+        push_test_u32(&mut types, 1);
+        types.push(VALTYPE_I32);
 
         let mut functions = Vec::new();
         push_test_u32(&mut functions, 2);
+        push_test_u32(&mut functions, 1);
         push_test_u32(&mut functions, 0);
-        push_test_u32(&mut functions, 0);
-        push_test_section(&mut module, SECTION_FUNCTION, &functions);
-
-        let mut exports = Vec::new();
-        push_test_u32(&mut exports, 2);
-        push_test_name(&mut exports, b"__main_void");
-        exports.push(EXTERNAL_KIND_FUNC);
-        push_test_u32(&mut exports, 0);
-        push_test_name(&mut exports, b"_start");
-        exports.push(EXTERNAL_KIND_FUNC);
-        push_test_u32(&mut exports, 1);
-        push_test_section(&mut module, SECTION_EXPORT, &exports);
 
         let mut code = Vec::new();
         push_test_u32(&mut code, 2);
-        for _ in 0..2 {
-            push_test_u32(&mut code, 2);
-            code.push(0);
-            code.push(OPCODE_END);
-        }
-        push_test_section(&mut module, SECTION_CODE, &code);
+        let main_body = [0, OPCODE_I32_CONST, 0, OPCODE_END];
+        push_test_u32(&mut code, main_body.len() as u32);
+        code.extend_from_slice(&main_body);
+        let start_body = [0, OPCODE_END];
+        push_test_u32(&mut code, start_body.len() as u32);
+        code.extend_from_slice(&start_body);
 
-        let mut storage = MaybeUninit::<Module<'_>>::uninit();
-        unsafe {
-            Module::parse_in_place(storage.as_mut_ptr(), &module)
-                .expect("module with both std _start and rust main export parses");
-            assert_eq!(storage.assume_init_ref().start_function_index, 1);
+        for start_first in [false, true] {
+            let mut module = Vec::new();
+            module.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+            push_test_section(&mut module, SECTION_TYPE, &types);
+            push_test_section(&mut module, SECTION_FUNCTION, &functions);
+
+            let mut exports = Vec::new();
+            push_test_u32(&mut exports, 2);
+            let ordered_exports = if start_first {
+                [(b"_start".as_slice(), 1), (b"__main_void".as_slice(), 0)]
+            } else {
+                [(b"__main_void".as_slice(), 0), (b"_start".as_slice(), 1)]
+            };
+            for (name, index) in ordered_exports {
+                push_test_name(&mut exports, name);
+                exports.push(EXTERNAL_KIND_FUNC);
+                push_test_u32(&mut exports, index);
+            }
+            push_test_section(&mut module, SECTION_EXPORT, &exports);
+            push_test_section(&mut module, SECTION_CODE, &code);
+
+            let mut storage = MaybeUninit::<Module<'_>>::uninit();
+            // SAFETY: `storage` is aligned unpublished space for one `Module`;
+            // successful parsing initializes it before the reference is formed.
+            unsafe {
+                Module::parse_in_place(storage.as_mut_ptr(), &module)
+                    .expect("valid _start must supersede the incompatible fallback");
+                assert_eq!(storage.assume_init_ref().start_function_index, 1);
+            }
         }
     }
 
@@ -5574,6 +6060,154 @@ mod tests {
             }
             Ok(_) => panic!("unknown WASI P1 import name must be rejected"),
         }
+    }
+
+    #[test]
+    fn core_wasm_rejects_duplicate_sections_before_state_overwrite() {
+        static DUPLICATE_TYPE_SECTIONS: &[u8] = &[
+            0x00,
+            0x61,
+            0x73,
+            0x6d,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            SECTION_TYPE,
+            0x01,
+            0x00,
+            SECTION_TYPE,
+            0x01,
+            0x00,
+        ];
+        match TestInterpreter::new(DUPLICATE_TYPE_SECTIONS) {
+            Err(error) => {
+                assert_eq!(
+                    error,
+                    invalid!("core wasm section order invalid or duplicated")
+                );
+            }
+            Ok(_) => panic!("duplicate sections must be rejected"),
+        }
+    }
+
+    #[test]
+    fn core_wasm_rejects_start_with_parameters_at_load_time() {
+        static PARAMETERIZED_START: &[u8] = &[
+            0x00,
+            0x61,
+            0x73,
+            0x6d,
+            0x01,
+            0x00,
+            0x00,
+            0x00, // header
+            SECTION_TYPE,
+            0x05,
+            0x01,
+            0x60,
+            0x01,
+            VALTYPE_I32,
+            0x00, // (i32) -> ()
+            SECTION_FUNCTION,
+            0x02,
+            0x01,
+            0x00, // one local function
+            SECTION_EXPORT,
+            0x0a,
+            0x01,
+            0x06,
+            b'_',
+            b's',
+            b't',
+            b'a',
+            b'r',
+            b't',
+            0x00,
+            0x00, // _start = func 0
+            SECTION_CODE,
+            0x04,
+            0x01,
+            0x02,
+            0x00,
+            OPCODE_END,
+        ];
+        match TestInterpreter::new(PARAMETERIZED_START) {
+            Err(error) => {
+                assert_eq!(error, invalid!("start entry must have type () -> ()"));
+            }
+            Ok(_) => panic!("parameterized start must be rejected"),
+        }
+    }
+
+    #[test]
+    fn core_wasm_start_export_must_name_a_local_function() {
+        let mut module = Module::empty();
+        module.import_count = 1;
+        assert_eq!(
+            module.require_start_export(EXTERNAL_KIND_FUNC, 0),
+            Err(invalid!("start entry must be a local function"))
+        );
+    }
+
+    #[test]
+    fn poll_oneoff_writes_ready_event_at_linear_memory_zero() {
+        let module = core_wasip1_single_import_module(
+            Wasip1ImportName::PollOneoff,
+            &[VALTYPE_I32, VALTYPE_I32, VALTYPE_I32, VALTYPE_I32],
+            &[VALTYPE_I32],
+            &[
+                TestWasmArg::I32(64),
+                TestWasmArg::I32(0),
+                TestWasmArg::I32(1),
+                TestWasmArg::I32(128),
+            ],
+            true,
+        );
+        let mut guest = TestVm::new(&module).expect("poll_oneoff at address zero");
+        let VmEvent::PollOneoff(poll) = guest.resume(test_budget()).expect("poll pending") else {
+            panic!("expected poll_oneoff");
+        };
+
+        let userdata = 0x0102_0304_0506_0708u64.to_le_bytes();
+        guest
+            .write_memory(64, &userdata)
+            .expect("subscription userdata");
+        guest
+            .write_memory(72, &[WASIP1_EVENTTYPE_CLOCK])
+            .expect("subscription event type");
+        guest
+            .write_memory(88, &1u64.to_le_bytes())
+            .expect("subscription timeout");
+        guest
+            .write_memory(0, &[0xa5; WASIP1_EVENT_SIZE])
+            .expect("event sentinel");
+        assert_eq!(
+            guest
+                .poll_oneoff_timeout_nanos(poll)
+                .expect("supported clock subscription"),
+            1
+        );
+        guest
+            .write_memory(88, &0u64.to_le_bytes())
+            .expect("immediate subscription timeout");
+        assert_eq!(
+            guest
+                .poll_oneoff_timeout_nanos(poll)
+                .expect("zero timeout is an immediate poll"),
+            0
+        );
+
+        guest
+            .finish_poll_oneoff(poll, 1, 0)
+            .expect("complete ready poll");
+
+        let mut event = [0u8; WASIP1_EVENT_SIZE];
+        event[..8].copy_from_slice(&userdata);
+        let mut actual = [0u8; WASIP1_EVENT_SIZE];
+        guest.read_memory(0, &mut actual).expect("event at zero");
+        assert_eq!(actual, event);
+        assert_eq!(guest.core.read_memory_u32(128).expect("event count"), 1);
     }
 
     #[test]
@@ -5776,6 +6410,212 @@ mod tests {
     }
 
     #[test]
+    fn active_data_segment_is_consumed_by_initialization() {
+        let mut data = Vec::new();
+        push_test_u32(&mut data, 1);
+        push_test_u32(&mut data, 0);
+        data.push(OPCODE_I32_CONST);
+        push_test_i32(&mut data, 0);
+        data.push(OPCODE_END);
+        push_test_u32(&mut data, 1);
+        data.push(b'x');
+
+        let mut body = Vec::new();
+        for value in [1, 0, 1] {
+            body.push(OPCODE_I32_CONST);
+            push_test_i32(&mut body, value);
+        }
+        body.push(super::OPCODE_MISC);
+        push_test_u32(&mut body, 8);
+        push_test_u32(&mut body, 0);
+        push_test_u32(&mut body, 0);
+
+        let module = core_test_module(&body, true, None, Some(&data), None);
+        let mut core = TestInterpreter::new(&module).expect("instantiate active data wasm");
+        let mut initial = [0u8; 1];
+        core.read_memory(0, &mut initial)
+            .expect("read initialized active data");
+        assert_eq!(initial, [b'x']);
+        assert!(core.data_dropped[0]);
+        assert_eq!(core.resume(), Err(WasmError::Truncated));
+    }
+
+    #[test]
+    fn failed_active_data_preflight_preserves_guest_memory() {
+        let mut data = Vec::new();
+        push_test_u32(&mut data, 2);
+        for (offset, byte) in [(0, b'x'), (super::CORE_WASM_PAGE_SIZE as u32, b'y')] {
+            push_test_u32(&mut data, 0);
+            data.push(OPCODE_I32_CONST);
+            push_test_i32(&mut data, offset);
+            data.push(OPCODE_END);
+            push_test_u32(&mut data, 1);
+            data.push(byte);
+        }
+        let module = core_test_module(&[], true, None, Some(&data), None);
+        let mut storage = Box::new(MaybeUninit::<Interpreter<'_>>::uninit());
+        let memory = Box::into_raw(Box::new([0xa5; DEFAULT_GUEST_MEMORY_BYTES]));
+        // SAFETY: both allocations are exclusive and correctly aligned.
+        // Failure leaves the interpreter unpublished; storage is discarded
+        // before the backing allocation is inspected or reclaimed.
+        let result = unsafe {
+            Interpreter::init_in_place(
+                storage.as_mut_ptr(),
+                &module,
+                GuestMemory::new(&mut *memory),
+            )
+        };
+        assert_eq!(result, Err(WasmError::Truncated));
+        drop(storage);
+        // SAFETY: failed initialization published no reference, the storage
+        // that could contain a borrow was discarded, and this is the unique
+        // pointer returned by `Box::into_raw`.
+        let memory = unsafe { Box::from_raw(memory) };
+        assert!(memory.iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[test]
+    fn active_element_segment_is_consumed_without_growing_the_table() {
+        let mut elements = Vec::new();
+        push_test_u32(&mut elements, 1);
+        push_test_u32(&mut elements, 0);
+        elements.push(OPCODE_I32_CONST);
+        push_test_i32(&mut elements, 0);
+        elements.push(OPCODE_END);
+        push_test_u32(&mut elements, 1);
+        push_test_u32(&mut elements, 0);
+
+        let module = core_test_module(&[], false, Some((1, None)), None, Some(&elements));
+        let core = TestInterpreter::new(&module).expect("instantiate active element wasm");
+        assert_eq!(core.table_size, 1);
+        assert_eq!(core.table_functions[0], 0);
+        assert!(core.element_dropped[0]);
+    }
+
+    #[test]
+    fn active_element_segment_cannot_expand_the_initial_table() {
+        let mut elements = Vec::new();
+        push_test_u32(&mut elements, 1);
+        push_test_u32(&mut elements, 0);
+        elements.push(OPCODE_I32_CONST);
+        push_test_i32(&mut elements, 0);
+        elements.push(OPCODE_END);
+        push_test_u32(&mut elements, 1);
+        push_test_u32(&mut elements, 0);
+
+        let module = core_test_module(&[], false, Some((0, None)), None, Some(&elements));
+        match TestInterpreter::new(&module) {
+            Err(error) => {
+                assert_eq!(
+                    error,
+                    invalid!("active element segment exceeds initial table")
+                );
+            }
+            Ok(_) => panic!("active element segment must fit the initial table"),
+        }
+    }
+
+    #[test]
+    fn table_grow_respects_the_module_declared_maximum() {
+        let module = core_test_module(&[], false, Some((0, Some(0))), None, None);
+        let mut core = TestInterpreter::new(&module).expect("instantiate bounded table wasm");
+        core.push_core_value(super::Value::FuncRef(u32::MAX))
+            .expect("table.grow initializer");
+        core.push_core_value(super::Value::I32(1))
+            .expect("table.grow delta");
+        core.exec_misc(super::MiscInstr::TableGrow { table_index: 0 })
+            .expect("table.grow reports allocation failure");
+        assert_eq!(core.pop_core_i32().expect("table.grow result"), u32::MAX);
+        assert_eq!(core.table_size, 0);
+    }
+
+    #[test]
+    fn absent_memory_and_table_reject_even_zero_length_operations() {
+        let module = core_test_module(&[], false, None, None, None);
+        let mut core = TestInterpreter::new(&module).expect("instantiate resource-free wasm");
+        assert_eq!(
+            core.core_memory_fill(0, 0, 0),
+            Err(invalid!("core memory instruction requires memory"))
+        );
+        assert_eq!(
+            core.exec_misc(super::MiscInstr::TableSize { table_index: 0 }),
+            Err(invalid!("core table instruction requires table"))
+        );
+        assert_eq!(
+            core.require_data_count(),
+            Err(invalid!("bulk data instruction requires data count"))
+        );
+    }
+
+    #[test]
+    fn untyped_select_rejects_mixed_operand_types() {
+        let module = core_test_module(&[], false, None, None, None);
+        let mut core = TestInterpreter::new(&module).expect("instantiate select test wasm");
+        core.push_core_value(super::Value::I32(1))
+            .expect("select consequent");
+        core.push_core_value(super::Value::I64(2))
+            .expect("select alternate");
+        core.push_core_value(super::Value::I32(1))
+            .expect("select condition");
+        assert_eq!(
+            core.exec_simple(super::OPCODE_SELECT),
+            Err(invalid!("core select operand type mismatch"))
+        );
+    }
+
+    #[test]
+    fn zero_length_bulk_memory_ops_accept_one_past_end_and_dropped_data() {
+        let mut data = Vec::new();
+        push_test_u32(&mut data, 1);
+        push_test_u32(&mut data, 1);
+        push_test_u32(&mut data, 1);
+        data.push(b'x');
+
+        let mut body = Vec::new();
+        for value in [super::CORE_WASM_PAGE_SIZE as u32; 2] {
+            body.push(OPCODE_I32_CONST);
+            push_test_i32(&mut body, value);
+        }
+        body.push(OPCODE_I32_CONST);
+        push_test_i32(&mut body, 0);
+        body.push(super::OPCODE_MISC);
+        push_test_u32(&mut body, 10);
+        push_test_u32(&mut body, 0);
+        push_test_u32(&mut body, 0);
+
+        body.push(OPCODE_I32_CONST);
+        push_test_i32(&mut body, super::CORE_WASM_PAGE_SIZE as u32);
+        body.push(OPCODE_I32_CONST);
+        push_test_i32(&mut body, 0xff);
+        body.push(OPCODE_I32_CONST);
+        push_test_i32(&mut body, 0);
+        body.push(super::OPCODE_MISC);
+        push_test_u32(&mut body, 11);
+        push_test_u32(&mut body, 0);
+
+        body.push(super::OPCODE_MISC);
+        push_test_u32(&mut body, 9);
+        push_test_u32(&mut body, 0);
+        body.push(OPCODE_I32_CONST);
+        push_test_i32(&mut body, super::CORE_WASM_PAGE_SIZE as u32);
+        body.push(OPCODE_I32_CONST);
+        push_test_i32(&mut body, 0);
+        body.push(OPCODE_I32_CONST);
+        push_test_i32(&mut body, 0);
+        body.push(super::OPCODE_MISC);
+        push_test_u32(&mut body, 8);
+        push_test_u32(&mut body, 0);
+        push_test_u32(&mut body, 0);
+
+        let module = core_test_module(&body, true, None, Some(&data), None);
+        let mut core = TestInterpreter::new(&module).expect("instantiate zero-length bulk ops");
+        assert_eq!(
+            core.resume().expect("zero-length bulk ops reach done"),
+            ExecutionEvent::Done
+        );
+    }
+
+    #[test]
     fn core_wasm_engine_executes_float_basics() {
         let mut body = Vec::new();
         body.push(OPCODE_I32_CONST);
@@ -5793,7 +6633,9 @@ mod tests {
         push_test_i32(&mut body, 8);
         body.push(super::OPCODE_F64_CONST);
         body.extend_from_slice(&4.0f64.to_bits().to_le_bytes());
-        body.push(super::OPCODE_F64_SQRT);
+        body.push(super::OPCODE_F64_CONST);
+        body.extend_from_slice(&0.5f64.to_bits().to_le_bytes());
+        body.push(super::OPCODE_F64_MUL);
         body.push(super::OPCODE_I64_REINTERPRET_F64);
         body.push(super::OPCODE_I64_STORE);
         push_test_u32(&mut body, 3);
@@ -5812,6 +6654,90 @@ mod tests {
         let mut out = [0u8; 8];
         core.read_memory(8, &mut out).expect("f64 sqrt");
         assert_eq!(f64::from_bits(u64::from_le_bytes(out)), 2.0);
+    }
+
+    #[test]
+    fn float_rounding_and_integer_conversion_boundaries_are_exact() {
+        assert_eq!(super::wasm_f32_trunc(-0.5).to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(super::wasm_f32_ceil(-0.5).to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(
+            super::wasm_f32_nearest(-0.5).to_bits(),
+            (-0.0_f32).to_bits()
+        );
+        assert_eq!(super::wasm_f64_trunc(-0.5).to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(
+            super::trunc_f32_to_i32_s(i32::MIN as f32),
+            Ok(i32::MIN as u32)
+        );
+        assert_eq!(
+            super::trunc_f32_to_i64_s(i64::MIN as f32),
+            Ok(i64::MIN as u64)
+        );
+        assert_eq!(
+            super::trunc_f64_to_i64_s(i64::MIN as f64),
+            Ok(i64::MIN as u64)
+        );
+        assert_eq!(
+            super::trunc_f32_to_i32_s(2_147_483_648.0),
+            Err(WasmError::Trap)
+        );
+        assert_eq!(
+            super::trunc_f64_to_i64_s(9_223_372_036_854_775_808.0),
+            Err(WasmError::Trap)
+        );
+        assert_eq!(super::trunc_f32_to_i32_u(0.0), Ok(0));
+        assert_eq!(super::trunc_f64_to_i32_u(0.0), Ok(0));
+        assert_eq!(super::trunc_f32_to_i64_u(0.0), Ok(0));
+        assert_eq!(super::trunc_f64_to_i64_u(0.0), Ok(0));
+        assert_eq!(super::trunc_f32_to_i32_u(-1.0), Err(WasmError::Trap));
+        assert_eq!(super::trunc_f64_to_i32_u(-1.0), Err(WasmError::Trap));
+        assert_eq!(super::trunc_f32_to_i64_u(-1.0), Err(WasmError::Trap));
+        assert_eq!(super::trunc_f64_to_i64_u(-1.0), Err(WasmError::Trap));
+        assert_eq!(
+            super::trunc_f32_to_i32_u(4_294_967_296.0),
+            Err(WasmError::Trap)
+        );
+        assert_eq!(
+            super::trunc_f64_to_i32_u(4_294_967_296.0),
+            Err(WasmError::Trap)
+        );
+        assert_eq!(
+            super::trunc_f32_to_i64_u(18_446_744_073_709_551_616.0),
+            Err(WasmError::Trap)
+        );
+        assert_eq!(
+            super::trunc_f64_to_i64_u(18_446_744_073_709_551_616.0),
+            Err(WasmError::Trap)
+        );
+        assert_eq!(super::trunc_f32_to_i32_s(f32::NAN), Err(WasmError::Trap));
+        assert_eq!(
+            super::trunc_f64_to_i32_u(f64::INFINITY),
+            Err(WasmError::Trap)
+        );
+        assert_eq!(
+            super::trunc_f32_to_i64_s(f32::NEG_INFINITY),
+            Err(WasmError::Trap)
+        );
+        assert_eq!(super::trunc_f64_to_i64_u(f64::NAN), Err(WasmError::Trap));
+    }
+
+    #[test]
+    fn unsupported_sqrt_fault_is_sticky() {
+        let mut body = Vec::new();
+        body.push(super::OPCODE_F32_CONST);
+        body.extend_from_slice(&4.0f32.to_bits().to_le_bytes());
+        body.push(super::OPCODE_F32_SQRT);
+        body.push(OPCODE_DROP);
+
+        let module = core_test_module(&body, false, None, None, None);
+        let mut guest = TestVm::new(&module).expect("instantiate sqrt module");
+        let error = Err(WasmError::UnsupportedOpcode(super::OPCODE_F32_SQRT));
+        assert_eq!(guest.resume(test_budget()), error);
+        assert_eq!(
+            guest.resume(test_budget()),
+            error,
+            "execution faults must not be bypassed by resuming past the opcode"
+        );
     }
 
     #[test]
@@ -5842,7 +6768,7 @@ mod tests {
         push_test_u32(&mut body, 0);
         body.push(OPCODE_DROP);
 
-        let module = core_test_module(&body, true, Some(1), None, None);
+        let module = core_test_module(&body, true, Some((1, None)), None, None);
         let mut core = TestInterpreter::new(&module).expect("instantiate table/ref wasm");
         assert_eq!(
             core.resume().expect("table/ref reaches done"),
@@ -5881,12 +6807,35 @@ mod tests {
                 .as_bytes(),
             b"1"
         );
+        let before = guest
+            .core
+            .read_memory_u32(write.nwritten)
+            .expect("initial written count");
+        assert!(matches!(
+            guest.finish_fd_write(write, 2, 0),
+            Err(WasmError::Unsupported(_))
+        ));
+        assert_eq!(
+            guest
+                .core
+                .read_memory_u32(write.nwritten)
+                .expect("unchanged written count"),
+            before,
+            "oversized completion must not publish a written count"
+        );
         guest
-            .finish_fd_write(write, 0)
+            .finish_fd_write(write, 1, 0)
             .expect("complete fd_write errno");
         assert_eq!(
+            guest
+                .core
+                .read_memory_u32(write.nwritten)
+                .expect("written count"),
+            1
+        );
+        assert_eq!(
             guest.resume(test_budget()).expect("done after fd_write"),
-            VmEvent::Done
+            VmEvent::Exit(0)
         );
     }
 
@@ -5924,7 +6873,7 @@ mod tests {
         };
 
         assert_eq!(
-            close_guest.finish_fd_write(write, 0),
+            close_guest.finish_fd_write(write, 0, 0),
             Err(WasmError::PendingMismatch)
         );
         close_guest
@@ -6023,7 +6972,7 @@ mod tests {
             guest
                 .resume(test_budget())
                 .expect("done after errno completion"),
-            VmEvent::Done
+            VmEvent::Exit(0)
         );
     }
 
@@ -6062,7 +7011,7 @@ mod tests {
             .expect("matching completion resumes the pending import");
         assert_eq!(
             guest.resume(test_budget()).expect("done after completion"),
-            VmEvent::Done
+            VmEvent::Exit(0)
         );
     }
 
@@ -6103,7 +7052,7 @@ mod tests {
             guest
                 .resume(test_budget())
                 .expect("done after memory grow request"),
-            VmEvent::Done
+            VmEvent::Exit(0)
         );
     }
 
@@ -6327,7 +7276,7 @@ mod tests {
                         .expect("complete path_open as ENOSYS");
                     assert_eq!(
                         guest.resume(test_budget()).expect("done after path_open"),
-                        VmEvent::Done
+                        VmEvent::Exit(0)
                     );
                 }
 
@@ -6571,7 +7520,7 @@ mod tests {
         assert_eq!(guest.read_memory_u32(196).expect("opened fd"), 44);
         assert_eq!(
             guest.resume(test_budget()).expect("done after path_open"),
-            VmEvent::Done
+            VmEvent::Exit(0)
         );
 
         let fd_readdir = core_wasip1_single_import_module(
@@ -6611,7 +7560,7 @@ mod tests {
         assert_eq!(guest.read_memory_u32(260).expect("bufused"), 13);
         assert_eq!(
             guest.resume(test_budget()).expect("done after fd_readdir"),
-            VmEvent::Done
+            VmEvent::Exit(0)
         );
     }
 
@@ -6639,6 +7588,10 @@ mod tests {
                         .expect("complete args sizes");
                     assert_eq!(guest.read_memory_u32(16).expect("argc"), 2);
                     assert_eq!(guest.read_memory_u32(20).expect("argv size"), 14);
+                    assert_eq!(
+                        guest.args_layout,
+                        Some(WasiVectorLayout::arguments(2, 14).expect("args layout"))
+                    );
                 }
 
                 {
@@ -6655,6 +7608,8 @@ mod tests {
                     else {
                         panic!("expected args_get");
                     };
+                    guest.args_layout =
+                        Some(WasiVectorLayout::arguments(2, 14).expect("args layout"));
                     guest
                         .finish_args_get(call, &[b"hibana", b"wasip1"], 0)
                         .expect("complete args get");
@@ -6686,6 +7641,10 @@ mod tests {
                         .expect("complete env sizes");
                     assert_eq!(guest.read_memory_u32(128).expect("env count"), 1);
                     assert_eq!(guest.read_memory_u32(132).expect("env size"), 10);
+                    assert_eq!(
+                        guest.environ_layout,
+                        Some(WasiVectorLayout::environment(1, 10).expect("environment layout"))
+                    );
                 }
 
                 {
@@ -6702,6 +7661,8 @@ mod tests {
                     else {
                         panic!("expected environ_get");
                     };
+                    guest.environ_layout =
+                        Some(WasiVectorLayout::environment(1, 10).expect("environment layout"));
                     guest
                         .finish_environ_get(call, &[(b"MODE", b"test")], 0)
                         .expect("complete env get");
@@ -6716,6 +7677,87 @@ mod tests {
             .expect("spawn args/env wasm test")
             .join()
             .expect("args/env wasm test joins");
+    }
+
+    #[test]
+    fn multiregion_wasi_completion_preflights_before_publication() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let memory_end = DEFAULT_GUEST_MEMORY_BYTES as u32;
+                let args_sizes = core_wasip1_single_import_module(
+                    Wasip1ImportName::ArgsSizesGet,
+                    &[VALTYPE_I32, VALTYPE_I32],
+                    &[VALTYPE_I32],
+                    &[TestWasmArg::I32(16), TestWasmArg::I32(memory_end - 2)],
+                    true,
+                );
+                let mut guest = TestVm::new(&args_sizes).expect("args sizes module");
+                guest
+                    .write_memory(16, &[0xa5; 4])
+                    .expect("write argc sentinel");
+                let VmEvent::ArgsSizesGet(call) =
+                    guest.resume(test_budget()).expect("args sizes trap")
+                else {
+                    panic!("expected args_sizes_get");
+                };
+                assert_eq!(
+                    guest.finish_args_sizes_get(call, 2, 14, 0),
+                    Err(WasmError::Truncated)
+                );
+                let mut argc = [0u8; 4];
+                guest
+                    .read_memory(16, &mut argc)
+                    .expect("read argc sentinel");
+                assert_eq!(argc, [0xa5; 4]);
+                guest
+                    .finish_args_sizes_get(call, 0, 0, 8)
+                    .expect("retry pending call without output");
+                assert_eq!(
+                    guest.resume(test_budget()).expect("args sizes done"),
+                    VmEvent::Exit(0)
+                );
+
+                let args_get = core_wasip1_single_import_module(
+                    Wasip1ImportName::ArgsGet,
+                    &[VALTYPE_I32, VALTYPE_I32],
+                    &[VALTYPE_I32],
+                    &[TestWasmArg::I32(32), TestWasmArg::I32(memory_end - 1)],
+                    true,
+                );
+                let mut guest = TestVm::new(&args_get).expect("args get module");
+                guest
+                    .write_memory(32, &[0x5a; 8])
+                    .expect("write argv sentinel");
+                let VmEvent::ArgsGet(call) = guest.resume(test_budget()).expect("args get trap")
+                else {
+                    panic!("expected args_get");
+                };
+                guest.args_layout = Some(WasiVectorLayout::arguments(2, 14).expect("args layout"));
+                assert!(matches!(
+                    guest.finish_args_get(call, &[b"wrong"], 0),
+                    Err(WasmError::Invalid(_))
+                ));
+                assert_eq!(
+                    guest.finish_args_get(call, &[b"hibana", b"wasip1"], 0),
+                    Err(WasmError::Truncated)
+                );
+                let mut argv = [0u8; 8];
+                guest
+                    .read_memory(32, &mut argv)
+                    .expect("read argv sentinel");
+                assert_eq!(argv, [0x5a; 8]);
+                guest
+                    .finish_args_get(call, &[], 8)
+                    .expect("retry pending args call without output");
+                assert_eq!(
+                    guest.resume(test_budget()).expect("args get done"),
+                    VmEvent::Exit(0)
+                );
+            })
+            .expect("spawn atomic completion test")
+            .join()
+            .expect("atomic completion test joins");
     }
 
     #[test]
@@ -6735,13 +7777,13 @@ mod tests {
             guest
                 .resume(test_budget())
                 .expect("proc_exit trampoline trap"),
-            VmEvent::ProcExit(7)
+            VmEvent::Exit(7)
         );
         assert_eq!(
             guest
                 .resume(test_budget())
                 .expect("proc_exit terminates app"),
-            VmEvent::Done
+            VmEvent::Exit(7)
         );
     }
 }

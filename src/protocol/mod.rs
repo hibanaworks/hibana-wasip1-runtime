@@ -3,14 +3,79 @@ use hibana::{
     runtime::wire::{CodecError, Payload, WireEncode, WirePayload},
 };
 
-macro_rules! wire_payload_via_decode {
-    () => {
-        fn validate_payload(input: Payload<'_>) -> Result<(), CodecError> {
-            Self::decode_payload(input).map(|_| ())
+mod schema {
+    const WASIP1: u32 = 0x5750_0000;
+
+    macro_rules! schema_ids {
+        ($($name:ident = $id:literal),+ $(,)?) => {
+            $(pub(super) const $name: u32 = WASIP1 | $id;)+
+
+            #[cfg(test)]
+            pub(super) const ALL: &[u32] = &[$($name),+];
+        };
+    }
+
+    schema_ids! {
+        MEMORY_GROW = 1,
+        MEMORY_GROW_DECISION = 2,
+        FD_WRITE = 3,
+        FD_READ = 4,
+        FD_READDIR = 5,
+        FD_REQUEST = 6,
+        FD_PRESTAT_DIR_NAME = 7,
+        PATH_OPEN = 8,
+        PATH_FILESTAT_GET = 9,
+        CLOCK_RES_GET = 10,
+        CLOCK_TIME_GET = 11,
+        POLL_ONEOFF = 12,
+        RANDOM_GET = 13,
+        ARGS_SIZES_GET = 14,
+        ARGS_GET = 15,
+        ENVIRON_SIZES_GET = 16,
+        ENVIRON_GET = 17,
+        FD_WRITE_DONE = 18,
+        FD_READ_DONE = 19,
+        FD_READDIR_DONE = 20,
+        FD_STAT = 21,
+        FD_PRESTAT = 22,
+        FD_PRESTAT_DIR_NAME_DONE = 23,
+        FILE_STAT = 24,
+        FD_CLOSED = 25,
+        CLOCK_RESOLUTION = 26,
+        CLOCK_TIME = 27,
+        POLL_READY = 28,
+        RANDOM_DONE = 29,
+        ARGS_SIZES = 30,
+        ARGS_DONE = 31,
+        ENVIRON_SIZES = 32,
+        ENVIRON_DONE = 33,
+        PATH_OPENED = 34,
+    }
+}
+
+macro_rules! wire_payload {
+    ($wrapper:ident, $payload:ty) => {
+        impl WireEncode for $wrapper {
+            fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+                self.0.encode_payload(out)
+            }
         }
 
-        fn decode_validated_payload<'a>(input: Payload<'a>) -> Self::Decoded<'a> {
-            Self::decode_payload(input).expect("validated payload")
+        impl WirePayload for $wrapper {
+            const SCHEMA_ID: u32 = <$payload as TypedWasiPayload>::SCHEMA_ID;
+
+            type Decoded<'a> = Self;
+
+            fn validate_payload(input: Payload<'_>) -> Result<(), CodecError> {
+                <$payload as TypedWasiPayload>::decode_payload_bytes(input.as_bytes()).map(drop)
+            }
+
+            fn decode_validated_payload<'a>(input: Payload<'a>) -> Self::Decoded<'a> {
+                Self(
+                    <$payload as TypedWasiPayload>::decode_payload_bytes(input.as_bytes())
+                        .expect("payload was validated"),
+                )
+            }
         }
     };
 }
@@ -56,7 +121,7 @@ pub const LABEL_WASI_FD_FILESTAT_GET_RET: u8 = 158;
 pub const LABEL_WASI_PATH_FILESTAT_GET: u8 = 159;
 pub const LABEL_WASI_PATH_FILESTAT_GET_RET: u8 = 160;
 
-pub const WASIP1_IO_CHUNK_CAPACITY: usize = 64;
+pub const WASIP1_IO_CHUNK_CAPACITY: usize = 96;
 pub const WASIP1_PATH_CHUNK_CAPACITY: usize = 40;
 
 mod wasi;

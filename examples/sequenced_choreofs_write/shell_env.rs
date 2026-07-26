@@ -49,21 +49,21 @@ static CHOREOFS_OBJECTS: ChoreoFsObjectSet<3> = ChoreoFsObjectSet::new([
     ChoreoFsObject::readdir(
         b"objects",
         OBJECTS_DIR_ID,
-        FdSpec::new(OBJECTS_DIR_FD as u32, FD_READDIR_RIGHT, 1),
+        FdSpec::new(OBJECTS_DIR_FD, FD_READDIR_RIGHT, 1),
         OBJECTS_DIRENT_LOG,
         FdBinding::readdir(FdReaddirRow::Base),
     ),
     ChoreoFsObject::readable(
         b"objects/log",
         OBJECT_LOG_ID,
-        FdSpec::new(OBJECT_LOG_FD as u32, FD_READ_RIGHT, 1),
+        FdSpec::new(OBJECT_LOG_FD, FD_READ_RIGHT, 1),
         OBJECT_LOG_BYTES,
         FdBinding::read(FdReadRow::Base),
     ),
     ChoreoFsObject::writable(
         b"outputs/led/green",
         LED_GREEN_ID,
-        FdSpec::new(LED_GREEN_FD as u32, FD_WRITE_RIGHT, 1),
+        FdSpec::new(LED_GREEN_FD, FD_WRITE_RIGHT, 1),
         FdBinding::write(FdWriteRow::Object),
     ),
 ]);

@@ -26,7 +26,7 @@ const ERRNO_BADF: u16 = 8;
 static CHOREOFS_OBJECTS: ChoreoFsObjectSet<1> = ChoreoFsObjectSet::new([ChoreoFsObject::writable(
     b"outputs/led/green",
     LED_GREEN_ID,
-    FdSpec::new(LED_GREEN_FD as u32, FD_WRITE_RIGHT, 1),
+    FdSpec::new(LED_GREEN_FD, FD_WRITE_RIGHT, 1),
     FdBinding::write(FdWriteRow::Object),
 )]);
 

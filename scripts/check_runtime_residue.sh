@@ -17,23 +17,24 @@ check_absent() {
 }
 
 runtime_source() {
-    find src -name '*.rs' -print | while IFS= read -r file; do
-        awk '
-            BEGIN { cfg_test = 0; in_tests = 0 }
-            cfg_test {
-                if ($0 ~ /^[[:space:]]*mod tests[[:space:]]*\{/) {
-                    in_tests = 1
+    find src -name '*.rs' ! -name 'tests.rs' ! -path '*/tests/*' -print |
+        while IFS= read -r file; do
+            awk '
+                BEGIN { cfg_test = 0; in_tests = 0 }
+                cfg_test {
+                    if ($0 ~ /^[[:space:]]*mod tests[[:space:]]*\{/) {
+                        in_tests = 1
+                    }
+                    cfg_test = 0
+                    next
                 }
-                cfg_test = 0
-                next
-            }
-            /^[[:space:]]*#\[cfg\(test\)\]/ {
-                cfg_test = 1
-                next
-            }
-            !in_tests { print FILENAME ":" FNR ":" $0 }
-        ' "$file"
-    done
+                /^[[:space:]]*#\[cfg\(test\)\]/ {
+                    cfg_test = 1
+                    next
+                }
+                !in_tests { print FILENAME ":" FNR ":" $0 }
+            ' "$file"
+        done
 }
 
 check_absent \
@@ -79,6 +80,11 @@ check_absent \
 check_absent \
     "broad fallback/default residue" \
     'Default|pub const EMPTY|unwrap_or|unwrap_or_default|TODO|FIXME|deprecated|legacy|compatibility|compat alias|fallback path' \
+    src
+
+check_absent \
+    "saturating arithmetic fallback" \
+    'saturating_(add|sub|mul)' \
     src
 
 if runtime_source | rg -n 'extern crate std|std::|Vec<|Box<|String|format!|println!|eprintln!|panic!|todo!|unimplemented!'; then

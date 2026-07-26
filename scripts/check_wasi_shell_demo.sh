@@ -4,8 +4,11 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
-if ! rustup target list --installed | rg -q '^wasm32-wasip1$'; then
-    echo "wasm32-wasip1 target is not installed; run: rustup target add wasm32-wasip1" >&2
+toolchain=${HIBANA_WASIP1_TOOLCHAIN:-1.95.0}
+
+if ! rustup target list --installed --toolchain "$toolchain" | rg -q '^wasm32-wasip1$'; then
+    echo "wasm32-wasip1 target is not installed for $toolchain" >&2
+    echo "run: rustup target add --toolchain $toolchain wasm32-wasip1" >&2
     exit 1
 fi
 
@@ -38,12 +41,12 @@ codegen-units = 1
 strip = "debuginfo"
 CARGO
 
-cargo generate-lockfile \
+cargo "+$toolchain" generate-lockfile \
     --manifest-path "$guest_manifest" \
     --offline
 
 RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=--initial-memory=65536 -C link-arg=--max-memory=65536 -C link-arg=-zstack-size=8192" \
-    cargo build \
+    cargo "+$toolchain" build \
     --manifest-path "$guest_manifest" \
     --target wasm32-wasip1 \
     --release \
@@ -54,7 +57,7 @@ blocked_output=$(
     printf '%s\n' \
         'echo 1 > /outputs/led/green' \
         'exit' |
-        cargo run --quiet --locked --example direct_choreofs_write_rejection -- "$guest_wasm" 2>&1
+        cargo "+$toolchain" run --quiet --locked --example direct_choreofs_write_rejection -- "$guest_wasm" 2>&1
 )
 printf '%s\n' "$blocked_output"
 for expected in \
@@ -80,7 +83,7 @@ sequenced_output=$(
         'cat /objects/log' \
         'apply /objects/log /outputs/led/green' \
         'exit' |
-        cargo run --quiet --locked --example sequenced_choreofs_write -- "$guest_wasm" 2>&1
+        cargo "+$toolchain" run --quiet --locked --example sequenced_choreofs_write -- "$guest_wasm" 2>&1
 )
 printf '%s\n' "$sequenced_output"
 for expected in \

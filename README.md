@@ -1,6 +1,6 @@
 # hibana-wasip1-runtime
 
-`hibana-wasip1-runtime` is a Rust 2024, `#![no_std]` WASI Preview 1
+`hibana-wasip1-runtime` is a Rust 2024, `#![no_std]`, bounded WASI Preview 1
 runtime boundary for Wasm guests that advance under Hibana choreography.
 
 The crate is intentionally narrow. It parses and runs a WASI P1 guest, copies
@@ -19,6 +19,9 @@ WASI P1 guest
 
 It depends on `hibana`; it does not define a second message system, a host
 policy layer, or a filesystem fallback.
+
+Version `0.1` targets Hibana `0.9.6` and its schema-identified wire payload
+contract.
 
 ## Install
 
@@ -62,9 +65,9 @@ There are four public surfaces:
 
 | Surface | Used for | Main names |
 | --- | --- | --- |
-| Engine stepper | running the guest to a WASI boundary | `HibanaWasiGuestStorage`, `HibanaWasiGuest`, `WasiBoundaryStep`, `WasiImportPending`, `WasiMemoryGrowPending`, `WasiImportRequest`, `WasiImportCompletion` |
+| Engine stepper | running the guest to a WASI boundary | `HibanaWasiGuestStorage`, `HibanaWasiGuest`, `BudgetRun`, `WasiBoundaryStep`, `WasiImportPending`, `WasiMemoryGrowPending`, `WasiImportRequest`, `WasiImportCompletion` |
 | Guest memory | caller-owned WASM linear-memory backing | `GuestMemory`, `GUEST_MEMORY_PAGE_SIZE`, `DEFAULT_GUEST_MEMORY_BYTES` |
-| Protocol payloads | Hibana message payloads for WASI P1 imports and runtime events | `protocol::*ReqMsg`, `protocol::*RetMsg`, `BudgetRun`, `MemoryGrowReqMsg`, `MemoryGrowRetMsg` |
+| Protocol payloads | Hibana message payloads for WASI P1 imports and memory growth | `protocol::*ReqMsg`, `protocol::*RetMsg`, `MemoryGrowReqMsg`, `MemoryGrowRetMsg` |
 | ChoreoFS facts | object and fd facts a local role can use while answering admitted WASI calls | `ChoreoFsObjectSet`, `ChoreoFs`, `ChoreoFsOpen`, `ChoreoFsRead`, `ChoreoFsReadDir`, `ChoreoFsWrite`, `FdBindingTable` |
 
 Application code should read the global choreography and the local-side endpoint
@@ -95,6 +98,17 @@ Unsupported imports fail closed while the import plan is built. Known imports
 with wrong signatures fail before guest execution begins. Completion is linear:
 `WasiImportPending::complete(...)` and `WasiMemoryGrowPending::complete(...)`
 consume the pending value, so a response cannot be reused for a later import.
+`HibanaWasiGuestStorage` is one-shot even when initialization fails, so partially
+initialized in-place storage is never retried.
+Every message payload has a stable Hibana `SCHEMA_ID`; malformed or
+non-canonical bytes are rejected before decode. Multi-region ABI writeback is
+prepared in full before publication, so an invalid later range cannot leave an
+earlier guest-memory write committed.
+
+Successful `args_sizes_get` / `environ_sizes_get` completions establish the
+exact compact list layout accepted by the following `args_get` /
+`environ_get`. The data completion must match that count and byte length
+exactly; otherwise the pending call remains uncommitted.
 
 The crate deliberately excludes:
 
@@ -105,6 +119,46 @@ The crate deliberately excludes:
 - syscall availability profiles;
 - compatibility aliases for removed protocol variants;
 - platform-family names in protocol labels, event variants, or feature names.
+
+## Supported Profile
+
+This is not a general-purpose WebAssembly engine or a complete implementation
+of all WASI P1 imports. It is one bounded profile whose unsupported module
+shapes and imports are rejected while the module is loaded.
+
+The supported WASI P1 imports are:
+
+```text
+args_get              args_sizes_get       clock_res_get
+clock_time_get        environ_get          environ_sizes_get
+fd_close              fd_fdstat_get        fd_filestat_get
+fd_prestat_dir_name   fd_prestat_get       fd_read
+fd_readdir            fd_write             path_filestat_get
+path_open             poll_oneoff          proc_exit
+random_get
+```
+
+`poll_oneoff` currently accepts one clock subscription and carries its exact
+WASI nanosecond timeout; the answering role owns any scheduler-unit conversion.
+I/O completion payloads carry at most 96 bytes, path payloads at most 40 bytes,
+and the fd table holds 16 live bindings while accepting any `u8` fd number.
+
+The current Wasm profile is bounded as follows:
+
+| Area | Ceiling |
+| --- | ---: |
+| types / imports / functions / globals | 24 / 16 / 224 / 16 |
+| parameters / results per function | 12 / 1 |
+| value stack / locals / call frames | 64 / 32 / 16 |
+| control frames / decoded control targets | 128 / 192 |
+| `br_table` labels / table functions | 64 / 64 |
+| data segments / element segments | 8 / 8 |
+
+These are rejection ceilings, not truncation points. Raising one requires
+remeasuring the embedded object budget and adding its exact boundary test.
+`f32.sqrt` and `f64.sqrt` are rejected instead of being approximated; adding
+them requires a correctly rounded `no_std` implementation and a measured Pico
+flash budget.
 
 ## Hibana Integration
 
@@ -124,7 +178,9 @@ let memory_grow = g::seq(
 let program = g::route(memory_grow, fd_read).roll();
 ```
 
-The guest-running role is small because Hibana already owns endpoint progress:
+The guest-running role is small because Hibana already owns endpoint progress.
+The following is an excerpt; the repository examples contain the exhaustive,
+compiled match over all admitted imports:
 
 ```rust,ignore
 async fn run_guest<const ROLE: u8>(
@@ -231,8 +287,8 @@ The repository includes one guest program and two host choreographies:
 | Path | Purpose |
 | --- | --- |
 | `examples/wasi_std_shell_app.rs` | a real `wasm32-wasip1` Rust `std` guest using `std::io` and `std::fs` |
-| `examples/direct_choreofs_write_rejection` | proves that a direct write does not advance when the ChoreoFS object write row is absent |
-| `examples/sequenced_choreofs_write` | proves that choreography can require reading `/objects/log` before writing `/outputs/led/green` |
+| `examples/direct_choreofs_write_rejection` | demonstrates that a direct write does not advance when the ChoreoFS object write row is absent |
+| `examples/sequenced_choreofs_write` | demonstrates that choreography can require reading `/objects/log` before writing `/outputs/led/green` |
 
 Run the demonstration:
 
@@ -240,24 +296,21 @@ Run the demonstration:
 bash scripts/check_wasi_shell_demo.sh
 ```
 
-The important point is not the shell UI. The proof is that changing the Hibana
-choreography changes which WASI guest progress is possible, while the guest
-continues to use ordinary Rust `std` APIs.
+The important point is not the shell UI. The executable evidence shows that
+changing the Hibana choreography changes which WASI guest progress is possible,
+while the guest continues to use ordinary Rust `std` APIs.
 
 ## Embedded Budget
 
-Raspberry Pi Pico / RP2040 Core1-side execution is a real validation floor for
-the runtime boundary. The design must not assume that the full chip SRAM is
-available to this crate.
+The same public API is compiled for `thumbv6m-none-eabi`. On ARM, a compile-time
+assertion limits the VM object to 32 KiB. `DEFAULT_GUEST_MEMORY_BYTES` is one
+64 KiB Wasm page, so the VM object plus default guest backing is bounded by
+96 KiB before caller-owned Hibana session, transport, and application storage.
 
-The core path therefore prefers caller-owned storage, explicit fuel, visible
-memory-growth boundaries, bounded guest-memory copies, small typed protocol
-values, and direct hot-path copying after ABI checks. Host conveniences may
-exist in examples, but the engine contract must stay allocation-aware and
-reviewable for the reduced Core1-side budget.
-
-The Pico constraint is a resource budget and validation target. It is not a
-public protocol naming scheme.
+Guest memory remains caller-owned. `memory.grow` cannot commit beyond that
+backing or the module limit. The hot path performs no allocation and uses
+explicit fuel, bounded copies, compact typed payloads, and checked ABI ranges.
+Host-only example code is not part of this resource claim.
 
 ## Build And Test
 
@@ -274,13 +327,16 @@ cargo test --locked choreofs
 cargo check --locked --example sequenced_choreofs_write
 cargo check --locked --example direct_choreofs_write_rejection
 bash scripts/check_runtime_residue.sh
+bash scripts/check_miri.sh
 bash scripts/check_wasi_shell_demo.sh
 ```
 
 The gates cover import decoding, unsupported import rejection, guest-memory
-bounds, writeback, pending-call mismatch rejection, memory-growth pending, fuel
-suspension, restart behavior, ChoreoFS object lookup, example behavior, residue
-scans, clippy, and embedded-oriented compilation checks.
+bounds, atomic writeback, pending-call mismatch rejection, canonical
+argument/environment payloads, memory-growth pending, fuel suspension, restart
+behavior, ChoreoFS object lookup, example behavior, residue scans, clippy,
+Miri, `thumbv6m-none-eabi`, documentation, and package verification. CI runs
+the same gate with Rust `1.95.0` and Miri `nightly-2026-05-28`.
 
 ## License
 

@@ -24,14 +24,21 @@ const FD_READ_RIGHT: u64 = 1 << 1;
 const FD_WRITE_RIGHT: u64 = 1 << 6;
 const FD_READDIR_RIGHT: u64 = 1 << 14;
 const MAX_ARG_REFS: usize = WASIP1_IO_CHUNK_CAPACITY;
+const MAX_ENV_REFS: usize = WASIP1_IO_CHUNK_CAPACITY / 3;
 pub const FD_BINDING_CAPACITY: usize = 16;
 const UNSUPPORTED_WASIP1_INLINE_REPLY_TOO_LARGE: u16 = 0x5101;
 const UNSUPPORTED_WASIP1_PATH_REPLY_TOO_LARGE: u16 = 0x5102;
 const UNSUPPORTED_WASIP1_CLOCK_ID_TOO_LARGE: u16 = 0x5103;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FdBindingEntry {
+    fd: u8,
+    binding: FdBinding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdBindingTable {
-    entries: [Option<FdBinding>; FD_BINDING_CAPACITY],
+    entries: [Option<FdBindingEntry>; FD_BINDING_CAPACITY],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +47,7 @@ pub struct FdBindingCapacityError {
 }
 
 impl FdBindingCapacityError {
-    pub const fn new(fd: u8) -> Self {
+    const fn new(fd: u8) -> Self {
         Self { fd }
     }
 
@@ -57,21 +64,38 @@ impl FdBindingTable {
     }
 
     pub fn bind_fd(&mut self, fd: u8, binding: FdBinding) -> Result<(), FdBindingCapacityError> {
-        let Some(slot) = self.entries.get_mut(fd as usize) else {
-            return Err(FdBindingCapacityError::new(fd));
-        };
-        *slot = Some(binding);
-        Ok(())
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.fd == fd)
+        {
+            entry.binding = binding;
+            return Ok(());
+        }
+        if let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) {
+            *slot = Some(FdBindingEntry { fd, binding });
+            return Ok(());
+        }
+        Err(FdBindingCapacityError::new(fd))
     }
 
     pub fn remove_fd(&mut self, fd: u8) {
-        if let Some(slot) = self.entries.get_mut(fd as usize) {
+        if let Some(slot) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_some_and(|entry| entry.fd == fd))
+        {
             *slot = None;
         }
     }
 
     pub fn binding(&self, fd: u8) -> Option<FdBinding> {
-        self.entries.get(fd as usize).and_then(|binding| *binding)
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.fd == fd)
+            .map(|entry| entry.binding)
     }
 
     pub fn bound_write_row(&self, fd: u8) -> Option<FdWriteRow> {
@@ -102,7 +126,7 @@ pub enum ExchangeError {
         expected_fd: u8,
         actual_fd: u8,
     },
-    GuestStorageAlreadyInitialized,
+    GuestStorageConsumed,
 }
 
 impl From<CodecError> for ExchangeError {
@@ -128,16 +152,25 @@ pub struct HibanaWasiGuest<'a> {
     bindings: FdBindingTable,
 }
 
+const _: () = assert!(!core::mem::needs_drop::<HibanaWasiGuest<'static>>());
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuestStorageState {
+    Vacant,
+    Failed,
+    Initialized,
+}
+
 pub struct HibanaWasiGuestStorage<'a> {
     slot: MaybeUninit<HibanaWasiGuest<'a>>,
-    initialized: bool,
+    state: GuestStorageState,
 }
 
 impl<'a> HibanaWasiGuestStorage<'a> {
     pub const fn uninit() -> Self {
         Self {
             slot: MaybeUninit::uninit(),
-            initialized: false,
+            state: GuestStorageState::Vacant,
         }
     }
 
@@ -147,20 +180,28 @@ impl<'a> HibanaWasiGuestStorage<'a> {
         memory: GuestMemory<'a>,
         bindings: FdBindingTable,
     ) -> Result<&mut HibanaWasiGuest<'a>, ExchangeError> {
-        if self.initialized {
-            return Err(ExchangeError::GuestStorageAlreadyInitialized);
+        if self.state != GuestStorageState::Vacant {
+            return Err(ExchangeError::GuestStorageConsumed);
         }
+        self.state = GuestStorageState::Failed;
+        // SAFETY: `slot` is aligned writable storage, remains exclusively
+        // borrowed through `self`, and this one-shot storage is never read,
+        // dropped as initialized, or retried unless initialization succeeds.
         unsafe {
             HibanaWasiGuest::init_in_place(self.slot.as_mut_ptr(), module, memory, bindings)?;
         }
-        self.initialized = true;
+        self.state = GuestStorageState::Initialized;
+        // SAFETY: the successful initializer wrote every field and the state
+        // transition above records that fact before the reference is exposed.
         Ok(unsafe { &mut *self.slot.as_mut_ptr() })
     }
 }
 
 impl Drop for HibanaWasiGuestStorage<'_> {
     fn drop(&mut self) {
-        if self.initialized {
+        if self.state == GuestStorageState::Initialized {
+            // SAFETY: `Initialized` is set only after complete initialization
+            // and the storage cannot be initialized a second time.
             unsafe {
                 self.slot.assume_init_drop();
             }
@@ -174,12 +215,15 @@ impl<'a> HibanaWasiGuest<'a> {
     /// `dst` must be valid for writes, properly aligned for
     /// `HibanaWasiGuest<'a>`, and must not be read until this function returns
     /// `Ok(())`.
-    pub unsafe fn init_in_place(
+    unsafe fn init_in_place(
         dst: *mut Self,
         module: &'a [u8],
         memory: GuestMemory<'a>,
         bindings: FdBindingTable,
     ) -> Result<(), ExchangeError> {
+        // SAFETY: the caller provides exclusive aligned storage. `Guest`
+        // initializes its complete field before `bindings` is written, and
+        // neither field is read through `dst` until both writes succeed.
         unsafe {
             Guest::init_in_place(core::ptr::addr_of_mut!((*dst).guest), module, memory)?;
             core::ptr::addr_of_mut!((*dst).bindings).write(bindings);
@@ -495,11 +539,11 @@ impl PendingCall {
         match (self, completion) {
             (Self::FdWrite(call), WasiImportCompletion::FdWrite(done)) => {
                 expect_fd(WasiImport::FdWrite, call.fd(), done.0.fd())?;
-                call.complete(guest, done.0.errno() as u32)?;
+                call.complete(guest, done.0.written() as u32, done.0.errno() as u32)?;
             }
             (Self::FdWriteObject(call), WasiImportCompletion::FdWriteObject(done)) => {
                 expect_fd(WasiImport::FdWriteObject, call.fd(), done.0.fd())?;
-                call.complete(guest, done.0.errno() as u32)?;
+                call.complete(guest, done.0.written() as u32, done.0.errno() as u32)?;
             }
             (Self::FdRead(call), WasiImportCompletion::FdRead(done)) => {
                 expect_fd(WasiImport::FdRead, call.fd(), done.0.fd())?;
@@ -510,10 +554,9 @@ impl PendingCall {
                 call.complete(guest, done.0.as_bytes(), done.0.errno() as u32)?;
             }
             (Self::PathOpen(call), WasiImportCompletion::PathOpen(opened)) => {
+                let prepared_bindings = prepare_path_open_bindings(*bindings, opened.0)?;
                 call.complete(guest, opened.0.fd() as u32, opened.0.errno() as u32)?;
-                if opened.0.errno() == 0 && !opened.0.binding().is_empty() {
-                    bindings.bind_fd(opened.0.fd(), opened.0.binding())?;
-                }
+                *bindings = prepared_bindings;
             }
             (Self::FdPrestatGet(call), WasiImportCompletion::FdPrestatGet(prestat)) => {
                 expect_fd(WasiImport::FdPrestatGet, call.fd(), prestat.0.fd())?;
@@ -531,14 +574,16 @@ impl PendingCall {
             }
             (Self::ArgsGet(call), WasiImportCompletion::ArgsGet(done)) => {
                 let mut args = [&[][..]; MAX_ARG_REFS];
-                let count = split_args(done.0.as_bytes(), &mut args);
+                let count = split_args(done.0.as_bytes(), done.0.count(), &mut args)?;
                 call.complete(guest, &args[..count], 0)?;
             }
             (Self::EnvironSizesGet(call), WasiImportCompletion::EnvironSizesGet(sizes)) => {
                 call.complete(guest, sizes.0.count() as u32, sizes.0.buf_size() as u32, 0)?;
             }
-            (Self::EnvironGet(call), WasiImportCompletion::EnvironGet(_done)) => {
-                call.complete(guest, &[], 0)?;
+            (Self::EnvironGet(call), WasiImportCompletion::EnvironGet(done)) => {
+                let mut environ = [(&[][..], &[][..]); MAX_ENV_REFS];
+                let count = split_environ(done.0.as_bytes(), done.0.count(), &mut environ)?;
+                call.complete(guest, &environ[..count], 0)?;
             }
             (Self::FdFdstatGet(call), WasiImportCompletion::FdFdstatGet(stat)) => {
                 expect_fd(WasiImport::FdFdstatGet, call.fd(), stat.0.fd())?;
@@ -549,10 +594,10 @@ impl PendingCall {
             }
             (Self::FdClose(call), WasiImportCompletion::FdClose(closed)) => {
                 expect_fd(WasiImport::FdClose, call.fd(), closed.0.fd())?;
-                if closed.0.errno() == 0 {
-                    bindings.remove_fd(call.fd());
-                }
+                let prepared_bindings =
+                    prepare_fd_close_bindings(*bindings, call.fd(), closed.0.errno());
                 call.complete(guest, closed.0.errno() as u32)?;
+                *bindings = prepared_bindings;
             }
             (Self::ClockResGet(call), WasiImportCompletion::ClockResGet(resolution)) => {
                 call.complete(guest, resolution.0.nanos(), 0)?;
@@ -734,7 +779,7 @@ fn lower_call(
             })
         }
         Call::PollOneoff(call) => {
-            let request = protocol::PollOneoffReq(PollOneoff::new(call.delay_ticks(guest)?));
+            let request = protocol::PollOneoffReq(PollOneoff::new(call.timeout_nanos(guest)?));
             Ok(WasiImportPending {
                 request: WasiImportRequest::PollOneoff(request),
                 pending: PendingCall::PollOneoff(call),
@@ -761,6 +806,23 @@ fn expect_fd(import: WasiImport, expected_fd: u8, actual_fd: u8) -> Result<(), E
             actual_fd,
         })
     }
+}
+
+fn prepare_path_open_bindings(
+    mut bindings: FdBindingTable,
+    opened: protocol::PathOpened,
+) -> Result<FdBindingTable, FdBindingCapacityError> {
+    if opened.errno() == 0 && !opened.binding().is_empty() {
+        bindings.bind_fd(opened.fd(), opened.binding())?;
+    }
+    Ok(bindings)
+}
+
+fn prepare_fd_close_bindings(mut bindings: FdBindingTable, fd: u8, errno: u16) -> FdBindingTable {
+    if errno == 0 {
+        bindings.remove_fd(fd);
+    }
+    bindings
 }
 
 fn inline_io_request_len(value: usize) -> u8 {
@@ -792,16 +854,50 @@ fn unsupported(code: u16) -> ExchangeError {
     ExchangeError::Wasm(WasmError::Unsupported(code))
 }
 
-fn split_args<'a>(bytes: &'a [u8], out: &mut [&'a [u8]; MAX_ARG_REFS]) -> usize {
-    let mut count = 0usize;
-    for arg in bytes.split(|byte| *byte == 0).filter(|arg| !arg.is_empty()) {
-        if count == out.len() {
-            break;
-        }
-        out[count] = arg;
-        count += 1;
+fn split_args<'a>(
+    mut bytes: &'a [u8],
+    count: usize,
+    out: &mut [&'a [u8]; MAX_ARG_REFS],
+) -> Result<usize, CodecError> {
+    let slots = out.get_mut(..count).ok_or(CodecError::Malformed)?;
+    for slot in slots {
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(CodecError::Malformed)?;
+        *slot = &bytes[..end];
+        bytes = &bytes[end + 1..];
     }
-    count
+    if !bytes.is_empty() {
+        return Err(CodecError::Malformed);
+    }
+    Ok(count)
+}
+
+fn split_environ<'a>(
+    mut bytes: &'a [u8],
+    count: usize,
+    out: &mut [(&'a [u8], &'a [u8]); MAX_ENV_REFS],
+) -> Result<usize, CodecError> {
+    let slots = out.get_mut(..count).ok_or(CodecError::Malformed)?;
+    for slot in slots {
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(CodecError::Malformed)?;
+        let entry = &bytes[..end];
+        let separator = entry
+            .iter()
+            .position(|byte| *byte == b'=')
+            .filter(|separator| *separator != 0)
+            .ok_or(CodecError::Malformed)?;
+        *slot = (&entry[..separator], &entry[separator + 1..]);
+        bytes = &bytes[end + 1..];
+    }
+    if !bytes.is_empty() {
+        return Err(CodecError::Malformed);
+    }
+    Ok(count)
 }
 
 fn wasm_fd_stat(stat: protocol::FdStat) -> WasmFdStat {
@@ -817,73 +913,4 @@ fn wasm_file_stat(stat: protocol::FileStat) -> WasmFileStat {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        ExchangeError, FdBindingTable, PendingCall, UNSUPPORTED_WASIP1_CLOCK_ID_TOO_LARGE,
-        UNSUPPORTED_WASIP1_INLINE_REPLY_TOO_LARGE, UNSUPPORTED_WASIP1_PATH_REPLY_TOO_LARGE,
-        WasiBoundaryStep, WasiImportPending, WasiImportRequest, clock_id_u8, exact_io_reply_len,
-        exact_path_reply_len, inline_io_request_len,
-    };
-    use crate::WasmError;
-    use core::mem::size_of;
-
-    #[test]
-    fn binding_table_and_pending_token_stay_small() {
-        assert!(
-            size_of::<FdBindingTable>() <= 128,
-            "FdBindingTable uses {} bytes",
-            size_of::<FdBindingTable>()
-        );
-        assert!(
-            size_of::<PendingCall>() <= 64,
-            "PendingCall uses {} bytes",
-            size_of::<PendingCall>()
-        );
-        assert!(
-            size_of::<WasiImportRequest>() <= 80,
-            "WasiImportRequest uses {} bytes",
-            size_of::<WasiImportRequest>()
-        );
-        assert!(
-            size_of::<WasiImportPending>() <= 128,
-            "WasiImportPending uses {} bytes",
-            size_of::<WasiImportPending>()
-        );
-        assert!(
-            size_of::<WasiBoundaryStep>() <= 136,
-            "WasiBoundaryStep uses {} bytes",
-            size_of::<WasiBoundaryStep>()
-        );
-    }
-
-    #[test]
-    fn inline_io_len_only_clamps_partial_transfer_imports() {
-        assert_eq!(inline_io_request_len(0), 0);
-        assert_eq!(inline_io_request_len(64), 64);
-        assert_eq!(inline_io_request_len(65), 64);
-
-        assert!(matches!(exact_io_reply_len(64), Ok(64)));
-        assert!(matches!(
-            exact_io_reply_len(65),
-            Err(ExchangeError::Wasm(WasmError::Unsupported(code)))
-                if code == UNSUPPORTED_WASIP1_INLINE_REPLY_TOO_LARGE
-        ));
-    }
-
-    #[test]
-    fn exact_path_and_clock_values_fail_fast() {
-        assert!(matches!(exact_path_reply_len(40), Ok(40)));
-        assert!(matches!(
-            exact_path_reply_len(41),
-            Err(ExchangeError::Wasm(WasmError::Unsupported(code)))
-                if code == UNSUPPORTED_WASIP1_PATH_REPLY_TOO_LARGE
-        ));
-
-        assert!(matches!(clock_id_u8(255), Ok(255)));
-        assert!(matches!(
-            clock_id_u8(256),
-            Err(ExchangeError::Wasm(WasmError::Unsupported(code)))
-                if code == UNSUPPORTED_WASIP1_CLOCK_ID_TOO_LARGE
-        ));
-    }
-}
+mod tests;

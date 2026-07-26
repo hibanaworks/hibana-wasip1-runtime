@@ -28,6 +28,9 @@ impl<'a> Guest<'a> {
         module: &'a [u8],
         memory: GuestMemory<'a>,
     ) -> Result<(), Error> {
+        // SAFETY: the caller's contract for `Guest` provides exclusive
+        // unpublished storage; `engine` is its only field and `Vm` initializes
+        // it completely before returning success.
         unsafe {
             machine::Vm::init_in_place(core::ptr::addr_of_mut!((*dst).engine), module, memory)?;
         }
@@ -88,8 +91,7 @@ impl<'a> Guest<'a> {
                 Ok(Event::MemoryGrowPending(MemoryGrowPending { event }))
             }
             Ok(machine::VmEvent::BudgetExpired(expired)) => Ok(Event::BudgetExpired(expired)),
-            Ok(machine::VmEvent::ProcExit(status)) => Ok(Event::Exit(Exit::new(status))),
-            Ok(machine::VmEvent::Done) => Ok(Event::Exit(Exit::returned())),
+            Ok(machine::VmEvent::Exit(status)) => Ok(Event::Exit(Exit::new(status))),
             Err(error) => Err(error),
         }
     }
@@ -138,10 +140,6 @@ impl Exit {
         Self { status }
     }
 
-    const fn returned() -> Self {
-        Self { status: 0 }
-    }
-
     pub const fn status(self) -> u32 {
         self.status
     }
@@ -172,8 +170,8 @@ impl FdWrite {
         })
     }
 
-    pub fn complete(self, guest: &mut Guest<'_>, errno: u32) -> Result<(), Error> {
-        guest.engine.finish_fd_write(self.call, errno)
+    pub fn complete(self, guest: &mut Guest<'_>, written: u32, errno: u32) -> Result<(), Error> {
+        guest.engine.finish_fd_write(self.call, written, errno)
     }
 }
 
@@ -318,8 +316,8 @@ pub struct PollOneoff {
 }
 
 impl PollOneoff {
-    pub fn delay_ticks(&self, guest: &Guest<'_>) -> Result<u64, Error> {
-        guest.engine.poll_oneoff_delay_ticks(self.call)
+    pub fn timeout_nanos(&self, guest: &Guest<'_>) -> Result<u64, Error> {
+        guest.engine.poll_oneoff_timeout_nanos(self.call)
     }
 
     pub fn complete(self, guest: &mut Guest<'_>, ready: u32, errno: u32) -> Result<(), Error> {
@@ -507,10 +505,12 @@ mod tests {
 
     #[test]
     fn facade_returns_explicit_exit_when_start_returns() {
+        let mut memory = Box::new([0u8; DEFAULT_GUEST_MEMORY_BYTES]);
         let mut storage = Box::new(MaybeUninit::<Guest<'_>>::uninit());
+        // SAFETY: the boxed storage and memory are aligned, uniquely owned, and
+        // remain live for the use of the successfully initialized guest.
         let guest = unsafe {
             let ptr = storage.as_mut_ptr();
-            let memory = Box::leak(Box::new([0u8; DEFAULT_GUEST_MEMORY_BYTES]));
             Guest::init_in_place(ptr, START_RETURNS, GuestMemory::new(&mut memory[..]))
                 .expect("guest init");
             &mut *ptr

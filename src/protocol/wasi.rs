@@ -53,39 +53,6 @@ impl BudgetRun {
     pub const fn fuel(&self) -> u32 {
         self.fuel
     }
-
-    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != 8 {
-            return Err(CodecError::Malformed);
-        }
-        Ok(Self::new(
-            u16::from_be_bytes([bytes[0], bytes[1]]),
-            u16::from_be_bytes([bytes[2], bytes[3]]),
-            u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-        ))
-    }
-}
-
-impl WireEncode for BudgetRun {
-    fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        if out.len() < 8 {
-            return Err(CodecError::Truncated);
-        }
-        out[0..2].copy_from_slice(&self.run_id.to_be_bytes());
-        out[2..4].copy_from_slice(&self.generation.to_be_bytes());
-        out[4..8].copy_from_slice(&self.fuel.to_be_bytes());
-        Ok(8)
-    }
-}
-
-impl WirePayload for BudgetRun {
-    type Decoded<'a> = Self;
-
-    wire_payload_via_decode!();
-
-    fn decode_payload<'a>(input: Payload<'a>) -> Result<Self::Decoded<'a>, CodecError> {
-        Self::decode(input.as_bytes())
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,37 +72,6 @@ impl BudgetExpired {
 
     pub const fn generation(&self) -> u16 {
         self.generation
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != 4 {
-            return Err(CodecError::Malformed);
-        }
-        Ok(Self::new(
-            u16::from_be_bytes([bytes[0], bytes[1]]),
-            u16::from_be_bytes([bytes[2], bytes[3]]),
-        ))
-    }
-}
-
-impl WireEncode for BudgetExpired {
-    fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        if out.len() < 4 {
-            return Err(CodecError::Truncated);
-        }
-        out[0..2].copy_from_slice(&self.run_id.to_be_bytes());
-        out[2..4].copy_from_slice(&self.generation.to_be_bytes());
-        Ok(4)
-    }
-}
-
-impl WirePayload for BudgetExpired {
-    type Decoded<'a> = Self;
-
-    wire_payload_via_decode!();
-
-    fn decode_payload<'a>(input: Payload<'a>) -> Result<Self::Decoded<'a>, CodecError> {
-        Self::decode(input.as_bytes())
     }
 }
 
@@ -186,28 +122,6 @@ impl MemoryGrow {
     }
 }
 
-impl WireEncode for MemoryGrow {
-    fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        if out.len() < 12 {
-            return Err(CodecError::Truncated);
-        }
-        out[0..4].copy_from_slice(&self.previous_pages.to_be_bytes());
-        out[4..8].copy_from_slice(&self.requested_pages.to_be_bytes());
-        out[8..12].copy_from_slice(&self.max_pages.to_be_bytes());
-        Ok(12)
-    }
-}
-
-impl WirePayload for MemoryGrow {
-    type Decoded<'a> = Self;
-
-    wire_payload_via_decode!();
-
-    fn decode_payload<'a>(input: Payload<'a>) -> Result<Self::Decoded<'a>, CodecError> {
-        Self::decode(input.as_bytes())
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryGrowDecision {
     grant: bool,
@@ -238,69 +152,45 @@ impl MemoryGrowDecision {
     }
 }
 
-impl WireEncode for MemoryGrowDecision {
-    fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+trait TypedWasiPayload: Sized {
+    const SCHEMA_ID: u32;
+
+    fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError>;
+    fn decode_payload_bytes(bytes: &[u8]) -> Result<Self, CodecError>;
+}
+
+impl TypedWasiPayload for MemoryGrow {
+    const SCHEMA_ID: u32 = schema::MEMORY_GROW;
+
+    fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        if out.len() < 12 {
+            return Err(CodecError::Truncated);
+        }
+        out[0..4].copy_from_slice(&self.previous_pages.to_be_bytes());
+        out[4..8].copy_from_slice(&self.requested_pages.to_be_bytes());
+        out[8..12].copy_from_slice(&self.max_pages.to_be_bytes());
+        Ok(12)
+    }
+
+    fn decode_payload_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
+        Self::decode(bytes)
+    }
+}
+
+impl TypedWasiPayload for MemoryGrowDecision {
+    const SCHEMA_ID: u32 = schema::MEMORY_GROW_DECISION;
+
+    fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.is_empty() {
             return Err(CodecError::Truncated);
         }
         out[0] = u8::from(self.grant);
         Ok(1)
     }
-}
 
-impl WirePayload for MemoryGrowDecision {
-    type Decoded<'a> = Self;
-
-    wire_payload_via_decode!();
-
-    fn decode_payload<'a>(input: Payload<'a>) -> Result<Self::Decoded<'a>, CodecError> {
-        Self::decode(input.as_bytes())
+    fn decode_payload_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
+        Self::decode(bytes)
     }
-}
-
-trait TypedWasiPayload: Sized {
-    fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError>;
-    fn decode_payload_bytes(bytes: &[u8]) -> Result<Self, CodecError>;
-}
-
-macro_rules! engine_req_payload {
-    ($wrapper:ident, $payload:ty) => {
-        impl WireEncode for $wrapper {
-            fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-                self.0.encode_payload(out)
-            }
-        }
-
-        impl WirePayload for $wrapper {
-            type Decoded<'a> = Self;
-
-            wire_payload_via_decode!();
-
-            fn decode_payload<'a>(input: Payload<'a>) -> Result<Self::Decoded<'a>, CodecError> {
-                <$payload as TypedWasiPayload>::decode_payload_bytes(input.as_bytes()).map(Self)
-            }
-        }
-    };
-}
-
-macro_rules! engine_ret_payload {
-    ($wrapper:ident, $payload:ty) => {
-        impl WireEncode for $wrapper {
-            fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-                self.0.encode_payload(out)
-            }
-        }
-
-        impl WirePayload for $wrapper {
-            type Decoded<'a> = Self;
-
-            wire_payload_via_decode!();
-
-            fn decode_payload<'a>(input: Payload<'a>) -> Result<Self::Decoded<'a>, CodecError> {
-                <$payload as TypedWasiPayload>::decode_payload_bytes(input.as_bytes()).map(Self)
-            }
-        }
-    };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -381,75 +271,45 @@ pub struct PathOpenedRet(pub PathOpened);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryGrowRet(pub MemoryGrowDecision);
 
-engine_req_payload!(FdWriteReq, FdWrite);
-engine_req_payload!(FdReadReq, FdRead);
-engine_req_payload!(FdReaddirReq, FdReaddir);
-engine_req_payload!(FdFdstatGetReq, FdRequest);
-engine_req_payload!(FdPrestatGetReq, FdRequest);
-engine_req_payload!(FdPrestatDirNameReq, FdPrestatDirName);
-engine_req_payload!(FdFilestatGetReq, FdRequest);
-engine_req_payload!(FdCloseReq, FdRequest);
-engine_req_payload!(ClockResGetReq, ClockResGet);
-engine_req_payload!(ClockTimeGetReq, ClockTimeGet);
-engine_req_payload!(PollOneoffReq, PollOneoff);
-engine_req_payload!(RandomGetReq, RandomGet);
-engine_req_payload!(ArgsSizesGetReq, ArgsSizesGet);
-engine_req_payload!(ArgsGetReq, ArgsGet);
-engine_req_payload!(EnvironSizesGetReq, EnvironSizesGet);
-engine_req_payload!(EnvironGetReq, EnvironGet);
-engine_req_payload!(PathOpenReq, PathOpen);
-engine_req_payload!(PathFilestatGetReq, PathFilestatGet);
+wire_payload!(FdWriteReq, FdWrite);
+wire_payload!(FdReadReq, FdRead);
+wire_payload!(FdReaddirReq, FdReaddir);
+wire_payload!(FdFdstatGetReq, FdRequest);
+wire_payload!(FdPrestatGetReq, FdRequest);
+wire_payload!(FdPrestatDirNameReq, FdPrestatDirName);
+wire_payload!(FdFilestatGetReq, FdRequest);
+wire_payload!(FdCloseReq, FdRequest);
+wire_payload!(ClockResGetReq, ClockResGet);
+wire_payload!(ClockTimeGetReq, ClockTimeGet);
+wire_payload!(PollOneoffReq, PollOneoff);
+wire_payload!(RandomGetReq, RandomGet);
+wire_payload!(ArgsSizesGetReq, ArgsSizesGet);
+wire_payload!(ArgsGetReq, ArgsGet);
+wire_payload!(EnvironSizesGetReq, EnvironSizesGet);
+wire_payload!(EnvironGetReq, EnvironGet);
+wire_payload!(PathOpenReq, PathOpen);
+wire_payload!(PathFilestatGetReq, PathFilestatGet);
+wire_payload!(MemoryGrowReq, MemoryGrow);
 
-impl WireEncode for MemoryGrowReq {
-    fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        self.0.encode_into(out)
-    }
-}
-
-impl WirePayload for MemoryGrowReq {
-    type Decoded<'a> = Self;
-
-    wire_payload_via_decode!();
-
-    fn decode_payload<'a>(input: Payload<'a>) -> Result<Self::Decoded<'a>, CodecError> {
-        MemoryGrow::decode_payload(input).map(Self)
-    }
-}
-
-engine_ret_payload!(FdWriteDoneRet, FdWriteDone);
-engine_ret_payload!(FdReadDoneRet, FdReadDone);
-engine_ret_payload!(FdReaddirDoneRet, FdReaddirDone);
-engine_ret_payload!(FdStatRet, FdStat);
-engine_ret_payload!(FdPrestatRet, FdPrestat);
-engine_ret_payload!(FdPrestatDirNameRet, FdPrestatDirNameDone);
-engine_ret_payload!(FdFilestatRet, FileStat);
-engine_ret_payload!(PathFilestatRet, FileStat);
-engine_ret_payload!(FdClosedRet, FdClosed);
-engine_ret_payload!(ClockResolutionRet, ClockResolution);
-engine_ret_payload!(ClockTimeRet, ClockTime);
-engine_ret_payload!(PollReadyRet, PollReady);
-engine_ret_payload!(RandomDoneRet, RandomDone);
-engine_ret_payload!(ArgsSizesRet, ArgsSizes);
-engine_ret_payload!(ArgsDoneRet, ArgsDone);
-engine_ret_payload!(EnvironSizesRet, EnvironSizes);
-engine_ret_payload!(EnvironDoneRet, EnvironDone);
-engine_ret_payload!(PathOpenedRet, PathOpened);
-
-impl WireEncode for MemoryGrowRet {
-    fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        self.0.encode_into(out)
-    }
-}
-
-impl WirePayload for MemoryGrowRet {
-    type Decoded<'a> = Self;
-
-    wire_payload_via_decode!();
-
-    fn decode_payload<'a>(input: Payload<'a>) -> Result<Self::Decoded<'a>, CodecError> {
-        MemoryGrowDecision::decode_payload(input).map(Self)
-    }
-}
+wire_payload!(FdWriteDoneRet, FdWriteDone);
+wire_payload!(FdReadDoneRet, FdReadDone);
+wire_payload!(FdReaddirDoneRet, FdReaddirDone);
+wire_payload!(FdStatRet, FdStat);
+wire_payload!(FdPrestatRet, FdPrestat);
+wire_payload!(FdPrestatDirNameRet, FdPrestatDirNameDone);
+wire_payload!(FdFilestatRet, FileStat);
+wire_payload!(PathFilestatRet, FileStat);
+wire_payload!(FdClosedRet, FdClosed);
+wire_payload!(ClockResolutionRet, ClockResolution);
+wire_payload!(ClockTimeRet, ClockTime);
+wire_payload!(PollReadyRet, PollReady);
+wire_payload!(RandomDoneRet, RandomDone);
+wire_payload!(ArgsSizesRet, ArgsSizes);
+wire_payload!(ArgsDoneRet, ArgsDone);
+wire_payload!(EnvironSizesRet, EnvironSizes);
+wire_payload!(EnvironDoneRet, EnvironDone);
+wire_payload!(PathOpenedRet, PathOpened);
+wire_payload!(MemoryGrowRet, MemoryGrowDecision);
 
 pub type FdWriteReqMsg = Msg<LABEL_WASI_FD_WRITE, FdWriteReq>;
 pub type FdWriteRetMsg = Msg<LABEL_WASI_FD_WRITE_RET, FdWriteDoneRet>;
@@ -721,6 +581,16 @@ impl WasiP1IoChunk {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len()]
+    }
+
+    fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let len = self.len();
+        if out.len() < 1 + len {
+            return Err(CodecError::Truncated);
+        }
+        out[0] = len as u8;
+        out[1..1 + len].copy_from_slice(self.as_bytes());
+        Ok(1 + len)
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1088,16 +958,16 @@ impl ClockResolution {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PollOneoff {
-    timeout_tick: u64,
+    timeout_nanos: u64,
 }
 
 impl PollOneoff {
-    pub const fn new(timeout_tick: u64) -> Self {
-        Self { timeout_tick }
+    pub const fn new(timeout_nanos: u64) -> Self {
+        Self { timeout_nanos }
     }
 
-    pub const fn timeout_tick(&self) -> u64 {
-        self.timeout_tick
+    pub const fn timeout_nanos(&self) -> u64 {
+        self.timeout_nanos
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1591,8 +1461,11 @@ pub struct PollReady {
 }
 
 impl PollReady {
-    pub const fn new(ready: u8) -> Self {
-        Self { ready }
+    pub const fn new(ready: u8) -> Result<Self, CodecError> {
+        if ready > 1 {
+            return Err(CodecError::Malformed);
+        }
+        Ok(Self { ready })
     }
 
     pub const fn ready(&self) -> u8 {
@@ -1603,7 +1476,7 @@ impl PollReady {
         if bytes.len() != 1 {
             return Err(CodecError::Malformed);
         }
-        Ok(Self::new(bytes[0]))
+        Self::new(bytes[0])
     }
 }
 
@@ -1643,8 +1516,11 @@ pub struct ArgsSizes {
 }
 
 impl ArgsSizes {
-    pub const fn new(count: u8, buf_size: u8) -> Self {
-        Self { count, buf_size }
+    pub fn new(count: u8, buf_size: u8) -> Result<Self, CodecError> {
+        if buf_size as usize > WASIP1_IO_CHUNK_CAPACITY || count > buf_size {
+            return Err(CodecError::Malformed);
+        }
+        Ok(Self { count, buf_size })
     }
 
     pub const fn count(&self) -> u8 {
@@ -1659,20 +1535,42 @@ impl ArgsSizes {
         if bytes.len() != 2 {
             return Err(CodecError::Malformed);
         }
-        Ok(Self::new(bytes[0], bytes[1]))
+        Self::new(bytes[0], bytes[1])
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArgsDone {
+    count: u8,
     chunk: WasiP1IoChunk,
 }
 
 impl ArgsDone {
-    pub fn new(bytes: &[u8]) -> Result<Self, CodecError> {
+    pub fn new(args: &[&[u8]]) -> Result<Self, CodecError> {
+        let mut bytes = [0u8; WASIP1_IO_CHUNK_CAPACITY];
+        let mut len = 0usize;
+        for arg in args {
+            if arg.contains(&0) {
+                return Err(CodecError::Malformed);
+            }
+            let end = len.checked_add(arg.len()).ok_or(CodecError::Malformed)?;
+            let next = end.checked_add(1).ok_or(CodecError::Malformed)?;
+            if next > bytes.len() {
+                return Err(CodecError::Malformed);
+            }
+            bytes[len..end].copy_from_slice(arg);
+            bytes[end] = 0;
+            len = next;
+        }
+        let count = u8::try_from(args.len()).map_err(|_| CodecError::Malformed)?;
         Ok(Self {
-            chunk: WasiP1IoChunk::new(bytes)?,
+            count,
+            chunk: WasiP1IoChunk::new(&bytes[..len])?,
         })
+    }
+
+    pub(crate) const fn count(&self) -> usize {
+        self.count as usize
     }
 
     pub const fn len(&self) -> usize {
@@ -1688,7 +1586,16 @@ impl ArgsDone {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        WasiP1IoChunk::decode(bytes).map(|chunk| Self { chunk })
+        let chunk = WasiP1IoChunk::decode(bytes)?;
+        let bytes = chunk.as_bytes();
+        if !bytes.is_empty() && bytes.last() != Some(&0) {
+            return Err(CodecError::Malformed);
+        }
+        let count = bytes.iter().filter(|byte| **byte == 0).count();
+        Ok(Self {
+            count: u8::try_from(count).map_err(|_| CodecError::Malformed)?,
+            chunk,
+        })
     }
 }
 
@@ -1699,8 +1606,12 @@ pub struct EnvironSizes {
 }
 
 impl EnvironSizes {
-    pub const fn new(count: u8, buf_size: u8) -> Self {
-        Self { count, buf_size }
+    pub fn new(count: u8, buf_size: u8) -> Result<Self, CodecError> {
+        let minimum = count.checked_mul(3).ok_or(CodecError::Malformed)?;
+        if buf_size as usize > WASIP1_IO_CHUNK_CAPACITY || minimum > buf_size {
+            return Err(CodecError::Malformed);
+        }
+        Ok(Self { count, buf_size })
     }
 
     pub const fn count(&self) -> u8 {
@@ -1715,20 +1626,48 @@ impl EnvironSizes {
         if bytes.len() != 2 {
             return Err(CodecError::Malformed);
         }
-        Ok(Self::new(bytes[0], bytes[1]))
+        Self::new(bytes[0], bytes[1])
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnvironDone {
+    count: u8,
     chunk: WasiP1IoChunk,
 }
 
 impl EnvironDone {
-    pub fn new(bytes: &[u8]) -> Result<Self, CodecError> {
+    pub fn new(environ: &[(&[u8], &[u8])]) -> Result<Self, CodecError> {
+        let mut bytes = [0u8; WASIP1_IO_CHUNK_CAPACITY];
+        let mut len = 0usize;
+        for (key, value) in environ {
+            if key.is_empty() || key.contains(&0) || key.contains(&b'=') || value.contains(&0) {
+                return Err(CodecError::Malformed);
+            }
+            let key_end = len.checked_add(key.len()).ok_or(CodecError::Malformed)?;
+            let value_start = key_end.checked_add(1).ok_or(CodecError::Malformed)?;
+            let value_end = value_start
+                .checked_add(value.len())
+                .ok_or(CodecError::Malformed)?;
+            let next = value_end.checked_add(1).ok_or(CodecError::Malformed)?;
+            if next > bytes.len() {
+                return Err(CodecError::Malformed);
+            }
+            bytes[len..key_end].copy_from_slice(key);
+            bytes[key_end] = b'=';
+            bytes[value_start..value_end].copy_from_slice(value);
+            bytes[value_end] = 0;
+            len = next;
+        }
+        let count = u8::try_from(environ.len()).map_err(|_| CodecError::Malformed)?;
         Ok(Self {
-            chunk: WasiP1IoChunk::new(bytes)?,
+            count,
+            chunk: WasiP1IoChunk::new(&bytes[..len])?,
         })
+    }
+
+    pub(crate) const fn count(&self) -> usize {
+        self.count as usize
     }
 
     pub const fn len(&self) -> usize {
@@ -1744,27 +1683,37 @@ impl EnvironDone {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        WasiP1IoChunk::decode(bytes).map(|chunk| Self { chunk })
-    }
-}
-
-impl TypedWasiPayload for WasiP1IoChunk {
-    fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let len = self.len();
-        if out.len() < 1 + len {
-            return Err(CodecError::Truncated);
+        let chunk = WasiP1IoChunk::decode(bytes)?;
+        let bytes = chunk.as_bytes();
+        if !bytes.is_empty() && bytes.last() != Some(&0) {
+            return Err(CodecError::Malformed);
         }
-        out[0] = len as u8;
-        out[1..1 + len].copy_from_slice(self.as_bytes());
-        Ok(1 + len)
-    }
-
-    fn decode_payload_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
-        Self::decode(bytes)
+        let mut count = 0usize;
+        for entry in bytes
+            .split(|byte| *byte == 0)
+            .take_while(|entry| !entry.is_empty())
+        {
+            let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
+                return Err(CodecError::Malformed);
+            };
+            if separator == 0 {
+                return Err(CodecError::Malformed);
+            }
+            count += 1;
+        }
+        if count != bytes.iter().filter(|byte| **byte == 0).count() {
+            return Err(CodecError::Malformed);
+        }
+        Ok(Self {
+            count: u8::try_from(count).map_err(|_| CodecError::Malformed)?,
+            chunk,
+        })
     }
 }
 
 impl TypedWasiPayload for FdWrite {
+    const SCHEMA_ID: u32 = schema::FD_WRITE;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let len = self.len();
         if out.len() < 2 + len {
@@ -1782,6 +1731,8 @@ impl TypedWasiPayload for FdWrite {
 }
 
 impl TypedWasiPayload for FdRead {
+    const SCHEMA_ID: u32 = schema::FD_READ;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 2 {
             return Err(CodecError::Truncated);
@@ -1797,6 +1748,8 @@ impl TypedWasiPayload for FdRead {
 }
 
 impl TypedWasiPayload for FdReaddir {
+    const SCHEMA_ID: u32 = schema::FD_READDIR;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 10 {
             return Err(CodecError::Truncated);
@@ -1813,6 +1766,8 @@ impl TypedWasiPayload for FdReaddir {
 }
 
 impl TypedWasiPayload for FdRequest {
+    const SCHEMA_ID: u32 = schema::FD_REQUEST;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let Some(first) = out.first_mut() else {
             return Err(CodecError::Truncated);
@@ -1827,6 +1782,8 @@ impl TypedWasiPayload for FdRequest {
 }
 
 impl TypedWasiPayload for FdPrestatDirName {
+    const SCHEMA_ID: u32 = schema::FD_PRESTAT_DIR_NAME;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 2 {
             return Err(CodecError::Truncated);
@@ -1842,6 +1799,8 @@ impl TypedWasiPayload for FdPrestatDirName {
 }
 
 impl TypedWasiPayload for PathOpen {
+    const SCHEMA_ID: u32 = schema::PATH_OPEN;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let len = self.len();
         if out.len() < 10 + len {
@@ -1860,6 +1819,8 @@ impl TypedWasiPayload for PathOpen {
 }
 
 impl TypedWasiPayload for PathFilestatGet {
+    const SCHEMA_ID: u32 = schema::PATH_FILESTAT_GET;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let len = self.len();
         if out.len() < 6 + len {
@@ -1878,6 +1839,8 @@ impl TypedWasiPayload for PathFilestatGet {
 }
 
 impl TypedWasiPayload for ClockResGet {
+    const SCHEMA_ID: u32 = schema::CLOCK_RES_GET;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let Some(first) = out.first_mut() else {
             return Err(CodecError::Truncated);
@@ -1892,6 +1855,8 @@ impl TypedWasiPayload for ClockResGet {
 }
 
 impl TypedWasiPayload for ClockTimeGet {
+    const SCHEMA_ID: u32 = schema::CLOCK_TIME_GET;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 9 {
             return Err(CodecError::Truncated);
@@ -1907,11 +1872,13 @@ impl TypedWasiPayload for ClockTimeGet {
 }
 
 impl TypedWasiPayload for PollOneoff {
+    const SCHEMA_ID: u32 = schema::POLL_ONEOFF;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 8 {
             return Err(CodecError::Truncated);
         }
-        out[..8].copy_from_slice(&self.timeout_tick().to_be_bytes());
+        out[..8].copy_from_slice(&self.timeout_nanos().to_be_bytes());
         Ok(8)
     }
 
@@ -1921,6 +1888,8 @@ impl TypedWasiPayload for PollOneoff {
 }
 
 impl TypedWasiPayload for RandomGet {
+    const SCHEMA_ID: u32 = schema::RANDOM_GET;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let Some(first) = out.first_mut() else {
             return Err(CodecError::Truncated);
@@ -1935,6 +1904,8 @@ impl TypedWasiPayload for RandomGet {
 }
 
 impl TypedWasiPayload for ArgsSizesGet {
+    const SCHEMA_ID: u32 = schema::ARGS_SIZES_GET;
+
     fn encode_payload(&self, _out: &mut [u8]) -> Result<usize, CodecError> {
         Ok(0)
     }
@@ -1945,6 +1916,8 @@ impl TypedWasiPayload for ArgsSizesGet {
 }
 
 impl TypedWasiPayload for ArgsGet {
+    const SCHEMA_ID: u32 = schema::ARGS_GET;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let Some(first) = out.first_mut() else {
             return Err(CodecError::Truncated);
@@ -1959,6 +1932,8 @@ impl TypedWasiPayload for ArgsGet {
 }
 
 impl TypedWasiPayload for EnvironSizesGet {
+    const SCHEMA_ID: u32 = schema::ENVIRON_SIZES_GET;
+
     fn encode_payload(&self, _out: &mut [u8]) -> Result<usize, CodecError> {
         Ok(0)
     }
@@ -1969,6 +1944,8 @@ impl TypedWasiPayload for EnvironSizesGet {
 }
 
 impl TypedWasiPayload for EnvironGet {
+    const SCHEMA_ID: u32 = schema::ENVIRON_GET;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let Some(first) = out.first_mut() else {
             return Err(CodecError::Truncated);
@@ -1983,6 +1960,8 @@ impl TypedWasiPayload for EnvironGet {
 }
 
 impl TypedWasiPayload for FdWriteDone {
+    const SCHEMA_ID: u32 = schema::FD_WRITE_DONE;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 4 {
             return Err(CodecError::Truncated);
@@ -1999,6 +1978,8 @@ impl TypedWasiPayload for FdWriteDone {
 }
 
 impl TypedWasiPayload for FdReadDone {
+    const SCHEMA_ID: u32 = schema::FD_READ_DONE;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let len = self.len();
         if out.len() < 4 + len {
@@ -2017,6 +1998,8 @@ impl TypedWasiPayload for FdReadDone {
 }
 
 impl TypedWasiPayload for FdReaddirDone {
+    const SCHEMA_ID: u32 = schema::FD_READDIR_DONE;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let len = self.len();
         if out.len() < 4 + len {
@@ -2035,6 +2018,8 @@ impl TypedWasiPayload for FdReaddirDone {
 }
 
 impl TypedWasiPayload for FdStat {
+    const SCHEMA_ID: u32 = schema::FD_STAT;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 4 {
             return Err(CodecError::Truncated);
@@ -2051,6 +2036,8 @@ impl TypedWasiPayload for FdStat {
 }
 
 impl TypedWasiPayload for FdPrestat {
+    const SCHEMA_ID: u32 = schema::FD_PRESTAT;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 4 {
             return Err(CodecError::Truncated);
@@ -2067,6 +2054,8 @@ impl TypedWasiPayload for FdPrestat {
 }
 
 impl TypedWasiPayload for FdPrestatDirNameDone {
+    const SCHEMA_ID: u32 = schema::FD_PRESTAT_DIR_NAME_DONE;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let len = self.len();
         if out.len() < 4 + len {
@@ -2085,6 +2074,8 @@ impl TypedWasiPayload for FdPrestatDirNameDone {
 }
 
 impl TypedWasiPayload for FileStat {
+    const SCHEMA_ID: u32 = schema::FILE_STAT;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 11 {
             return Err(CodecError::Truncated);
@@ -2101,6 +2092,8 @@ impl TypedWasiPayload for FileStat {
 }
 
 impl TypedWasiPayload for FdClosed {
+    const SCHEMA_ID: u32 = schema::FD_CLOSED;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 3 {
             return Err(CodecError::Truncated);
@@ -2116,6 +2109,8 @@ impl TypedWasiPayload for FdClosed {
 }
 
 impl TypedWasiPayload for ClockResolution {
+    const SCHEMA_ID: u32 = schema::CLOCK_RESOLUTION;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 8 {
             return Err(CodecError::Truncated);
@@ -2130,6 +2125,8 @@ impl TypedWasiPayload for ClockResolution {
 }
 
 impl TypedWasiPayload for ClockTime {
+    const SCHEMA_ID: u32 = schema::CLOCK_TIME;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 8 {
             return Err(CodecError::Truncated);
@@ -2144,6 +2141,8 @@ impl TypedWasiPayload for ClockTime {
 }
 
 impl TypedWasiPayload for PollReady {
+    const SCHEMA_ID: u32 = schema::POLL_READY;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let Some(first) = out.first_mut() else {
             return Err(CodecError::Truncated);
@@ -2158,8 +2157,10 @@ impl TypedWasiPayload for PollReady {
 }
 
 impl TypedWasiPayload for RandomDone {
+    const SCHEMA_ID: u32 = schema::RANDOM_DONE;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        self.chunk.encode_payload(out)
+        self.chunk.encode(out)
     }
 
     fn decode_payload_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -2168,6 +2169,8 @@ impl TypedWasiPayload for RandomDone {
 }
 
 impl TypedWasiPayload for ArgsSizes {
+    const SCHEMA_ID: u32 = schema::ARGS_SIZES;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 2 {
             return Err(CodecError::Truncated);
@@ -2183,8 +2186,10 @@ impl TypedWasiPayload for ArgsSizes {
 }
 
 impl TypedWasiPayload for ArgsDone {
+    const SCHEMA_ID: u32 = schema::ARGS_DONE;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        self.chunk.encode_payload(out)
+        self.chunk.encode(out)
     }
 
     fn decode_payload_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -2193,6 +2198,8 @@ impl TypedWasiPayload for ArgsDone {
 }
 
 impl TypedWasiPayload for EnvironSizes {
+    const SCHEMA_ID: u32 = schema::ENVIRON_SIZES;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 2 {
             return Err(CodecError::Truncated);
@@ -2208,8 +2215,10 @@ impl TypedWasiPayload for EnvironSizes {
 }
 
 impl TypedWasiPayload for EnvironDone {
+    const SCHEMA_ID: u32 = schema::ENVIRON_DONE;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        self.chunk.encode_payload(out)
+        self.chunk.encode(out)
     }
 
     fn decode_payload_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -2218,6 +2227,8 @@ impl TypedWasiPayload for EnvironDone {
 }
 
 impl TypedWasiPayload for PathOpened {
+    const SCHEMA_ID: u32 = schema::PATH_OPENED;
+
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         if out.len() < 4 {
             return Err(CodecError::Truncated);
@@ -2237,57 +2248,35 @@ impl TypedWasiPayload for PathOpened {
 mod tests {
     use super::*;
 
-    #[test]
-    fn budget_run_wire_is_fuel_only() {
-        let run = BudgetRun::new(0x1234, 0x5678, 0x9abc_def0);
-        let mut out = [0u8; 16];
-
-        assert_eq!(run.encode_into(&mut out), Ok(8));
-        assert_eq!(&out[..8], &[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
-        assert_eq!(
-            BudgetRun::decode(&out[..8]),
-            Ok(BudgetRun::new(0x1234, 0x5678, 0x9abc_def0))
-        );
-        assert!(matches!(
-            run.encode_into(&mut [0u8; 7]),
-            Err(CodecError::Truncated)
-        ));
-        assert!(matches!(
-            BudgetRun::decode(&out[..9]),
-            Err(CodecError::Malformed)
-        ));
+    fn decode<'a, P: WirePayload>(bytes: &'a [u8]) -> Result<P::Decoded<'a>, CodecError> {
+        let payload = Payload::new(bytes);
+        P::validate_payload(payload)?;
+        Ok(P::decode_validated_payload(payload))
     }
 
     #[test]
     fn memory_grow_request_and_decision_are_typed_wire_states() {
         let request = MemoryGrow::new(1, 2, 4);
+        let request = MemoryGrowReq(request);
         let mut request_bytes = [0u8; 12];
         let mut decision_bytes = [0u8; 1];
 
         assert_eq!(request.encode_into(&mut request_bytes), Ok(12));
         assert_eq!(request_bytes, [0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 4]);
-        assert_eq!(
-            <MemoryGrow as WirePayload>::decode_payload(Payload::new(&request_bytes)),
-            Ok(request)
-        );
-        assert!(request.would_fit());
+        assert_eq!(decode::<MemoryGrowReq>(&request_bytes), Ok(request));
+        assert!(request.0.would_fit());
         assert!(!MemoryGrow::new(3, 2, 4).would_fit());
 
-        assert_eq!(
-            MemoryGrowDecision::grant().encode_into(&mut decision_bytes),
-            Ok(1)
-        );
+        let grant = MemoryGrowRet(MemoryGrowDecision::grant());
+        assert_eq!(grant.encode_into(&mut decision_bytes), Ok(1));
         assert_eq!(decision_bytes, [1]);
+        assert_eq!(decode::<MemoryGrowRet>(&decision_bytes), Ok(grant));
         assert_eq!(
-            <MemoryGrowDecision as WirePayload>::decode_payload(Payload::new(&decision_bytes)),
-            Ok(MemoryGrowDecision::grant())
-        );
-        assert_eq!(
-            <MemoryGrowDecision as WirePayload>::decode_payload(Payload::new(&[0])),
-            Ok(MemoryGrowDecision::reject())
+            decode::<MemoryGrowRet>(&[0]),
+            Ok(MemoryGrowRet(MemoryGrowDecision::reject()))
         );
         assert!(matches!(
-            <MemoryGrowDecision as WirePayload>::decode_payload(Payload::new(&[2])),
+            decode::<MemoryGrowRet>(&[2]),
             Err(CodecError::Malformed)
         ));
     }
@@ -2298,81 +2287,147 @@ mod tests {
         let request = FdWriteReq(FdWrite::new(4, b"G").expect("fd_write request"));
         assert_eq!(request.encode_into(&mut write), Ok(3));
         assert_eq!(&write[..3], &[4, 1, b'G']);
-        assert_eq!(
-            <FdWriteReq as WirePayload>::decode_payload(Payload::new(&write[..3])),
-            Ok(request)
-        );
+        assert_eq!(decode::<FdWriteReq>(&write[..3]), Ok(request));
 
         let mut poll = [0u8; 8];
         let request = PollOneoffReq(PollOneoff::new(20));
         assert_eq!(request.encode_into(&mut poll), Ok(8));
         assert_eq!(poll, 20u64.to_be_bytes());
-        assert_eq!(
-            <PollOneoffReq as WirePayload>::decode_payload(Payload::new(&poll)),
-            Ok(request)
-        );
+        assert_eq!(decode::<PollOneoffReq>(&poll), Ok(request));
 
         let mut written = [0u8; 4];
         let done = FdWriteDoneRet(FdWriteDone::new(4, 1));
         assert_eq!(done.encode_into(&mut written), Ok(4));
         assert_eq!(&written, &[4, 1, 0, 0]);
-        assert_eq!(
-            <FdWriteDoneRet as WirePayload>::decode_payload(Payload::new(&written)),
-            Ok(done)
-        );
+        assert_eq!(decode::<FdWriteDoneRet>(&written), Ok(done));
 
         let mut read_done = [0u8; 4];
         let done = FdReadDoneRet(FdReadDone::new_with_errno(4, b"", 8).expect("fd_read done"));
         assert_eq!(done.encode_into(&mut read_done), Ok(4));
         assert_eq!(read_done, [4, 0, 8, 0]);
-        assert_eq!(
-            <FdReadDoneRet as WirePayload>::decode_payload(Payload::new(&read_done)),
-            Ok(done)
-        );
+        assert_eq!(decode::<FdReadDoneRet>(&read_done), Ok(done));
 
         let mut stat = [0u8; 4];
         let done = FdStatRet(FdStat::new_with_errno(4, MemRights::Read, 8));
         assert_eq!(done.encode_into(&mut stat), Ok(4));
         assert_eq!(stat, [4, MemRights::Read.tag(), 0, 8]);
-        assert_eq!(
-            <FdStatRet as WirePayload>::decode_payload(Payload::new(&stat)),
-            Ok(done)
-        );
+        assert_eq!(decode::<FdStatRet>(&stat), Ok(done));
 
         let mut closed = [0u8; 3];
         let done = FdClosedRet(FdClosed::new_with_errno(4, 8));
         assert_eq!(done.encode_into(&mut closed), Ok(3));
         assert_eq!(closed, [4, 0, 8]);
-        assert_eq!(
-            <FdClosedRet as WirePayload>::decode_payload(Payload::new(&closed)),
-            Ok(done)
-        );
+        assert_eq!(decode::<FdClosedRet>(&closed), Ok(done));
 
         let mut ready = [0u8; 1];
-        let done = PollReadyRet(PollReady::new(1));
+        let done = PollReadyRet(PollReady::new(1).expect("one ready event"));
         assert_eq!(done.encode_into(&mut ready), Ok(1));
         assert_eq!(ready, [1]);
+        assert_eq!(decode::<PollReadyRet>(&ready), Ok(done));
         assert_eq!(
-            <PollReadyRet as WirePayload>::decode_payload(Payload::new(&ready)),
-            Ok(done)
+            decode::<PollReadyRet>(&[2]),
+            Err(CodecError::Malformed),
+            "the one-subscription profile must reject impossible event counts"
         );
 
         let unit = ArgsSizesGetReq(ArgsSizesGet);
         let mut out = [0xffu8; 1];
         assert_eq!(unit.encode_into(&mut out), Ok(0));
-        assert_eq!(
-            <ArgsSizesGetReq as WirePayload>::decode_payload(Payload::new(&[])),
-            Ok(unit)
-        );
+        assert_eq!(decode::<ArgsSizesGetReq>(&[]), Ok(unit));
         assert!(matches!(
-            <ArgsSizesGetReq as WirePayload>::decode_payload(Payload::new(&[0])),
+            decode::<ArgsSizesGetReq>(&[0]),
             Err(CodecError::Malformed)
         ));
+    }
+
+    #[test]
+    fn schema_registry_is_unique_and_protocol_local() {
+        for (index, schema_id) in schema::ALL.iter().copied().enumerate() {
+            assert_eq!(schema_id & 0xffff_0000, 0x5750_0000);
+            assert!(!schema::ALL[..index].contains(&schema_id));
+        }
+
+        assert_eq!(
+            <FdFdstatGetReq as WirePayload>::SCHEMA_ID,
+            <FdCloseReq as WirePayload>::SCHEMA_ID
+        );
+        assert_eq!(
+            <FdFilestatRet as WirePayload>::SCHEMA_ID,
+            <PathFilestatRet as WirePayload>::SCHEMA_ID
+        );
     }
 
     #[test]
     fn io_chunk_wire_is_inline_bytes_only() {
         let inline = WasiP1IoChunk::decode(&[2, b'o', b'k']).expect("inline chunk");
         assert_eq!(inline.as_bytes(), b"ok");
+    }
+
+    #[test]
+    fn payload_capacities_accept_the_exact_boundary_and_reject_one_more() {
+        let io = [0xa5; WASIP1_IO_CHUNK_CAPACITY];
+        let request = FdWriteReq(FdWrite::new(7, &io).expect("maximum I/O payload"));
+        let mut encoded = [0u8; WASIP1_IO_CHUNK_CAPACITY + 2];
+
+        assert_eq!(request.encode_into(&mut encoded), Ok(encoded.len()));
+        assert_eq!(decode::<FdWriteReq>(&encoded), Ok(request));
+        assert!(matches!(
+            FdWrite::new(7, &[0; WASIP1_IO_CHUNK_CAPACITY + 1]),
+            Err(CodecError::Malformed)
+        ));
+
+        let path = [b'p'; WASIP1_PATH_CHUNK_CAPACITY];
+        assert!(PathOpen::new(3, 0, &path).is_ok());
+        assert!(matches!(
+            PathOpen::new(3, 0, &[b'p'; WASIP1_PATH_CHUNK_CAPACITY + 1]),
+            Err(CodecError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn argument_and_environment_payloads_have_one_canonical_list_shape() {
+        assert!(ArgsSizes::new(2, 2).is_ok());
+        assert!(matches!(ArgsSizes::new(2, 1), Err(CodecError::Malformed)));
+        assert!(matches!(
+            ArgsSizes::new(1, (WASIP1_IO_CHUNK_CAPACITY + 1) as u8),
+            Err(CodecError::Malformed)
+        ));
+        assert!(EnvironSizes::new(2, 6).is_ok());
+        assert!(matches!(
+            EnvironSizes::new(2, 5),
+            Err(CodecError::Malformed)
+        ));
+
+        let args = ArgsDoneRet(ArgsDone::new(&[b"", b"hibana"]).expect("argument list"));
+        let mut encoded_args = [0u8; 9];
+        assert_eq!(args.encode_into(&mut encoded_args), Ok(9));
+        assert_eq!(
+            &encoded_args,
+            &[8, 0, b'h', b'i', b'b', b'a', b'n', b'a', 0]
+        );
+        assert_eq!(decode::<ArgsDoneRet>(&encoded_args), Ok(args));
+        assert!(matches!(
+            ArgsDone::new(&[b"invalid\0argument"]),
+            Err(CodecError::Malformed)
+        ));
+        assert!(matches!(
+            decode::<ArgsDoneRet>(&[1, b'x']),
+            Err(CodecError::Malformed)
+        ));
+
+        let environ =
+            EnvironDoneRet(EnvironDone::new(&[(b"MODE", b"test=1")]).expect("environment"));
+        let mut encoded_environ = [0u8; 13];
+        assert_eq!(environ.encode_into(&mut encoded_environ), Ok(13));
+        assert_eq!(&encoded_environ, b"\x0cMODE=test=1\0");
+        assert_eq!(decode::<EnvironDoneRet>(&encoded_environ), Ok(environ));
+        assert!(matches!(
+            EnvironDone::new(&[(b"", b"value")]),
+            Err(CodecError::Malformed)
+        ));
+        assert!(matches!(
+            decode::<EnvironDoneRet>(&[4, b'N', b'O', b'P', 0]),
+            Err(CodecError::Malformed)
+        ));
     }
 }

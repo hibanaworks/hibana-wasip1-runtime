@@ -172,8 +172,10 @@ impl Transport for InProcessTransport {
             frame.target_role,
             frame.label,
         );
-        let bytes: &'a [u8] = unsafe { &*(frame.payload.as_slice() as *const [u8]) };
-        Poll::Ready(Ok(ReceivedFrame::framed(header, Payload::new(bytes))))
+        Poll::Ready(Ok(ReceivedFrame::framed(
+            header,
+            Payload::new(frame.payload.as_slice()),
+        )))
     }
 
     fn requeue<'a>(&self, rx: &mut Self::Rx<'a>) -> Result<(), TransportError> {

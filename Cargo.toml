@@ -16,13 +16,14 @@ include = [
     "/README.md",
     "/LICENSE-APACHE",
     "/LICENSE-MIT",
+    "/rust-toolchain.toml",
     "/src/**",
     "/examples/**",
     "/scripts/**",
 ]
 
 [dependencies]
-hibana = { version = "0.9.4", default-features = false }
+hibana = { version = "0.9.6", default-features = false }
 
 [dev-dependencies]
 futures-executor = "0.3"
