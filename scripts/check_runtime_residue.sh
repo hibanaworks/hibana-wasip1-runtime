@@ -4,6 +4,11 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
+if ! command -v rg >/dev/null 2>&1; then
+    printf '%s\n' "ripgrep is required for runtime residue verification" >&2
+    exit 1
+fi
+
 fail=0
 
 check_absent() {
