@@ -199,7 +199,7 @@ async fn run_shell_app_engine(
     loop {
         match guest.resume_wasi_boundary(protocol::BudgetRun::new(run_id, 0, 100_000))? {
             WasiBoundaryStep::ImportPending(pending) => {
-                complete_pending_import(guest, shell_app_endpoint, pending).await?;
+                complete_pending_import(shell_app_endpoint, pending).await?;
             }
             WasiBoundaryStep::MemoryGrowPending(pending) => {
                 let request = pending.request();
@@ -209,7 +209,7 @@ async fn run_shell_app_engine(
                 let decision = shell_app_endpoint
                     .recv::<protocol::MemoryGrowRetMsg>()
                     .await?;
-                pending.complete(guest, decision)?;
+                pending.complete(decision)?;
             }
             WasiBoundaryStep::BudgetExpired(_) => {
                 run_id = run_id.wrapping_add(1);
@@ -222,17 +222,16 @@ async fn run_shell_app_engine(
 }
 
 async fn complete_pending_import(
-    guest: &mut HibanaWasiGuest<'_>,
     shell_app_endpoint: &mut hibana::Endpoint<'_, SHELL_APP_ROLE>,
-    pending: WasiImportPending,
+    pending: WasiImportPending<'_, '_>,
 ) -> DemoResult<()> {
-    match pending.request() {
+    match pending.request()? {
         WasiImportRequest::FdWrite(request) => {
             shell_app_endpoint
                 .send::<protocol::FdWriteReqMsg>(&request)
                 .await?;
             let completion = shell_app_endpoint.recv::<protocol::FdWriteRetMsg>().await?;
-            pending.complete(guest, WasiImportCompletion::FdWrite(completion))?;
+            pending.complete(WasiImportCompletion::FdWrite(completion))?;
         }
         WasiImportRequest::FdWriteObject(request) => {
             shell_app_endpoint
@@ -241,14 +240,14 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::FdWriteObjectRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::FdWriteObject(completion))?;
+            pending.complete(WasiImportCompletion::FdWriteObject(completion))?;
         }
         WasiImportRequest::FdRead(request) => {
             shell_app_endpoint
                 .send::<protocol::FdReadReqMsg>(&request)
                 .await?;
             let completion = shell_app_endpoint.recv::<protocol::FdReadRetMsg>().await?;
-            pending.complete(guest, WasiImportCompletion::FdRead(completion))?;
+            pending.complete(WasiImportCompletion::FdRead(completion))?;
         }
         WasiImportRequest::FdReaddir(request) => {
             shell_app_endpoint
@@ -257,7 +256,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::FdReaddirRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::FdReaddir(completion))?;
+            pending.complete(WasiImportCompletion::FdReaddir(completion))?;
         }
         WasiImportRequest::PathOpen(request) => {
             shell_app_endpoint
@@ -266,7 +265,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::PathOpenRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::PathOpen(completion))?;
+            pending.complete(WasiImportCompletion::PathOpen(completion))?;
         }
         WasiImportRequest::FdPrestatGet(request) => {
             shell_app_endpoint
@@ -275,7 +274,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::FdPrestatGetRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::FdPrestatGet(completion))?;
+            pending.complete(WasiImportCompletion::FdPrestatGet(completion))?;
         }
         WasiImportRequest::FdPrestatDirName(request) => {
             shell_app_endpoint
@@ -284,7 +283,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::FdPrestatDirNameRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::FdPrestatDirName(completion))?;
+            pending.complete(WasiImportCompletion::FdPrestatDirName(completion))?;
         }
         WasiImportRequest::FdFilestatGet(request) => {
             shell_app_endpoint
@@ -293,7 +292,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::FdFilestatGetRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::FdFilestatGet(completion))?;
+            pending.complete(WasiImportCompletion::FdFilestatGet(completion))?;
         }
         WasiImportRequest::ArgsSizesGet(request) => {
             shell_app_endpoint
@@ -302,14 +301,14 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::ArgsSizesGetRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::ArgsSizesGet(completion))?;
+            pending.complete(WasiImportCompletion::ArgsSizesGet(completion))?;
         }
         WasiImportRequest::ArgsGet(request) => {
             shell_app_endpoint
                 .send::<protocol::ArgsGetReqMsg>(&request)
                 .await?;
             let completion = shell_app_endpoint.recv::<protocol::ArgsGetRetMsg>().await?;
-            pending.complete(guest, WasiImportCompletion::ArgsGet(completion))?;
+            pending.complete(WasiImportCompletion::ArgsGet(completion))?;
         }
         WasiImportRequest::EnvironSizesGet(request) => {
             shell_app_endpoint
@@ -318,7 +317,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::EnvironSizesGetRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::EnvironSizesGet(completion))?;
+            pending.complete(WasiImportCompletion::EnvironSizesGet(completion))?;
         }
         WasiImportRequest::EnvironGet(request) => {
             shell_app_endpoint
@@ -327,7 +326,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::EnvironGetRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::EnvironGet(completion))?;
+            pending.complete(WasiImportCompletion::EnvironGet(completion))?;
         }
         WasiImportRequest::FdFdstatGet(request) => {
             shell_app_endpoint
@@ -336,7 +335,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::FdFdstatGetRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::FdFdstatGet(completion))?;
+            pending.complete(WasiImportCompletion::FdFdstatGet(completion))?;
         }
         WasiImportRequest::PathFilestatGet(request) => {
             shell_app_endpoint
@@ -345,14 +344,14 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::PathFilestatGetRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::PathFilestatGet(completion))?;
+            pending.complete(WasiImportCompletion::PathFilestatGet(completion))?;
         }
         WasiImportRequest::FdClose(request) => {
             shell_app_endpoint
                 .send::<protocol::FdCloseReqMsg>(&request)
                 .await?;
             let completion = shell_app_endpoint.recv::<protocol::FdCloseRetMsg>().await?;
-            pending.complete(guest, WasiImportCompletion::FdClose(completion))?;
+            pending.complete(WasiImportCompletion::FdClose(completion))?;
         }
         WasiImportRequest::ClockResGet(request) => {
             shell_app_endpoint
@@ -361,7 +360,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::ClockResGetRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::ClockResGet(completion))?;
+            pending.complete(WasiImportCompletion::ClockResGet(completion))?;
         }
         WasiImportRequest::ClockTimeGet(request) => {
             shell_app_endpoint
@@ -370,7 +369,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::ClockTimeGetRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::ClockTimeGet(completion))?;
+            pending.complete(WasiImportCompletion::ClockTimeGet(completion))?;
         }
         WasiImportRequest::PollOneoff(request) => {
             shell_app_endpoint
@@ -379,7 +378,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::PollOneoffRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::PollOneoff(completion))?;
+            pending.complete(WasiImportCompletion::PollOneoff(completion))?;
         }
         WasiImportRequest::RandomGet(request) => {
             shell_app_endpoint
@@ -388,7 +387,7 @@ async fn complete_pending_import(
             let completion = shell_app_endpoint
                 .recv::<protocol::RandomGetRetMsg>()
                 .await?;
-            pending.complete(guest, WasiImportCompletion::RandomGet(completion))?;
+            pending.complete(WasiImportCompletion::RandomGet(completion))?;
         }
     }
     Ok(())

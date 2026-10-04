@@ -14,15 +14,33 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 1
       RUST_TEST_THREADS: 1
+    defaults:
+      run:
+        working-directory: hibana-wasip1-runtime
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: hibana-wasip1-runtime
+      - name: Check out the Hibana dependency and Lean workspace
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hibanaworks/hibana
+          ref: 404944869f35b06b76c3755c8a6c7693c715c2dd
+          path: hibana
       - name: Install release tools
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep
-          rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
-          rustup target add --toolchain 1.95.0 thumbv6m-none-eabi wasm32-wasip1
+          rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt --component llvm-tools-preview
+          rustup target add --toolchain 1.95.0 thumbv8m.main-none-eabi wasm32-wasip1
+      - name: Install Lean
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/elan" toolchain install leanprover/lean4:v4.30.0
       - name: Install Miri toolchain
         run: rustup toolchain install nightly-2026-05-28 --profile minimal --component miri --component rust-src
+      - name: Fetch locked dependencies for offline checks
+        run: cargo +1.95.0 fetch --locked
       - name: Run quality gates
         run: bash scripts/check_runtime_gates.sh

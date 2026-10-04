@@ -98,6 +98,11 @@ Unsupported imports fail closed while the import plan is built. Known imports
 with wrong signatures fail before guest execution begins. Completion is linear:
 `WasiImportPending::complete(...)` and `WasiMemoryGrowPending::complete(...)`
 consume the pending value, so a response cannot be reused for a later import.
+Each token retains an exclusive borrow of its original guest and fd bindings.
+Completion takes only the typed response; it cannot be directed to another guest,
+and execution cannot resume while the token remains live. `request()` on an
+import returns a validated borrowed view; the token stores the VM call itself,
+without a second call enum or a retained copy of the protocol request.
 `HibanaWasiGuestStorage` is one-shot even when initialization fails, so partially
 initialized in-place storage is never retried.
 Every message payload has a stable Hibana `SCHEMA_ID`; malformed or
@@ -138,8 +143,19 @@ path_open             poll_oneoff          proc_exit
 random_get
 ```
 
-`poll_oneoff` currently accepts one clock subscription and carries its exact
-WASI nanosecond timeout; the answering role owns any scheduler-unit conversion.
+`poll_oneoff` accepts 1–16 WASI subscriptions: clocks and fd read/write
+interests. Borrowed 48-byte subscription records retain userdata, clock ID,
+nanosecond timeout/precision and relative/absolute flags. Borrowed 32-byte event
+records carry the selected userdata/kind, errno, nbytes and hangup flag. Only
+meaningful ABI fields enter the canonical wire encoding; padding is zero.
+Replies are nonempty ordered subsequences of requested occurrences, including
+duplicate userdata. A reply consumes each matching occurrence once.
+The complete input and reserved output ranges, output count and disjoint event/
+count regions are validated before any guest write. Input/output aliasing is
+allowed after validation. Readiness is correspondence data, not I/O authority;
+fd rights, incarnation and physical readiness remain the answering owner's job.
+The format replaces the scalar poll format and uses distinct schema identities.
+There is one bounded `no_std` path for Pico and host users.
 I/O completion payloads carry at most 96 bytes, path payloads at most 40 bytes,
 and the fd table holds 16 live bindings while accepting any `u8` fd number.
 
@@ -191,16 +207,16 @@ async fn run_guest<const ROLE: u8>(
     loop {
         match guest.resume_wasi_boundary(protocol::BudgetRun::new(run_id, 0, 100_000))? {
             WasiBoundaryStep::ImportPending(pending) => {
-                match pending.request() {
+                match pending.request()? {
                     WasiImportRequest::FdRead(request) => {
                         endpoint.send::<protocol::FdReadReqMsg>(&request).await?;
                         let done = endpoint.recv::<protocol::FdReadRetMsg>().await?;
-                        pending.complete(guest, WasiImportCompletion::FdRead(done))?;
+                        pending.complete(WasiImportCompletion::FdRead(done))?;
                     }
                     WasiImportRequest::FdWriteObject(request) => {
                         endpoint.send::<protocol::FdWriteObjectReqMsg>(&request).await?;
                         let done = endpoint.recv::<protocol::FdWriteObjectRetMsg>().await?;
-                        pending.complete(guest, WasiImportCompletion::FdWriteObject(done))?;
+                        pending.complete(WasiImportCompletion::FdWriteObject(done))?;
                     }
                     // Other admitted imports follow the same direct Hibana row shape:
                     // send the matching protocol::*ReqMsg, receive protocol::*RetMsg,
@@ -211,7 +227,7 @@ async fn run_guest<const ROLE: u8>(
                 let request = pending.request();
                 endpoint.send::<protocol::MemoryGrowReqMsg>(&request).await?;
                 let decision = endpoint.recv::<protocol::MemoryGrowRetMsg>().await?;
-                pending.complete(guest, decision)?;
+                pending.complete(decision)?;
             }
             WasiBoundaryStep::BudgetExpired(_) => run_id = run_id.wrapping_add(1),
             WasiBoundaryStep::Exit(exit) => return Ok(exit.status() as i32),
@@ -302,7 +318,7 @@ while the guest continues to use ordinary Rust `std` APIs.
 
 ## Embedded Budget
 
-The same public API is compiled for `thumbv6m-none-eabi`. On ARM, a compile-time
+The same public API is compiled for Pico 2 (`thumbv8m.main-none-eabi`). On ARM, a compile-time
 assertion limits the VM object to 32 KiB. `DEFAULT_GUEST_MEMORY_BYTES` is one
 64 KiB Wasm page, so the VM object plus default guest backing is bounded by
 96 KiB before caller-owned Hibana session, transport, and application storage.
@@ -312,7 +328,20 @@ backing or the module limit. The hot path performs no allocation and uses
 explicit fuel, bounded copies, compact typed payloads, and checked ABI ranges.
 Host-only example code is not part of this resource claim.
 
+`python3 scripts/check_pico2.py` executes a 16-interest poll guest on the host
+and links the same runtime fixture for Cortex-M33. The fixture includes one
+64 KiB linear memory, caller-owned VM storage and a 24 KiB stack reservation.
+It checks a 128 KiB reserved-RAM limit and a 512 KiB flash-load limit, with no
+allocator or separate board API. Linking does not establish physical Pico 2
+execution, worst-case stack usage, or whole-application resource fit.
+
 ## Build And Test
+
+Repository builds use the sibling `../hibana` checkout through the root Cargo
+patch. Check out Hibana's `development/rolled-route-ownership` branch there;
+the [CI workflow](.github/workflows/quality.yml) pins the verified core revision.
+The proof gate uses its Lean 4.30.0 workspace. Package verification also rebuilds
+the normalized crate against the registry dependency.
 
 Run the full local gate:
 
@@ -335,10 +364,20 @@ The gates cover import decoding, unsupported import rejection, guest-memory
 bounds, atomic writeback, pending-call mismatch rejection, canonical
 argument/environment payloads, memory-growth pending, fuel suspension, restart
 behavior, ChoreoFS object lookup, example behavior, residue scans, clippy,
-Miri, `thumbv6m-none-eabi`, documentation, and package verification. CI runs
+Miri, Pico 2 compilation and resource linking, documentation, and package verification. CI runs
 the same gate with Rust `1.95.0` and Miri `nightly-2026-05-28`.
 
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your
 option.
+
+## Poll proof and verification
+
+`python3 scripts/check_poll.py` runs all-target tests, Clippy, Pico 2
+compilation, the affine ownership compile-fail test, and Lean kernel checks.
+Each Rust verification uses a temporary target that is deleted on success or
+failure. The gate verifies 20 model theorems and 520 admission decisions exported
+from actual Rust VM execution. [Proof scope](proofs/README.md) records the
+unmodeled boundaries and the exact axiom audit. [Surface reduction](api-removal.md)
+records the removed APIs and ownership changes.

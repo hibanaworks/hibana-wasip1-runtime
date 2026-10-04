@@ -1,5 +1,9 @@
 use super::*;
 
+#[path = "poll.rs"]
+mod poll;
+pub use poll::{PollOneoff, PollReady};
+
 pub type MemoryGrowReqMsg = Msg<LABEL_ENGINE_MEMORY_GROW, MemoryGrowReq>;
 pub type MemoryGrowRetMsg = Msg<LABEL_ENGINE_MEMORY_GROW_RET, MemoryGrowRet>;
 
@@ -214,7 +218,8 @@ pub struct ClockResGetReq(pub ClockResGet);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClockTimeGetReq(pub ClockTimeGet);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PollOneoffReq(pub PollOneoff);
+pub struct PollOneoffReq<'a>(pub PollOneoff<'a>);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RandomGetReq(pub RandomGet);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,7 +260,8 @@ pub struct ClockResolutionRet(pub ClockResolution);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClockTimeRet(pub ClockTime);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PollReadyRet(pub PollReady);
+pub struct PollReadyRet<'a>(pub PollReady<'a>);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RandomDoneRet(pub RandomDone);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,7 +287,6 @@ wire_payload!(FdFilestatGetReq, FdRequest);
 wire_payload!(FdCloseReq, FdRequest);
 wire_payload!(ClockResGetReq, ClockResGet);
 wire_payload!(ClockTimeGetReq, ClockTimeGet);
-wire_payload!(PollOneoffReq, PollOneoff);
 wire_payload!(RandomGetReq, RandomGet);
 wire_payload!(ArgsSizesGetReq, ArgsSizesGet);
 wire_payload!(ArgsGetReq, ArgsGet);
@@ -302,7 +307,6 @@ wire_payload!(PathFilestatRet, FileStat);
 wire_payload!(FdClosedRet, FdClosed);
 wire_payload!(ClockResolutionRet, ClockResolution);
 wire_payload!(ClockTimeRet, ClockTime);
-wire_payload!(PollReadyRet, PollReady);
 wire_payload!(RandomDoneRet, RandomDone);
 wire_payload!(ArgsSizesRet, ArgsSizes);
 wire_payload!(ArgsDoneRet, ArgsDone);
@@ -333,8 +337,8 @@ pub type ClockResGetReqMsg = Msg<LABEL_WASI_CLOCK_RES_GET, ClockResGetReq>;
 pub type ClockResGetRetMsg = Msg<LABEL_WASI_CLOCK_RES_GET_RET, ClockResolutionRet>;
 pub type ClockTimeGetReqMsg = Msg<LABEL_WASI_CLOCK_TIME_GET, ClockTimeGetReq>;
 pub type ClockTimeGetRetMsg = Msg<LABEL_WASI_CLOCK_TIME_GET_RET, ClockTimeRet>;
-pub type PollOneoffReqMsg = Msg<LABEL_WASI_POLL_ONEOFF, PollOneoffReq>;
-pub type PollOneoffRetMsg = Msg<LABEL_WASI_POLL_ONEOFF_RET, PollReadyRet>;
+pub type PollOneoffReqMsg<'a> = Msg<LABEL_WASI_POLL_ONEOFF, PollOneoffReq<'a>>;
+pub type PollOneoffRetMsg<'a> = Msg<LABEL_WASI_POLL_ONEOFF_RET, PollReadyRet<'a>>;
 pub type RandomGetReqMsg = Msg<LABEL_WASI_RANDOM_GET, RandomGetReq>;
 pub type RandomGetRetMsg = Msg<LABEL_WASI_RANDOM_GET_RET, RandomDoneRet>;
 pub type ArgsSizesGetReqMsg = Msg<LABEL_WASI_ARGS_SIZES_GET, ArgsSizesGetReq>;
@@ -957,30 +961,6 @@ impl ClockResolution {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PollOneoff {
-    timeout_nanos: u64,
-}
-
-impl PollOneoff {
-    pub const fn new(timeout_nanos: u64) -> Self {
-        Self { timeout_nanos }
-    }
-
-    pub const fn timeout_nanos(&self) -> u64 {
-        self.timeout_nanos
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != 8 {
-            return Err(CodecError::Malformed);
-        }
-        let mut timeout = [0u8; 8];
-        timeout.copy_from_slice(bytes);
-        Ok(Self::new(u64::from_be_bytes(timeout)))
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RandomGet {
     max_len: u8,
 }
@@ -1456,31 +1436,6 @@ impl FdClosed {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PollReady {
-    ready: u8,
-}
-
-impl PollReady {
-    pub const fn new(ready: u8) -> Result<Self, CodecError> {
-        if ready > 1 {
-            return Err(CodecError::Malformed);
-        }
-        Ok(Self { ready })
-    }
-
-    pub const fn ready(&self) -> u8 {
-        self.ready
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != 1 {
-            return Err(CodecError::Malformed);
-        }
-        Self::new(bytes[0])
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RandomDone {
     chunk: WasiP1IoChunk,
 }
@@ -1871,22 +1826,6 @@ impl TypedWasiPayload for ClockTimeGet {
     }
 }
 
-impl TypedWasiPayload for PollOneoff {
-    const SCHEMA_ID: u32 = schema::POLL_ONEOFF;
-
-    fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        if out.len() < 8 {
-            return Err(CodecError::Truncated);
-        }
-        out[..8].copy_from_slice(&self.timeout_nanos().to_be_bytes());
-        Ok(8)
-    }
-
-    fn decode_payload_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
-        Self::decode(bytes)
-    }
-}
-
 impl TypedWasiPayload for RandomGet {
     const SCHEMA_ID: u32 = schema::RANDOM_GET;
 
@@ -2140,22 +2079,6 @@ impl TypedWasiPayload for ClockTime {
     }
 }
 
-impl TypedWasiPayload for PollReady {
-    const SCHEMA_ID: u32 = schema::POLL_READY;
-
-    fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let Some(first) = out.first_mut() else {
-            return Err(CodecError::Truncated);
-        };
-        *first = self.ready();
-        Ok(1)
-    }
-
-    fn decode_payload_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
-        Self::decode(bytes)
-    }
-}
-
 impl TypedWasiPayload for RandomDone {
     const SCHEMA_ID: u32 = schema::RANDOM_DONE;
 
@@ -2289,12 +2212,6 @@ mod tests {
         assert_eq!(&write[..3], &[4, 1, b'G']);
         assert_eq!(decode::<FdWriteReq>(&write[..3]), Ok(request));
 
-        let mut poll = [0u8; 8];
-        let request = PollOneoffReq(PollOneoff::new(20));
-        assert_eq!(request.encode_into(&mut poll), Ok(8));
-        assert_eq!(poll, 20u64.to_be_bytes());
-        assert_eq!(decode::<PollOneoffReq>(&poll), Ok(request));
-
         let mut written = [0u8; 4];
         let done = FdWriteDoneRet(FdWriteDone::new(4, 1));
         assert_eq!(done.encode_into(&mut written), Ok(4));
@@ -2318,17 +2235,6 @@ mod tests {
         assert_eq!(done.encode_into(&mut closed), Ok(3));
         assert_eq!(closed, [4, 0, 8]);
         assert_eq!(decode::<FdClosedRet>(&closed), Ok(done));
-
-        let mut ready = [0u8; 1];
-        let done = PollReadyRet(PollReady::new(1).expect("one ready event"));
-        assert_eq!(done.encode_into(&mut ready), Ok(1));
-        assert_eq!(ready, [1]);
-        assert_eq!(decode::<PollReadyRet>(&ready), Ok(done));
-        assert_eq!(
-            decode::<PollReadyRet>(&[2]),
-            Err(CodecError::Malformed),
-            "the one-subscription profile must reject impossible event counts"
-        );
 
         let unit = ArgsSizesGetReq(ArgsSizesGet);
         let mut out = [0xffu8; 1];

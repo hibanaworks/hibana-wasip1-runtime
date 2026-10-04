@@ -52,8 +52,6 @@ dependencies = [
 [[package]]
 name = "hibana"
 version = "0.9.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78489bf1b24a0e326a31906a132ab736a991535e0462591138634e60909fdd46"
 
 [[package]]
 name = "hibana-wasip1-runtime"

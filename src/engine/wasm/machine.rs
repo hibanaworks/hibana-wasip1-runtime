@@ -235,12 +235,9 @@ const CORE_WASM_DATA_COUNT_NONE: u8 = u8::MAX;
 const CORE_WASM_PAGE_SIZE: usize = 64 * 1024;
 #[cfg(any(test, target_arch = "arm"))]
 const VM_OBJECT_BUDGET_BYTES: usize = 32 * 1024;
+#[cfg(test)]
 const WASIP1_EVENTTYPE_CLOCK: u8 = 0;
-const WASIP1_SUBSCRIPTION_USERDATA_OFFSET: u32 = 0;
-const WASIP1_SUBSCRIPTION_EVENTTYPE_OFFSET: u32 = 8;
-const WASIP1_SUBSCRIPTION_CLOCK_TIMEOUT_OFFSET: u32 = 24;
-const WASIP1_EVENT_ERROR_OFFSET: u32 = 8;
-const WASIP1_EVENT_TYPE_OFFSET: u32 = 10;
+#[cfg(test)]
 const WASIP1_EVENT_SIZE: usize = 32;
 #[cfg(test)]
 pub const WASIP1_FILETYPE_REGULAR_FILE: u8 = 4;
@@ -398,6 +395,9 @@ macro_rules! diagnostic {
         CODE
     }};
 }
+
+#[path = "poll.rs"]
+mod poll;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ValueKind {
@@ -5020,40 +5020,15 @@ impl<'a> Vm<'a> {
     pub(super) fn finish_poll_oneoff(
         &mut self,
         call: PollOneoffCall,
-        ready: u32,
+        ready: &[[u8; 32]],
         errno: u32,
     ) -> Result<(), WasmError> {
         let pending = PendingWasip1Call::PollOneoff(call);
         let completion = self
             .core
             .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
-        let mut event = None;
         if errno == 0 {
-            if ready > 0 {
-                let mut bytes = [0u8; WASIP1_EVENT_SIZE];
-                self.core.read_memory(
-                    call.in_ptr
-                        .checked_add(WASIP1_SUBSCRIPTION_USERDATA_OFFSET)
-                        .ok_or(WasmError::Truncated)?,
-                    &mut bytes[..8],
-                )?;
-                let event_type = self.read_memory_u8(
-                    call.in_ptr
-                        .checked_add(WASIP1_SUBSCRIPTION_EVENTTYPE_OFFSET)
-                        .ok_or(WasmError::Truncated)?,
-                )?;
-                bytes[WASIP1_EVENT_ERROR_OFFSET as usize..WASIP1_EVENT_ERROR_OFFSET as usize + 2]
-                    .copy_from_slice(&(0u16).to_le_bytes());
-                bytes[WASIP1_EVENT_TYPE_OFFSET as usize] = event_type;
-                self.core
-                    .require_memory_range(call.out_ptr, WASIP1_EVENT_SIZE)?;
-                event = Some(bytes);
-            }
-            self.core.require_memory_range(call.nevents, 4)?;
-            if let Some(bytes) = event {
-                self.core.write_memory(call.out_ptr, &bytes)?;
-            }
-            self.core.write_memory_u32(call.nevents, ready)?;
+            poll::PreparedWriteback::new(&mut self.core, call, ready)?.commit();
         }
         self.core.commit_wasip1_completion(completion);
         Ok(())
@@ -5335,34 +5310,11 @@ impl<'a> Vm<'a> {
         Ok(total)
     }
 
-    pub(super) fn poll_oneoff_timeout_nanos(&self, call: PollOneoffCall) -> Result<u64, WasmError> {
-        if call.nsubscriptions != 1 {
-            return Err(unsupported!(
-                "only one poll_oneoff subscription is supported"
-            ));
-        }
-        let event_type = self.read_memory_u8(
-            call.in_ptr
-                .checked_add(WASIP1_SUBSCRIPTION_EVENTTYPE_OFFSET)
-                .ok_or(WasmError::Truncated)?,
-        )?;
-        if event_type != WASIP1_EVENTTYPE_CLOCK {
-            return Err(unsupported!(
-                "poll_oneoff only supports clock subscriptions"
-            ));
-        }
-        let timeout_nanos = self.read_core_u64(
-            call.in_ptr
-                .checked_add(WASIP1_SUBSCRIPTION_CLOCK_TIMEOUT_OFFSET)
-                .ok_or(WasmError::Truncated)?,
-        )?;
-        Ok(timeout_nanos)
-    }
-
-    fn read_memory_u8(&self, addr: u32) -> Result<u8, WasmError> {
-        let mut byte = [0u8; 1];
-        self.core.read_memory(addr, &mut byte)?;
-        Ok(byte[0])
+    pub(super) fn poll_oneoff_request(
+        &self,
+        call: PollOneoffCall,
+    ) -> Result<crate::protocol::PollOneoff<'_>, WasmError> {
+        poll::request(&self.core, call)
     }
 
     fn translate_wasip1_import(&mut self) -> Result<VmEvent, WasmError> {
@@ -5379,12 +5331,6 @@ impl<'a> Vm<'a> {
             }
             _ => Ok(call.into_event()),
         }
-    }
-
-    fn read_core_u64(&self, addr: u32) -> Result<u64, WasmError> {
-        let mut bytes = [0u8; 8];
-        self.core.read_memory(addr, &mut bytes)?;
-        Ok(u64::from_le_bytes(bytes))
     }
 
     pub(super) fn fd_read_iovec(&self, call: FdReadCall) -> Result<(u32, u32), WasmError> {
@@ -5525,6 +5471,10 @@ mod tests {
     use std::ops::{Deref, DerefMut};
     use std::vec;
     use std::vec::Vec;
+
+    mod poll_tests {
+        include!("tests/poll.rs");
+    }
 
     struct TestInterpreter<'a> {
         storage: Option<Box<MaybeUninit<Interpreter<'a>>>>,
@@ -6184,26 +6134,28 @@ mod tests {
             .expect("event sentinel");
         assert_eq!(
             guest
-                .poll_oneoff_timeout_nanos(poll)
-                .expect("supported clock subscription"),
-            1
+                .poll_oneoff_request(poll)
+                .expect("supported clock subscription")
+                .subscriptions()[0][24..32],
+            1u64.to_le_bytes()
         );
         guest
             .write_memory(88, &0u64.to_le_bytes())
             .expect("immediate subscription timeout");
         assert_eq!(
             guest
-                .poll_oneoff_timeout_nanos(poll)
-                .expect("zero timeout is an immediate poll"),
-            0
+                .poll_oneoff_request(poll)
+                .expect("zero timeout is an immediate poll")
+                .subscriptions()[0][24..32],
+            0u64.to_le_bytes()
         );
-
-        guest
-            .finish_poll_oneoff(poll, 1, 0)
-            .expect("complete ready poll");
 
         let mut event = [0u8; WASIP1_EVENT_SIZE];
         event[..8].copy_from_slice(&userdata);
+        guest
+            .finish_poll_oneoff(poll, &[event], 0)
+            .expect("complete ready poll");
+
         let mut actual = [0u8; WASIP1_EVENT_SIZE];
         guest.read_memory(0, &mut actual).expect("event at zero");
         assert_eq!(actual, event);
@@ -7464,7 +7416,7 @@ mod tests {
                     assert_eq!(poll.nsubscriptions, 1);
                     assert_eq!(poll.nevents, 152);
                     guest
-                        .finish_poll_oneoff(poll, 0, 52)
+                        .finish_poll_oneoff(poll, &[], 52)
                         .expect("complete poll_oneoff errno");
                 }
             })

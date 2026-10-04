@@ -20,6 +20,8 @@ include = [
     "/src/**",
     "/examples/**",
     "/scripts/**",
+    "/proofs/**",
+    "/api-removal.md",
 ]
 
 [dependencies]
@@ -28,3 +30,6 @@ hibana = { version = "0.9.6", default-features = false }
 [dev-dependencies]
 futures-executor = "0.3"
 futures-util = "0.3"
+
+[patch.crates-io]
+hibana = { path = "../hibana" }

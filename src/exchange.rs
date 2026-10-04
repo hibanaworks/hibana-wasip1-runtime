@@ -9,12 +9,12 @@ use core::mem::MaybeUninit;
 use crate::{
     Exit, WasmError,
     engine::wasm::{
-        self, Call, Event, FdStat as WasmFdStat, FileStat as WasmFileStat, Guest, GuestMemory,
+        Call, Event, FdStat as WasmFdStat, FileStat as WasmFileStat, Guest, GuestMemory,
         ImportPlanDiagnostics, MemoryGrowPending,
     },
     protocol::{
         self, ArgsGet, BudgetExpired, BudgetRun, ClockResGet, ClockTimeGet, EnvironGet, FdBinding,
-        FdReadRow, FdReaddirRow, FdRequest, FdWriteRow, MemRights, PollOneoff, RandomGet,
+        FdReadRow, FdReaddirRow, FdRequest, FdWriteRow, MemRights, RandomGet,
         WASIP1_IO_CHUNK_CAPACITY, WASIP1_PATH_CHUNK_CAPACITY,
     },
 };
@@ -234,21 +234,17 @@ impl<'a> HibanaWasiGuest<'a> {
     pub fn resume_wasi_boundary(
         &mut self,
         budget: BudgetRun,
-    ) -> Result<WasiBoundaryStep, ExchangeError> {
+    ) -> Result<WasiBoundaryStep<'_, 'a>, ExchangeError> {
         let event = self.guest.resume(budget);
         match event? {
             Event::Call(call) => {
-                let pending = lower_call(&self.guest, call, &self.bindings);
-                Ok(WasiBoundaryStep::ImportPending(pending?))
+                let pending = WasiImportPending { call, guest: self };
+                pending.request()?;
+                Ok(WasiBoundaryStep::ImportPending(pending))
             }
             Event::MemoryGrowPending(pending) => {
-                let request = protocol::MemoryGrowReq(protocol::MemoryGrow::new(
-                    pending.previous_pages(),
-                    pending.requested_pages(),
-                    pending.max_pages(),
-                ));
                 Ok(WasiBoundaryStep::MemoryGrowPending(WasiMemoryGrowPending {
-                    request,
+                    guest: self,
                     pending,
                 }))
             }
@@ -262,66 +258,65 @@ impl<'a> HibanaWasiGuest<'a> {
     }
 }
 
-pub enum WasiBoundaryStep {
-    ImportPending(WasiImportPending),
-    MemoryGrowPending(WasiMemoryGrowPending),
+pub enum WasiBoundaryStep<'guest, 'module> {
+    ImportPending(WasiImportPending<'guest, 'module>),
+    MemoryGrowPending(WasiMemoryGrowPending<'guest, 'module>),
     BudgetExpired(BudgetExpired),
     Exit(Exit),
 }
 
-pub struct WasiImportPending {
-    request: WasiImportRequest,
-    pending: PendingCall,
+/// An affine import boundary retaining exclusive ownership of its original guest.
+/// Requests borrow this token; completion consumes it before execution can resume.
+///
+/// ```compile_fail,E0499
+/// use hibana_wasip1_runtime::{HibanaWasiGuest, WasiBoundaryStep, WasiImportCompletion};
+/// use hibana_wasip1_runtime::{exchange::ExchangeError, protocol::BudgetRun};
+/// fn resume_while_pending(guest: &mut HibanaWasiGuest<'_>, budget: BudgetRun,
+///     completion: WasiImportCompletion<'_>) -> Result<(), ExchangeError> {
+///     if let WasiBoundaryStep::ImportPending(pending) = guest.resume_wasi_boundary(budget)? {
+///         guest.resume_wasi_boundary(budget)?;
+///         pending.complete(completion)?;
+///     }
+///     Ok(())
+/// }
+/// ```
+pub struct WasiImportPending<'guest, 'module> {
+    guest: &'guest mut HibanaWasiGuest<'module>,
+    call: Call,
 }
 
-impl WasiImportPending {
-    pub const fn request(&self) -> WasiImportRequest {
-        self.request
+impl WasiImportPending<'_, '_> {
+    pub fn request(&self) -> Result<WasiImportRequest<'_>, ExchangeError> {
+        lower_request(&self.guest.guest, &self.call, &self.guest.bindings)
     }
 
-    pub const fn import(&self) -> WasiImport {
-        self.request.import()
-    }
-
-    pub fn complete(
-        self,
-        guest: &mut HibanaWasiGuest<'_>,
-        completion: WasiImportCompletion,
-    ) -> Result<(), ExchangeError> {
-        self.pending
-            .complete_with(&mut guest.guest, completion, &mut guest.bindings)
+    pub fn complete(self, completion: WasiImportCompletion<'_>) -> Result<(), ExchangeError> {
+        complete_call(
+            self.call,
+            &mut self.guest.guest,
+            completion,
+            &mut self.guest.bindings,
+        )
     }
 }
 
-pub struct WasiMemoryGrowPending {
-    request: protocol::MemoryGrowReq,
+pub struct WasiMemoryGrowPending<'guest, 'module> {
+    guest: &'guest mut HibanaWasiGuest<'module>,
     pending: MemoryGrowPending,
 }
 
-impl WasiMemoryGrowPending {
+impl WasiMemoryGrowPending<'_, '_> {
     pub const fn request(&self) -> protocol::MemoryGrowReq {
-        self.request
+        protocol::MemoryGrowReq(protocol::MemoryGrow::new(
+            self.pending.previous_pages(),
+            self.pending.requested_pages(),
+            self.pending.max_pages(),
+        ))
     }
 
-    pub const fn previous_pages(&self) -> u32 {
-        self.pending.previous_pages()
-    }
-
-    pub const fn requested_pages(&self) -> u32 {
-        self.pending.requested_pages()
-    }
-
-    pub const fn max_pages(&self) -> u32 {
-        self.pending.max_pages()
-    }
-
-    pub fn complete(
-        self,
-        guest: &mut HibanaWasiGuest<'_>,
-        decision: protocol::MemoryGrowRet,
-    ) -> Result<(), ExchangeError> {
+    pub fn complete(self, decision: protocol::MemoryGrowRet) -> Result<(), ExchangeError> {
         self.pending
-            .complete(&mut guest.guest, decision.0.granted())?;
+            .complete(&mut self.guest.guest, decision.0.granted())?;
         Ok(())
     }
 }
@@ -377,7 +372,7 @@ impl WasiImport {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WasiImportRequest {
+pub enum WasiImportRequest<'a> {
     FdWrite(protocol::FdWriteReq),
     FdWriteObject(protocol::FdWriteReq),
     FdRead(protocol::FdReadReq),
@@ -395,11 +390,11 @@ pub enum WasiImportRequest {
     FdClose(protocol::FdCloseReq),
     ClockResGet(protocol::ClockResGetReq),
     ClockTimeGet(protocol::ClockTimeGetReq),
-    PollOneoff(protocol::PollOneoffReq),
+    PollOneoff(protocol::PollOneoffReq<'a>),
     RandomGet(protocol::RandomGetReq),
 }
 
-impl WasiImportRequest {
+impl WasiImportRequest<'_> {
     pub const fn import(self) -> WasiImport {
         match self {
             Self::FdWrite(_) => WasiImport::FdWrite,
@@ -426,7 +421,7 @@ impl WasiImportRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WasiImportCompletion {
+pub enum WasiImportCompletion<'a> {
     FdWrite(protocol::FdWriteDoneRet),
     FdWriteObject(protocol::FdWriteDoneRet),
     FdRead(protocol::FdReadDoneRet),
@@ -444,11 +439,11 @@ pub enum WasiImportCompletion {
     FdClose(protocol::FdClosedRet),
     ClockResGet(protocol::ClockResolutionRet),
     ClockTimeGet(protocol::ClockTimeRet),
-    PollOneoff(protocol::PollReadyRet),
+    PollOneoff(protocol::PollReadyRet<'a>),
     RandomGet(protocol::RandomDoneRet),
 }
 
-impl WasiImportCompletion {
+impl WasiImportCompletion<'_> {
     pub const fn import(self) -> WasiImport {
         match self {
             Self::FdWrite(_) => WasiImport::FdWrite,
@@ -474,326 +469,228 @@ impl WasiImportCompletion {
     }
 }
 
-enum PendingCall {
-    FdWrite(wasm::FdWrite),
-    FdWriteObject(wasm::FdWrite),
-    FdRead(wasm::FdRead),
-    FdReaddir(wasm::FdReaddir),
-    PathOpen(wasm::PathOpen),
-    FdPrestatGet(wasm::FdPrestatGet),
-    FdPrestatDirName(wasm::FdPrestatDirName),
-    FdFilestatGet(wasm::FdFilestatGet),
-    ArgsSizesGet(wasm::ArgsSizesGet),
-    ArgsGet(wasm::ArgsGet),
-    EnvironSizesGet(wasm::EnvironSizesGet),
-    EnvironGet(wasm::EnvironGet),
-    FdFdstatGet(wasm::FdFdstatGet),
-    PathFilestatGet(wasm::PathFilestatGet),
-    FdClose(wasm::FdClose),
-    ClockResGet(wasm::ClockResGet),
-    ClockTimeGet(wasm::ClockTimeGet),
-    PollOneoff(wasm::PollOneoff),
-    RandomGet(wasm::RandomGet),
+fn call_import(call: &Call, bindings: &FdBindingTable) -> Result<WasiImport, ExchangeError> {
+    Ok(match call {
+        Call::FdWrite(call) => match bindings
+            .bound_write_row(call.fd())
+            .ok_or(ExchangeError::UnboundFd(call.fd()))?
+        {
+            FdWriteRow::Base => WasiImport::FdWrite,
+            FdWriteRow::Object => WasiImport::FdWriteObject,
+        },
+        Call::FdRead(_) => WasiImport::FdRead,
+        Call::FdReaddir(_) => WasiImport::FdReaddir,
+        Call::PathOpen(_) => WasiImport::PathOpen,
+        Call::FdPrestatGet(_) => WasiImport::FdPrestatGet,
+        Call::FdPrestatDirName(_) => WasiImport::FdPrestatDirName,
+        Call::FdFilestatGet(_) => WasiImport::FdFilestatGet,
+        Call::ArgsSizesGet(_) => WasiImport::ArgsSizesGet,
+        Call::ArgsGet(_) => WasiImport::ArgsGet,
+        Call::EnvironSizesGet(_) => WasiImport::EnvironSizesGet,
+        Call::EnvironGet(_) => WasiImport::EnvironGet,
+        Call::FdFdstatGet(_) => WasiImport::FdFdstatGet,
+        Call::PathFilestatGet(_) => WasiImport::PathFilestatGet,
+        Call::FdClose(_) => WasiImport::FdClose,
+        Call::ClockResGet(_) => WasiImport::ClockResGet,
+        Call::ClockTimeGet(_) => WasiImport::ClockTimeGet,
+        Call::PollOneoff(_) => WasiImport::PollOneoff,
+        Call::RandomGet(_) => WasiImport::RandomGet,
+    })
 }
 
-impl PendingCall {
-    fn import(&self) -> WasiImport {
-        match self {
-            Self::FdWrite(_) => WasiImport::FdWrite,
-            Self::FdWriteObject(_) => WasiImport::FdWriteObject,
-            Self::FdRead(_) => WasiImport::FdRead,
-            Self::FdReaddir(_) => WasiImport::FdReaddir,
-            Self::PathOpen(_) => WasiImport::PathOpen,
-            Self::FdPrestatGet(_) => WasiImport::FdPrestatGet,
-            Self::FdPrestatDirName(_) => WasiImport::FdPrestatDirName,
-            Self::FdFilestatGet(_) => WasiImport::FdFilestatGet,
-            Self::ArgsSizesGet(_) => WasiImport::ArgsSizesGet,
-            Self::ArgsGet(_) => WasiImport::ArgsGet,
-            Self::EnvironSizesGet(_) => WasiImport::EnvironSizesGet,
-            Self::EnvironGet(_) => WasiImport::EnvironGet,
-            Self::FdFdstatGet(_) => WasiImport::FdFdstatGet,
-            Self::PathFilestatGet(_) => WasiImport::PathFilestatGet,
-            Self::FdClose(_) => WasiImport::FdClose,
-            Self::ClockResGet(_) => WasiImport::ClockResGet,
-            Self::ClockTimeGet(_) => WasiImport::ClockTimeGet,
-            Self::PollOneoff(_) => WasiImport::PollOneoff,
-            Self::RandomGet(_) => WasiImport::RandomGet,
-        }
+fn complete_call(
+    call: Call,
+    guest: &mut Guest<'_>,
+    completion: WasiImportCompletion<'_>,
+    bindings: &mut FdBindingTable,
+) -> Result<(), ExchangeError> {
+    let pending = call_import(&call, bindings)?;
+    let completed = completion.import();
+    if pending != completed {
+        return Err(ExchangeError::CompletionMismatch {
+            pending,
+            completion: completed,
+        });
     }
 
-    fn complete_with(
-        self,
-        guest: &mut Guest<'_>,
-        completion: WasiImportCompletion,
-        bindings: &mut FdBindingTable,
-    ) -> Result<(), ExchangeError> {
-        let pending = self.import();
-        let completed = completion.import();
-        if pending != completed {
+    match (call, completion) {
+        (
+            Call::FdWrite(call),
+            WasiImportCompletion::FdWrite(done) | WasiImportCompletion::FdWriteObject(done),
+        ) => {
+            expect_fd(pending, call.fd(), done.0.fd())?;
+            call.complete(guest, done.0.written() as u32, done.0.errno() as u32)?;
+        }
+        (Call::FdRead(call), WasiImportCompletion::FdRead(done)) => {
+            expect_fd(WasiImport::FdRead, call.fd(), done.0.fd())?;
+            call.complete(guest, done.0.as_bytes(), done.0.errno() as u32)?;
+        }
+        (Call::FdReaddir(call), WasiImportCompletion::FdReaddir(done)) => {
+            expect_fd(WasiImport::FdReaddir, call.fd(), done.0.fd())?;
+            call.complete(guest, done.0.as_bytes(), done.0.errno() as u32)?;
+        }
+        (Call::PathOpen(call), WasiImportCompletion::PathOpen(opened)) => {
+            let prepared_bindings = prepare_path_open_bindings(*bindings, opened.0)?;
+            call.complete(guest, opened.0.fd() as u32, opened.0.errno() as u32)?;
+            *bindings = prepared_bindings;
+        }
+        (Call::FdPrestatGet(call), WasiImportCompletion::FdPrestatGet(prestat)) => {
+            expect_fd(WasiImport::FdPrestatGet, call.fd(), prestat.0.fd())?;
+            call.complete(guest, prestat.0.name_len() as u32, prestat.0.errno() as u32)?;
+        }
+        (Call::FdPrestatDirName(call), WasiImportCompletion::FdPrestatDirName(name)) => {
+            expect_fd(WasiImport::FdPrestatDirName, call.fd(), name.0.fd())?;
+            call.complete(guest, name.0.as_bytes(), name.0.errno() as u32)?;
+        }
+        (Call::FdFilestatGet(call), WasiImportCompletion::FdFilestatGet(stat)) => {
+            call.complete(guest, wasm_file_stat(stat.0), stat.0.errno() as u32)?;
+        }
+        (Call::ArgsSizesGet(call), WasiImportCompletion::ArgsSizesGet(sizes)) => {
+            call.complete(guest, sizes.0.count() as u32, sizes.0.buf_size() as u32, 0)?;
+        }
+        (Call::ArgsGet(call), WasiImportCompletion::ArgsGet(done)) => {
+            let mut args = [&[][..]; MAX_ARG_REFS];
+            let count = split_args(done.0.as_bytes(), done.0.count(), &mut args)?;
+            call.complete(guest, &args[..count], 0)?;
+        }
+        (Call::EnvironSizesGet(call), WasiImportCompletion::EnvironSizesGet(sizes)) => {
+            call.complete(guest, sizes.0.count() as u32, sizes.0.buf_size() as u32, 0)?;
+        }
+        (Call::EnvironGet(call), WasiImportCompletion::EnvironGet(done)) => {
+            let mut environ = [(&[][..], &[][..]); MAX_ENV_REFS];
+            let count = split_environ(done.0.as_bytes(), done.0.count(), &mut environ)?;
+            call.complete(guest, &environ[..count], 0)?;
+        }
+        (Call::FdFdstatGet(call), WasiImportCompletion::FdFdstatGet(stat)) => {
+            expect_fd(WasiImport::FdFdstatGet, call.fd(), stat.0.fd())?;
+            call.complete(guest, wasm_fd_stat(stat.0), stat.0.errno() as u32)?;
+        }
+        (Call::PathFilestatGet(call), WasiImportCompletion::PathFilestatGet(stat)) => {
+            call.complete(guest, wasm_file_stat(stat.0), stat.0.errno() as u32)?;
+        }
+        (Call::FdClose(call), WasiImportCompletion::FdClose(closed)) => {
+            expect_fd(WasiImport::FdClose, call.fd(), closed.0.fd())?;
+            let prepared_bindings =
+                prepare_fd_close_bindings(*bindings, call.fd(), closed.0.errno());
+            call.complete(guest, closed.0.errno() as u32)?;
+            *bindings = prepared_bindings;
+        }
+        (Call::ClockResGet(call), WasiImportCompletion::ClockResGet(resolution)) => {
+            call.complete(guest, resolution.0.nanos(), 0)?;
+        }
+        (Call::ClockTimeGet(call), WasiImportCompletion::ClockTimeGet(time)) => {
+            call.complete(guest, time.0.nanos(), 0)?;
+        }
+        (Call::PollOneoff(call), WasiImportCompletion::PollOneoff(ready)) => {
+            call.complete(guest, ready.0)?;
+        }
+        (Call::RandomGet(call), WasiImportCompletion::RandomGet(done)) => {
+            call.complete(guest, done.0.as_bytes(), 0)?;
+        }
+        _ => {
             return Err(ExchangeError::CompletionMismatch {
                 pending,
                 completion: completed,
             });
         }
-
-        match (self, completion) {
-            (Self::FdWrite(call), WasiImportCompletion::FdWrite(done)) => {
-                expect_fd(WasiImport::FdWrite, call.fd(), done.0.fd())?;
-                call.complete(guest, done.0.written() as u32, done.0.errno() as u32)?;
-            }
-            (Self::FdWriteObject(call), WasiImportCompletion::FdWriteObject(done)) => {
-                expect_fd(WasiImport::FdWriteObject, call.fd(), done.0.fd())?;
-                call.complete(guest, done.0.written() as u32, done.0.errno() as u32)?;
-            }
-            (Self::FdRead(call), WasiImportCompletion::FdRead(done)) => {
-                expect_fd(WasiImport::FdRead, call.fd(), done.0.fd())?;
-                call.complete(guest, done.0.as_bytes(), done.0.errno() as u32)?;
-            }
-            (Self::FdReaddir(call), WasiImportCompletion::FdReaddir(done)) => {
-                expect_fd(WasiImport::FdReaddir, call.fd(), done.0.fd())?;
-                call.complete(guest, done.0.as_bytes(), done.0.errno() as u32)?;
-            }
-            (Self::PathOpen(call), WasiImportCompletion::PathOpen(opened)) => {
-                let prepared_bindings = prepare_path_open_bindings(*bindings, opened.0)?;
-                call.complete(guest, opened.0.fd() as u32, opened.0.errno() as u32)?;
-                *bindings = prepared_bindings;
-            }
-            (Self::FdPrestatGet(call), WasiImportCompletion::FdPrestatGet(prestat)) => {
-                expect_fd(WasiImport::FdPrestatGet, call.fd(), prestat.0.fd())?;
-                call.complete(guest, prestat.0.name_len() as u32, prestat.0.errno() as u32)?;
-            }
-            (Self::FdPrestatDirName(call), WasiImportCompletion::FdPrestatDirName(name)) => {
-                expect_fd(WasiImport::FdPrestatDirName, call.fd(), name.0.fd())?;
-                call.complete(guest, name.0.as_bytes(), name.0.errno() as u32)?;
-            }
-            (Self::FdFilestatGet(call), WasiImportCompletion::FdFilestatGet(stat)) => {
-                call.complete(guest, wasm_file_stat(stat.0), stat.0.errno() as u32)?;
-            }
-            (Self::ArgsSizesGet(call), WasiImportCompletion::ArgsSizesGet(sizes)) => {
-                call.complete(guest, sizes.0.count() as u32, sizes.0.buf_size() as u32, 0)?;
-            }
-            (Self::ArgsGet(call), WasiImportCompletion::ArgsGet(done)) => {
-                let mut args = [&[][..]; MAX_ARG_REFS];
-                let count = split_args(done.0.as_bytes(), done.0.count(), &mut args)?;
-                call.complete(guest, &args[..count], 0)?;
-            }
-            (Self::EnvironSizesGet(call), WasiImportCompletion::EnvironSizesGet(sizes)) => {
-                call.complete(guest, sizes.0.count() as u32, sizes.0.buf_size() as u32, 0)?;
-            }
-            (Self::EnvironGet(call), WasiImportCompletion::EnvironGet(done)) => {
-                let mut environ = [(&[][..], &[][..]); MAX_ENV_REFS];
-                let count = split_environ(done.0.as_bytes(), done.0.count(), &mut environ)?;
-                call.complete(guest, &environ[..count], 0)?;
-            }
-            (Self::FdFdstatGet(call), WasiImportCompletion::FdFdstatGet(stat)) => {
-                expect_fd(WasiImport::FdFdstatGet, call.fd(), stat.0.fd())?;
-                call.complete(guest, wasm_fd_stat(stat.0), stat.0.errno() as u32)?;
-            }
-            (Self::PathFilestatGet(call), WasiImportCompletion::PathFilestatGet(stat)) => {
-                call.complete(guest, wasm_file_stat(stat.0), stat.0.errno() as u32)?;
-            }
-            (Self::FdClose(call), WasiImportCompletion::FdClose(closed)) => {
-                expect_fd(WasiImport::FdClose, call.fd(), closed.0.fd())?;
-                let prepared_bindings =
-                    prepare_fd_close_bindings(*bindings, call.fd(), closed.0.errno());
-                call.complete(guest, closed.0.errno() as u32)?;
-                *bindings = prepared_bindings;
-            }
-            (Self::ClockResGet(call), WasiImportCompletion::ClockResGet(resolution)) => {
-                call.complete(guest, resolution.0.nanos(), 0)?;
-            }
-            (Self::ClockTimeGet(call), WasiImportCompletion::ClockTimeGet(time)) => {
-                call.complete(guest, time.0.nanos(), 0)?;
-            }
-            (Self::PollOneoff(call), WasiImportCompletion::PollOneoff(ready)) => {
-                call.complete(guest, ready.0.ready() as u32, 0)?;
-            }
-            (Self::RandomGet(call), WasiImportCompletion::RandomGet(done)) => {
-                call.complete(guest, done.0.as_bytes(), 0)?;
-            }
-            _ => {
-                return Err(ExchangeError::CompletionMismatch {
-                    pending,
-                    completion: completed,
-                });
-            }
-        }
-        Ok(())
     }
+    Ok(())
 }
 
-fn lower_call(
-    guest: &Guest<'_>,
-    call: Call,
+fn lower_request<'a>(
+    guest: &'a Guest<'_>,
+    call: &Call,
     bindings: &FdBindingTable,
-) -> Result<WasiImportPending, ExchangeError> {
-    match call {
+) -> Result<WasiImportRequest<'a>, ExchangeError> {
+    Ok(match call {
         Call::FdWrite(call) => {
-            let payload = call.payload(guest)?;
-            let request =
-                protocol::FdWriteReq(protocol::FdWrite::new(call.fd(), payload.as_bytes())?);
-            let row = bindings
+            let request = protocol::FdWriteReq(protocol::FdWrite::new(
+                call.fd(),
+                call.payload(guest)?.as_bytes(),
+            )?);
+            match bindings
                 .bound_write_row(call.fd())
-                .ok_or(ExchangeError::UnboundFd(call.fd()))?;
-            match row {
-                FdWriteRow::Base => Ok(WasiImportPending {
-                    request: WasiImportRequest::FdWrite(request),
-                    pending: PendingCall::FdWrite(call),
-                }),
-                FdWriteRow::Object => Ok(WasiImportPending {
-                    request: WasiImportRequest::FdWriteObject(request),
-                    pending: PendingCall::FdWriteObject(call),
-                }),
+                .ok_or(ExchangeError::UnboundFd(call.fd()))?
+            {
+                FdWriteRow::Base => WasiImportRequest::FdWrite(request),
+                FdWriteRow::Object => WasiImportRequest::FdWriteObject(request),
             }
         }
         Call::FdRead(call) => {
             bindings
                 .bound_read_row(call.fd())
                 .ok_or(ExchangeError::UnboundFd(call.fd()))?;
-            let max_len = inline_io_request_len(call.max_len(guest)?);
-            let request = protocol::FdReadReq(protocol::FdRead::new(call.fd(), max_len)?);
-            Ok(WasiImportPending {
-                request: WasiImportRequest::FdRead(request),
-                pending: PendingCall::FdRead(call),
-            })
+            WasiImportRequest::FdRead(protocol::FdReadReq(protocol::FdRead::new(
+                call.fd(),
+                inline_io_request_len(call.max_len(guest)?),
+            )?))
         }
         Call::FdReaddir(call) => {
             bindings
                 .bound_readdir_row(call.fd())
                 .ok_or(ExchangeError::UnboundFd(call.fd()))?;
-            let request = protocol::FdReaddirReq(protocol::FdReaddir::new(
+            WasiImportRequest::FdReaddir(protocol::FdReaddirReq(protocol::FdReaddir::new(
                 call.fd(),
                 call.cookie(),
                 inline_io_request_len(call.max_len()),
-            )?);
-            Ok(WasiImportPending {
-                request: WasiImportRequest::FdReaddir(request),
-                pending: PendingCall::FdReaddir(call),
-            })
+            )?))
         }
         Call::PathOpen(call) => {
-            let path = call.path_bytes(guest)?;
-            let request = protocol::PathOpenReq(protocol::PathOpen::new(
+            WasiImportRequest::PathOpen(protocol::PathOpenReq(protocol::PathOpen::new(
                 call.fd(),
                 call.rights_base(),
-                path.as_bytes(),
-            )?);
-            Ok(WasiImportPending {
-                request: WasiImportRequest::PathOpen(request),
-                pending: PendingCall::PathOpen(call),
-            })
+                call.path_bytes(guest)?.as_bytes(),
+            )?))
         }
         Call::FdPrestatGet(call) => {
-            let request = protocol::FdPrestatGetReq(FdRequest::new(call.fd()));
-            Ok(WasiImportPending {
-                request: WasiImportRequest::FdPrestatGet(request),
-                pending: PendingCall::FdPrestatGet(call),
-            })
+            WasiImportRequest::FdPrestatGet(protocol::FdPrestatGetReq(FdRequest::new(call.fd())))
         }
         Call::FdPrestatDirName(call) => {
-            let request = protocol::FdPrestatDirNameReq(protocol::FdPrestatDirName::new(
-                call.fd(),
-                exact_path_reply_len(call.max_len())?,
-            )?);
-            Ok(WasiImportPending {
-                request: WasiImportRequest::FdPrestatDirName(request),
-                pending: PendingCall::FdPrestatDirName(call),
-            })
+            WasiImportRequest::FdPrestatDirName(protocol::FdPrestatDirNameReq(
+                protocol::FdPrestatDirName::new(call.fd(), exact_path_reply_len(call.max_len())?)?,
+            ))
         }
         Call::FdFilestatGet(call) => {
-            let request = protocol::FdFilestatGetReq(FdRequest::new(call.fd()));
-            Ok(WasiImportPending {
-                request: WasiImportRequest::FdFilestatGet(request),
-                pending: PendingCall::FdFilestatGet(call),
-            })
+            WasiImportRequest::FdFilestatGet(protocol::FdFilestatGetReq(FdRequest::new(call.fd())))
         }
-        Call::ArgsSizesGet(call) => {
-            let request = protocol::ArgsSizesGetReq(protocol::ArgsSizesGet);
-            Ok(WasiImportPending {
-                request: WasiImportRequest::ArgsSizesGet(request),
-                pending: PendingCall::ArgsSizesGet(call),
-            })
+        Call::ArgsSizesGet(_) => {
+            WasiImportRequest::ArgsSizesGet(protocol::ArgsSizesGetReq(protocol::ArgsSizesGet))
         }
-        Call::ArgsGet(call) => {
-            let request = protocol::ArgsGetReq(ArgsGet::new(WASIP1_IO_CHUNK_CAPACITY as u8)?);
-            Ok(WasiImportPending {
-                request: WasiImportRequest::ArgsGet(request),
-                pending: PendingCall::ArgsGet(call),
-            })
-        }
-        Call::EnvironSizesGet(call) => {
-            let request = protocol::EnvironSizesGetReq(protocol::EnvironSizesGet);
-            Ok(WasiImportPending {
-                request: WasiImportRequest::EnvironSizesGet(request),
-                pending: PendingCall::EnvironSizesGet(call),
-            })
-        }
-        Call::EnvironGet(call) => {
-            let request = protocol::EnvironGetReq(EnvironGet::new(WASIP1_IO_CHUNK_CAPACITY as u8)?);
-            Ok(WasiImportPending {
-                request: WasiImportRequest::EnvironGet(request),
-                pending: PendingCall::EnvironGet(call),
-            })
-        }
+        Call::ArgsGet(_) => WasiImportRequest::ArgsGet(protocol::ArgsGetReq(ArgsGet::new(
+            WASIP1_IO_CHUNK_CAPACITY as u8,
+        )?)),
+        Call::EnvironSizesGet(_) => WasiImportRequest::EnvironSizesGet(
+            protocol::EnvironSizesGetReq(protocol::EnvironSizesGet),
+        ),
+        Call::EnvironGet(_) => WasiImportRequest::EnvironGet(protocol::EnvironGetReq(
+            EnvironGet::new(WASIP1_IO_CHUNK_CAPACITY as u8)?,
+        )),
         Call::FdFdstatGet(call) => {
-            let request = protocol::FdFdstatGetReq(FdRequest::new(call.fd()));
-            Ok(WasiImportPending {
-                request: WasiImportRequest::FdFdstatGet(request),
-                pending: PendingCall::FdFdstatGet(call),
-            })
+            WasiImportRequest::FdFdstatGet(protocol::FdFdstatGetReq(FdRequest::new(call.fd())))
         }
-        Call::PathFilestatGet(call) => {
-            let path = call.path_bytes(guest)?;
-            let request = protocol::PathFilestatGetReq(protocol::PathFilestatGet::new(
+        Call::PathFilestatGet(call) => WasiImportRequest::PathFilestatGet(
+            protocol::PathFilestatGetReq(protocol::PathFilestatGet::new(
                 call.fd(),
                 call.flags(),
-                path.as_bytes(),
-            )?);
-            Ok(WasiImportPending {
-                request: WasiImportRequest::PathFilestatGet(request),
-                pending: PendingCall::PathFilestatGet(call),
-            })
-        }
+                call.path_bytes(guest)?.as_bytes(),
+            )?),
+        ),
         Call::FdClose(call) => {
-            let request = protocol::FdCloseReq(FdRequest::new(call.fd()));
-            Ok(WasiImportPending {
-                request: WasiImportRequest::FdClose(request),
-                pending: PendingCall::FdClose(call),
-            })
+            WasiImportRequest::FdClose(protocol::FdCloseReq(FdRequest::new(call.fd())))
         }
-        Call::ClockResGet(call) => {
-            let request = protocol::ClockResGetReq(ClockResGet::new(clock_id_u8(call.clock_id())?));
-            Ok(WasiImportPending {
-                request: WasiImportRequest::ClockResGet(request),
-                pending: PendingCall::ClockResGet(call),
-            })
-        }
-        Call::ClockTimeGet(call) => {
-            let request = protocol::ClockTimeGetReq(ClockTimeGet::new(
-                clock_id_u8(call.clock_id())?,
-                call.precision(),
-            ));
-            Ok(WasiImportPending {
-                request: WasiImportRequest::ClockTimeGet(request),
-                pending: PendingCall::ClockTimeGet(call),
-            })
-        }
+        Call::ClockResGet(call) => WasiImportRequest::ClockResGet(protocol::ClockResGetReq(
+            ClockResGet::new(clock_id_u8(call.clock_id())?),
+        )),
+        Call::ClockTimeGet(call) => WasiImportRequest::ClockTimeGet(protocol::ClockTimeGetReq(
+            ClockTimeGet::new(clock_id_u8(call.clock_id())?, call.precision()),
+        )),
         Call::PollOneoff(call) => {
-            let request = protocol::PollOneoffReq(PollOneoff::new(call.timeout_nanos(guest)?));
-            Ok(WasiImportPending {
-                request: WasiImportRequest::PollOneoff(request),
-                pending: PendingCall::PollOneoff(call),
-            })
+            WasiImportRequest::PollOneoff(protocol::PollOneoffReq(call.request(guest)?))
         }
-        Call::RandomGet(call) => {
-            let request =
-                protocol::RandomGetReq(RandomGet::new(exact_io_reply_len(call.buf_len())?)?);
-            Ok(WasiImportPending {
-                request: WasiImportRequest::RandomGet(request),
-                pending: PendingCall::RandomGet(call),
-            })
-        }
-    }
+        Call::RandomGet(call) => WasiImportRequest::RandomGet(protocol::RandomGetReq(
+            RandomGet::new(exact_io_reply_len(call.buf_len())?)?,
+        )),
+    })
 }
 
 fn expect_fd(import: WasiImport, expected_fd: u8, actual_fd: u8) -> Result<(), ExchangeError> {

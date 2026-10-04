@@ -316,12 +316,21 @@ pub struct PollOneoff {
 }
 
 impl PollOneoff {
-    pub fn timeout_nanos(&self, guest: &Guest<'_>) -> Result<u64, Error> {
-        guest.engine.poll_oneoff_timeout_nanos(self.call)
+    pub fn request<'a>(
+        &self,
+        guest: &'a Guest<'_>,
+    ) -> Result<crate::protocol::PollOneoff<'a>, Error> {
+        guest.engine.poll_oneoff_request(self.call)
     }
 
-    pub fn complete(self, guest: &mut Guest<'_>, ready: u32, errno: u32) -> Result<(), Error> {
-        guest.engine.finish_poll_oneoff(self.call, ready, errno)
+    pub fn complete(
+        self,
+        guest: &mut Guest<'_>,
+        ready: crate::protocol::PollReady<'_>,
+    ) -> Result<(), Error> {
+        guest
+            .engine
+            .finish_poll_oneoff(self.call, ready.events(), 0)
     }
 }
 

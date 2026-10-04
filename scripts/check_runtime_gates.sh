@@ -7,16 +7,19 @@ cd "$repo_root"
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-1}
 export RUST_TEST_THREADS=${RUST_TEST_THREADS:-1}
 
-cargo fmt --check
+rust_check() (
+    check_target=$(mktemp -d "${TMPDIR:-/tmp}/wasi-runtime-check.XXXXXX")
+    trap 'rm -rf "$check_target"' EXIT HUP INT TERM
+    export CARGO_TARGET_DIR="$check_target"
+    "$@"
+)
+
+cargo +1.95.0 fmt --check
+rustfmt +1.95.0 --check --edition 2024 scripts/fixtures/pico2_resources.rs
 bash scripts/check_runtime_residue.sh
-cargo check --locked --all-targets
-cargo check --locked --lib --target thumbv6m-none-eabi
-cargo test --locked --lib
-cargo check --locked --example sequenced_choreofs_write
-cargo check --locked --example direct_choreofs_write_rejection
+python3 scripts/check_poll.py
+python3 scripts/check_pico2.py
 bash scripts/check_wasi_shell_demo.sh
-cargo clippy --locked --all-targets -- -D warnings
-cargo doc --locked --no-deps
-bash scripts/check_miri.sh
-cargo package --locked --allow-dirty
-scripts/check_runtime_residue.sh
+rust_check cargo +1.95.0 doc --locked --no-deps
+rust_check bash scripts/check_miri.sh
+rust_check cargo +1.95.0 package --locked --allow-dirty

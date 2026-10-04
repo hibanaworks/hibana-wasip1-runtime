@@ -13,7 +13,10 @@ if ! rustup target list --installed --toolchain "$toolchain" | rg -q '^wasm32-wa
 fi
 
 guest_source="$repo_root/examples/wasi_std_shell_app.rs"
-guest_target="$repo_root/target/wasi-std-shell-app"
+demo_target=$(mktemp -d "${TMPDIR:-/tmp}/wasi-shell-check.XXXXXX")
+trap 'rm -rf "$demo_target"' EXIT HUP INT TERM
+guest_target="$demo_target/guest"
+export CARGO_TARGET_DIR="$demo_target/host"
 guest_manifest="$guest_target/Cargo.toml"
 guest_wasm="$guest_target/wasm32-wasip1/release/wasi-std-shell-app.wasm"
 
@@ -75,6 +78,8 @@ if printf '%s\n' "$blocked_output" | rg -q '^direct-choreofs-write-rejection fai
     echo "direct-write block example should handle the expected Hibana progress rejection" >&2
     exit 1
 fi
+
+rm -rf "$CARGO_TARGET_DIR"
 
 sequenced_output=$(
     printf '%s\n' \

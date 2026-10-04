@@ -1,11 +1,10 @@
 use super::{
-    ExchangeError, FD_BINDING_CAPACITY, FdBindingCapacityError, FdBindingTable,
-    HibanaWasiGuestStorage, MAX_ARG_REFS, MAX_ENV_REFS, PendingCall,
-    UNSUPPORTED_WASIP1_CLOCK_ID_TOO_LARGE, UNSUPPORTED_WASIP1_INLINE_REPLY_TOO_LARGE,
-    UNSUPPORTED_WASIP1_PATH_REPLY_TOO_LARGE, WASIP1_IO_CHUNK_CAPACITY, WasiBoundaryStep,
-    WasiImportPending, WasiImportRequest, clock_id_u8, exact_io_reply_len, exact_path_reply_len,
-    inline_io_request_len, prepare_fd_close_bindings, prepare_path_open_bindings, split_args,
-    split_environ,
+    Call, ExchangeError, FD_BINDING_CAPACITY, FdBindingCapacityError, FdBindingTable,
+    HibanaWasiGuestStorage, MAX_ARG_REFS, MAX_ENV_REFS, UNSUPPORTED_WASIP1_CLOCK_ID_TOO_LARGE,
+    UNSUPPORTED_WASIP1_INLINE_REPLY_TOO_LARGE, UNSUPPORTED_WASIP1_PATH_REPLY_TOO_LARGE,
+    WASIP1_IO_CHUNK_CAPACITY, WasiBoundaryStep, WasiImportPending, WasiImportRequest, clock_id_u8,
+    exact_io_reply_len, exact_path_reply_len, inline_io_request_len, prepare_fd_close_bindings,
+    prepare_path_open_bindings, split_args, split_environ,
 };
 use crate::{
     DEFAULT_GUEST_MEMORY_BYTES, GuestMemory, WasmError,
@@ -22,9 +21,9 @@ fn binding_table_and_pending_token_stay_small() {
         size_of::<FdBindingTable>()
     );
     assert!(
-        size_of::<PendingCall>() <= 64,
-        "PendingCall uses {} bytes",
-        size_of::<PendingCall>()
+        size_of::<Call>() <= 64,
+        "Call uses {} bytes",
+        size_of::<Call>()
     );
     assert!(
         size_of::<WasiImportRequest>() <= WASIP1_IO_CHUNK_CAPACITY + 16,
