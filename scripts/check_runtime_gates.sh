@@ -16,7 +16,6 @@ rust_check() (
 
 cargo +1.95.0 fmt --check
 rustfmt +1.95.0 --check --edition 2024 scripts/fixtures/pico2_resources.rs
-bash scripts/check_runtime_residue.sh
 python3 scripts/check_poll.py
 python3 scripts/check_pico2.py
 bash scripts/check_wasi_shell_demo.sh

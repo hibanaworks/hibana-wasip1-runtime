@@ -355,7 +355,6 @@ Focused checks:
 cargo test --locked choreofs
 cargo check --locked --example sequenced_choreofs_write
 cargo check --locked --example direct_choreofs_write_rejection
-bash scripts/check_runtime_residue.sh
 bash scripts/check_miri.sh
 bash scripts/check_wasi_shell_demo.sh
 ```
@@ -363,7 +362,7 @@ bash scripts/check_wasi_shell_demo.sh
 The gates cover import decoding, unsupported import rejection, guest-memory
 bounds, atomic writeback, pending-call mismatch rejection, canonical
 argument/environment payloads, memory-growth pending, fuel suspension, restart
-behavior, ChoreoFS object lookup, example behavior, residue scans, clippy,
+behavior, ChoreoFS object lookup, example behavior, clippy,
 Miri, Pico 2 compilation and resource linking, documentation, and package verification. CI runs
 the same gate with Rust `1.95.0` and Miri `nightly-2026-05-28`.
 

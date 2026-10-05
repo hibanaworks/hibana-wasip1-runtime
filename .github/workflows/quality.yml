@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: hibanaworks/hibana
-          ref: dbb6b5f6ccf344c56aded10c88f66581e6c1ac5f
+          ref: fac137e3efae0ada1fe27b802cf2fc99ab249f0d
           path: hibana
       - name: Install release tools
         run: |
