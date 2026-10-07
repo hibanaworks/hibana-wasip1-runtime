@@ -563,7 +563,8 @@ fn complete_call(
         }
         (Call::FdFdstatGet(call), WasiImportCompletion::FdFdstatGet(stat)) => {
             expect_fd(WasiImport::FdFdstatGet, call.fd(), stat.0.fd())?;
-            call.complete(guest, wasm_fd_stat(stat.0), stat.0.errno() as u32)?;
+            let descriptor_stat = wasm_fd_stat(stat.0, bindings.binding(call.fd()));
+            call.complete(guest, descriptor_stat, stat.0.errno() as u32)?;
         }
         (Call::PathFilestatGet(call), WasiImportCompletion::PathFilestatGet(stat)) => {
             call.complete(guest, wasm_file_stat(stat.0), stat.0.errno() as u32)?;
@@ -797,12 +798,23 @@ fn split_environ<'a>(
     Ok(count)
 }
 
-fn wasm_fd_stat(stat: protocol::FdStat) -> WasmFdStat {
+fn wasm_fd_stat(stat: protocol::FdStat, binding: Option<FdBinding>) -> WasmFdStat {
+    if binding.is_some_and(|binding| binding.readdir.is_some()) {
+        // A directory exposes child lookup, not byte reads/writes on itself.
+        // Every child still needs its own material, binding, ledger and
+        // choreography admission. No rights are installed on a child here.
+        return WasmFdStat::new(
+            protocol::WASIP1_FILETYPE_DIRECTORY,
+            0,
+            FD_READDIR_RIGHT,
+            FD_READ_RIGHT | FD_WRITE_RIGHT | FD_READDIR_RIGHT,
+        );
+    }
     let rights_base = match stat.rights() {
-        MemRights::Read => FD_READ_RIGHT | FD_READDIR_RIGHT,
+        MemRights::Read => FD_READ_RIGHT,
         MemRights::Write => FD_WRITE_RIGHT,
     };
-    WasmFdStat::new(0, 0, rights_base, rights_base)
+    WasmFdStat::new(0, 0, rights_base, 0)
 }
 
 fn wasm_file_stat(stat: protocol::FileStat) -> WasmFileStat {

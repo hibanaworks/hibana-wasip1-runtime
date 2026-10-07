@@ -1,4 +1,4 @@
-# Bounded WASI poll evidence
+# Bounded WASI poll and path-rights evidence
 
 Run `python3 scripts/check_poll.py` from the runtime repository. Rust tests,
 Clippy, Pico 2 (`thumbv8m.main-none-eabi`) compilation and the affine ownership compile-fail
@@ -46,3 +46,35 @@ is live; Lean does not model Rust's borrow checker.
 
 The 48-byte subscription and 32-byte event layouts and clock flag meanings
 were checked against the [WASI Preview 1 specification](https://github.com/WebAssembly/WASI/blob/snapshot-01/phases/snapshot/docs.md#subscription-struct).
+
+`PathRights.lean` proves six statements about fixed ChoreoFS I/O capabilities:
+an accepted object has a nonempty capability and the exact applicable I/O mode;
+an incompatible mode rejects; a writer requires the write bit; a read request
+cannot open a writer; empty materials reject. The gate exports 128 decisions
+from actual Rust `ChoreoFs::path_open` calls: four material kinds, every
+combination of the three I/O bits, and four ancillary-bit patterns including
+the high bit and every non-I/O bit. Denied calls return no descriptor or binding.
+The kernel checks every decision; the exact axiom audit permits only `propext`
+for all six general theorems and 128 finite decisions.
+
+`PathRights.smt2` checks all 64-bit base-right patterns. Four UNSAT queries rule
+out empty grants, added I/O rights, silently dropped conflicting applicable
+modes, and read admission on writers. Three SAT witnesses cover the old
+writable-default error, the old base/inheriting union, and a genuine write.
+The VM regression passes different base/inheriting masks, including u64::MAX,
+and checks unchanged descriptor output on denied completion. The actual
+compiled std shell rejects a read on its write-only LED object before its
+existing choreography rejection check. The sequenced shell rejects a write to
+its read-only log and then completes a valid write in the same session.
+
+WASI permits removing rights that do not apply to the object type. The model
+therefore excludes `FD_READDIR` on files and `FD_READ` on directories from the
+applicable mode; it never substitutes read and write on a file. This admission
+model does not prove all WASI rights, inheritance, fd lifetime, dynamic rights
+attenuation, Rust execution, Hibana progression, or physical side effects.
+The Rust binding and ledger checks remain independently required and tested.
+Directory fdstat reports enumeration as base rights and supported child I/O as
+inheriting rights; file fdstat reports only its base mode with no inheritance.
+The child is admitted only by its own material, binding, ledger and choreography.
+This fixed-capability directory convention is tested in Rust and the compiled
+std shell; it is not modeled as a general inherited-rights attenuation proof.

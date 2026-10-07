@@ -296,6 +296,14 @@ operation tokens for one already-admitted request. They expose selected object
 facts and produce typed completion payloads; they do not replace Hibana route
 authority.
 
+`path_open` checks the requested base I/O mode against the material, its actual
+binding, and its ledger rights. A read request cannot open a writer; conflicting
+applicable modes and requests with no applicable I/O capability are denied.
+As WASI permits, directory enumeration rights are inapplicable to files, and
+byte-read rights are inapplicable to directories. Inheriting rights never become
+base rights. Objects retain fixed capabilities; this is not a mutable directory
+inheritance or general WASI rights-attenuation implementation.
+
 ## Examples
 
 The repository includes one guest program and two host choreographies:
@@ -374,9 +382,11 @@ option.
 ## Poll proof and verification
 
 `python3 scripts/check_poll.py` runs all-target tests, Clippy, Pico 2
-compilation, the affine ownership compile-fail test, and Lean kernel checks.
+compilation, the affine ownership compile-fail test, Lean kernel checks, and Z3.
 Each Rust verification uses a temporary target that is deleted on success or
 failure. The gate verifies 20 model theorems and 520 admission decisions exported
-from actual Rust VM execution. [Proof scope](proofs/README.md) records the
+from actual Rust VM execution, plus 6 path-rights theorems and 128 actual
+ChoreoFS admission decisions. Z3 checks 64-bit I/O rights with four UNSAT
+properties and three SAT witnesses. [Proof scope](proofs/README.md) records the
 unmodeled boundaries and the exact axiom audit. [Surface reduction](api-removal.md)
 records the removed APIs and ownership changes.

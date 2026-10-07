@@ -56,17 +56,23 @@ RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=--initial-memory=65536 -C link-arg=--max-m
     --target-dir "$guest_target" \
     --locked
 
-blocked_output=$(
+if blocked_output=$(
     printf '%s\n' \
+        'cat /outputs/led/green' \
         'echo 1 > /outputs/led/green' \
         'exit' |
         cargo "+$toolchain" run --quiet --locked --example direct_choreofs_write_rejection -- "$guest_wasm" 2>&1
-)
+); then :; else
+    printf '%s\n' "$blocked_output"
+    exit 1
+fi
 printf '%s\n' "$blocked_output"
 for expected in \
     '^choreography: direct ChoreoFS write blocked$' \
     '^wasi std shell app$' \
-    '^(wasi> )*Hibana: ChoreoFS write did not advance on this localside -> ' \
+    '^(wasi> )*usage: help \| ls PATH \| cat PATH \| echo TEXT > PATH \| apply SOURCE TARGET \| exit$' \
+    '^(wasi> )*ChoreoFS object write attempt: fd=4 bytes=\[49\]$' \
+    '^Hibana: ChoreoFS write did not advance on this localside -> ' \
     '^Output: led\.green = unchanged$'
 do
     if ! printf '%s\n' "$blocked_output" | rg -q "$expected"; then
@@ -81,15 +87,19 @@ fi
 
 rm -rf "$CARGO_TARGET_DIR"
 
-sequenced_output=$(
+if sequenced_output=$(
     printf '%s\n' \
         'help' \
         'ls /objects' \
         'cat /objects/log' \
+        'echo 1 > /objects/log' \
         'apply /objects/log /outputs/led/green' \
         'exit' |
         cargo "+$toolchain" run --quiet --locked --example sequenced_choreofs_write -- "$guest_wasm" 2>&1
-)
+); then :; else
+    printf '%s\n' "$sequenced_output"
+    exit 1
+fi
 printf '%s\n' "$sequenced_output"
 for expected in \
     '^choreography: sequenced ChoreoFS write$' \
@@ -98,6 +108,7 @@ for expected in \
     '^  ls /objects$' \
     '^(wasi> )*log$' \
     '^(wasi> )*session=attached$' \
+    '^(wasi> )*write denied errno=2$' \
     '^(wasi> )*applied$' \
     '^(wasi> )*Output: led\.green = on$'
 do

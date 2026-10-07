@@ -4,7 +4,7 @@ use super::{
     UNSUPPORTED_WASIP1_INLINE_REPLY_TOO_LARGE, UNSUPPORTED_WASIP1_PATH_REPLY_TOO_LARGE,
     WASIP1_IO_CHUNK_CAPACITY, WasiBoundaryStep, WasiImportPending, WasiImportRequest, clock_id_u8,
     exact_io_reply_len, exact_path_reply_len, inline_io_request_len, prepare_fd_close_bindings,
-    prepare_path_open_bindings, split_args, split_environ,
+    prepare_path_open_bindings, split_args, split_environ, wasm_fd_stat,
 };
 use crate::{
     DEFAULT_GUEST_MEMORY_BYTES, GuestMemory, WasmError,
@@ -12,6 +12,26 @@ use crate::{
 };
 use core::mem::size_of;
 use std::boxed::Box;
+
+#[test]
+fn directory_child_rights_and_file_base_rights_are_distinct() {
+    use crate::protocol::{self, FdReaddirRow, FdStat, MemRights};
+    let dir = wasm_fd_stat(
+        FdStat::new(3, MemRights::Read),
+        Some(FdBinding::readdir(FdReaddirRow::Base)),
+    );
+    assert_eq!(dir.filetype(), protocol::WASIP1_FILETYPE_DIRECTORY);
+    assert_eq!(dir.rights_base(), 1 << 14);
+    assert_eq!(dir.rights_inheriting(), 2 | 64 | (1 << 14));
+    for (rights, binding, expected) in [
+        (MemRights::Read, FdBinding::read(FdReadRow::Base), 2),
+        (MemRights::Write, FdBinding::write(FdWriteRow::Object), 64),
+    ] {
+        let file = wasm_fd_stat(FdStat::new(4, rights), Some(binding));
+        assert_eq!(file.rights_base(), expected);
+        assert_eq!(file.rights_inheriting(), 0);
+    }
+}
 
 #[test]
 fn binding_table_and_pending_token_stay_small() {

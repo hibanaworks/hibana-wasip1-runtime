@@ -803,24 +803,18 @@ fn binding_allows_rights(binding: FdBinding, rights: u64) -> bool {
 }
 
 fn material_required_rights(material: ChoreoFsObjectMaterial<'_>, rights: u64) -> Option<u64> {
-    if rights & FD_WRITE_RIGHT != 0 {
-        return match material.kind {
-            ChoreoFsObjectMaterialKind::Writable => Some(FD_WRITE_RIGHT),
-            _ => None,
-        };
-    }
-    match material.kind {
-        ChoreoFsObjectMaterialKind::Empty => None,
-        ChoreoFsObjectMaterialKind::Readable(_) if rights & FD_READ_RIGHT != 0 => {
-            Some(FD_READ_RIGHT)
+    let (required, applicable) = match material.kind {
+        ChoreoFsObjectMaterialKind::Empty => return None,
+        ChoreoFsObjectMaterialKind::Readable(_) => (FD_READ_RIGHT, FD_READ_RIGHT | FD_WRITE_RIGHT),
+        ChoreoFsObjectMaterialKind::Readdir(_) => {
+            (FD_READDIR_RIGHT, FD_READDIR_RIGHT | FD_WRITE_RIGHT)
         }
-        ChoreoFsObjectMaterialKind::Readdir(_) if rights & FD_READDIR_RIGHT != 0 => {
-            Some(FD_READDIR_RIGHT)
-        }
-        ChoreoFsObjectMaterialKind::Writable => Some(FD_WRITE_RIGHT),
-        _ if rights & (FD_READ_RIGHT | FD_WRITE_RIGHT | FD_READDIR_RIGHT) == 0 => Some(0),
-        _ => None,
-    }
+        ChoreoFsObjectMaterialKind::Writable => (FD_WRITE_RIGHT, FD_READ_RIGHT | FD_WRITE_RIGHT),
+    };
+    // WASI permits dropping only rights inapplicable to the object type:
+    // readdir on a file, and byte reads on a directory. A conflicting file
+    // read/write mode must still reject, rather than grant another capability.
+    (rights & applicable == required).then_some(required)
 }
 
 const fn rights_from_binding(binding: FdBinding) -> MemRights {
@@ -896,6 +890,154 @@ mod tests {
     }
 
     #[test]
+    fn path_open_rejects_absent_or_conflicting_io_rights_without_poisoning_reentry() {
+        let choreofs = RUNTIME_OBJECTS.choreofs();
+        for (path, expected) in [
+            (&b"objects"[..], FD_READDIR_RIGHT),
+            (&b"objects/log"[..], FD_READ_RIGHT),
+            (&b"outputs/led/green"[..], FD_WRITE_RIGHT),
+        ] {
+            for bits in 0..8 {
+                let requested = (if bits & 1 != 0 { FD_READ_RIGHT } else { 0 })
+                    | (if bits & 2 != 0 { FD_WRITE_RIGHT } else { 0 })
+                    | (if bits & 4 != 0 { FD_READDIR_RIGHT } else { 0 });
+                for ancillary in [0, 1 << 21] {
+                    let open = choreofs.path_open(
+                        protocol::PathOpen::new(3, requested | ancillary, path).unwrap(),
+                    );
+                    let applicable = if expected == FD_READDIR_RIGHT {
+                        FD_READDIR_RIGHT | FD_WRITE_RIGHT
+                    } else {
+                        FD_READ_RIGHT | FD_WRITE_RIGHT
+                    };
+                    let accepted = requested & applicable == expected;
+                    assert_eq!(
+                        open.is_open(),
+                        accepted,
+                        "path={path:?}, requested={requested:#x}"
+                    );
+                    if !accepted {
+                        assert_eq!(open.opened_ret().0.errno(), ERRNO_ACCES);
+                        assert_eq!(open.fd(), None);
+                        assert_eq!(open.opened_ret().0.binding(), FdBinding::none());
+                    }
+                    // A rejected read must not consume the later valid write.
+                    let valid =
+                        choreofs.path_open(protocol::PathOpen::new(3, expected, path).unwrap());
+                    assert!(valid.is_open());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "exports actual ChoreoFS decisions for the Lean correspondence gate"]
+    fn export_actual_path_rights_decisions() {
+        use std::fmt::Write;
+        static OBJECTS: ChoreoFsObjectSet<4> = ChoreoFsObjectSet::new([
+            ChoreoFsObject::new(b"empty", ObjectId(20), FdSpec::new(7, 0, 0)),
+            ChoreoFsObject::readable(
+                b"reader",
+                ObjectId(21),
+                FdSpec::new(8, FD_READ_RIGHT, 0),
+                b"",
+                FdBinding::read(protocol::FdReadRow::Base),
+            ),
+            ChoreoFsObject::writable(
+                b"writer",
+                ObjectId(22),
+                FdSpec::new(9, FD_WRITE_RIGHT, 0),
+                FdBinding::write(protocol::FdWriteRow::Object),
+            ),
+            ChoreoFsObject::readdir(
+                b"directory",
+                ObjectId(23),
+                FdSpec::new(10, FD_READDIR_RIGHT, 0),
+                b"",
+                FdBinding::readdir(protocol::FdReaddirRow::Base),
+            ),
+        ]);
+        let output = std::env::var("HIBANA_WASIP1_PATH_LEAN_EXPORT").expect("export destination");
+        let choreofs = OBJECTS.choreofs();
+        let mask = FD_READ_RIGHT | FD_WRITE_RIGHT | FD_READDIR_RIGHT;
+        let mut lean = std::string::String::from("import PathRights\nnamespace WasiPathRights\n");
+        let mut index = 0;
+        for (kind, path) in [b"empty".as_slice(), b"reader", b"writer", b"directory"]
+            .into_iter()
+            .enumerate()
+        {
+            for bits in 0..8 {
+                let io = (if bits & 1 != 0 { FD_READ_RIGHT } else { 0 })
+                    | (if bits & 2 != 0 { FD_WRITE_RIGHT } else { 0 })
+                    | (if bits & 4 != 0 { FD_READDIR_RIGHT } else { 0 });
+                for ancillary in [0, 1 << 21, 1 << 63, !mask] {
+                    let requested = io | ancillary;
+                    let open =
+                        choreofs.path_open(protocol::PathOpen::new(3, requested, path).unwrap());
+                    let accepted = open.is_open();
+                    if !accepted {
+                        assert_eq!(open.fd(), None);
+                        assert_eq!(open.opened_ret().0.binding(), FdBinding::none());
+                    }
+                    writeln!(lean, "theorem actual_path_decision_{index} : admitted {kind} {requested} = {accepted} := by decide").unwrap();
+                    writeln!(lean, "#print axioms actual_path_decision_{index}").unwrap();
+                    index += 1;
+                }
+            }
+        }
+        assert_eq!(index, 128);
+        lean.push_str("end WasiPathRights\n");
+        std::fs::write(output, lean).unwrap();
+        std::println!("Exported {index} actual ChoreoFS path admission decisions");
+    }
+
+    #[test]
+    fn path_open_still_requires_both_actual_binding_and_ledger_right() {
+        static OBJECTS: ChoreoFsObjectSet<4> = ChoreoFsObjectSet::new([
+            ChoreoFsObject::writable(
+                b"no-binding",
+                ObjectId(30),
+                FdSpec::new(7, FD_WRITE_RIGHT, 0),
+                FdBinding::none(),
+            ),
+            ChoreoFsObject::writable(
+                b"no-ledger-right",
+                ObjectId(31),
+                FdSpec::new(8, FD_READ_RIGHT, 0),
+                FdBinding::write(protocol::FdWriteRow::Object),
+            ),
+            ChoreoFsObject::readable(
+                b"wrong-binding",
+                ObjectId(32),
+                FdSpec::new(9, FD_READ_RIGHT, 0),
+                b"",
+                FdBinding::write(protocol::FdWriteRow::Object),
+            ),
+            ChoreoFsObject::writable(
+                b"valid",
+                ObjectId(33),
+                FdSpec::new(10, FD_WRITE_RIGHT, 0),
+                FdBinding::write(protocol::FdWriteRow::Object),
+            ),
+        ]);
+        let choreofs = OBJECTS.choreofs();
+        for (path, right) in [
+            (b"no-binding".as_slice(), FD_WRITE_RIGHT),
+            (b"no-ledger-right", FD_WRITE_RIGHT),
+            (b"wrong-binding", FD_READ_RIGHT),
+        ] {
+            let denied = choreofs.path_open(protocol::PathOpen::new(3, right, path).unwrap());
+            assert_eq!(denied.fd(), None);
+            assert_eq!(denied.opened_ret().0.errno(), ERRNO_ACCES);
+        }
+        assert!(
+            choreofs
+                .path_open(protocol::PathOpen::new(3, FD_WRITE_RIGHT, b"valid").unwrap())
+                .is_open()
+        );
+    }
+
+    #[test]
     fn choreofs_builds_object_operation_tokens() {
         let choreofs = RUNTIME_OBJECTS.choreofs();
 
@@ -913,17 +1055,17 @@ mod tests {
             Some(protocol::FdReaddirRow::Base)
         );
 
-        let inherited_dir_open = choreofs.path_open(
+        let mixed_dir_open = choreofs.path_open(
             protocol::PathOpen::new(3, FD_READ_RIGHT | FD_READDIR_RIGHT, b"objects")
                 .expect("path_open"),
         );
-        assert_eq!(inherited_dir_open.fd(), Some(4));
+        assert_eq!(mixed_dir_open.fd(), Some(4));
 
-        let inherited_read_open = choreofs.path_open(
+        let mixed_read_open = choreofs.path_open(
             protocol::PathOpen::new(3, FD_READ_RIGHT | FD_READDIR_RIGHT, b"objects/log")
                 .expect("path_open"),
         );
-        assert_eq!(inherited_read_open.fd(), Some(5));
+        assert_eq!(mixed_read_open.fd(), Some(5));
 
         let readdir =
             choreofs.fd_readdir(protocol::FdReaddir::new(4, 0, 16).expect("fd_readdir request"));

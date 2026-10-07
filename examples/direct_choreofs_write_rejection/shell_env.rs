@@ -153,6 +153,32 @@ impl ShellEnv {
         Ok(operation.opened_ret())
     }
 
+    pub fn prestat_fd(&self, request: FdRequest) -> protocol::FdPrestatRet {
+        if request.fd() == ROOT_FD {
+            protocol::FdPrestatRet(protocol::FdPrestat::new(request.fd(), 1))
+        } else {
+            protocol::FdPrestatRet(protocol::FdPrestat::new_with_errno(
+                request.fd(),
+                0,
+                ERRNO_BADF,
+            ))
+        }
+    }
+
+    pub fn prestat_dir_name(
+        &self,
+        request: protocol::FdPrestatDirName,
+    ) -> DemoResult<protocol::FdPrestatDirNameRet> {
+        let (name, errno) = if request.fd() == ROOT_FD {
+            (&b"/"[..], 0)
+        } else {
+            (&b""[..], ERRNO_BADF)
+        };
+        Ok(protocol::FdPrestatDirNameRet(
+            protocol::FdPrestatDirNameDone::new(request.fd(), name, errno)?,
+        ))
+    }
+
     fn apply_led_green_write(&mut self, write: ChoreoFsWrite) -> protocol::FdWriteDoneRet {
         match write.bytes() {
             b"1" => {

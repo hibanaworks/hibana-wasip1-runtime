@@ -25,12 +25,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: hibanaworks/hibana
-          ref: fac137e3efae0ada1fe27b802cf2fc99ab249f0d
+          ref: 1b28efffe3cc5c93080dc21682c25b87ae5b84a3
           path: hibana
       - name: Install release tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ripgrep
+          sudo apt-get install -y ripgrep z3
           rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt --component llvm-tools-preview
           rustup target add --toolchain 1.95.0 thumbv8m.main-none-eabi wasm32-wasip1
       - name: Install Lean

@@ -84,12 +84,26 @@ fn direct_choreofs_write_blocked_choreography() -> impl hibana::runtime::program
         g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, protocol::PathOpenReqMsg>(),
         g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, protocol::PathOpenRetMsg>(),
     );
+    let prestat = g::seq(
+        g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, protocol::FdPrestatGetReqMsg>(),
+        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, protocol::FdPrestatGetRetMsg>(),
+    );
+    let prestat_name = g::seq(
+        g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, protocol::FdPrestatDirNameReqMsg>(),
+        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, protocol::FdPrestatDirNameRetMsg>(),
+    );
 
     let open_selector_flow = g::seq(fd_fdstat_get, path_open);
 
     g::route(
         memory_grow,
-        g::route(fd_write, g::route(fd_read, open_selector_flow)),
+        g::route(
+            fd_write,
+            g::route(
+                fd_read,
+                g::route(prestat, g::route(prestat_name, open_selector_flow)),
+            ),
+        ),
     )
     .roll()
 }
@@ -139,6 +153,11 @@ async fn complete_pending_import(
             pending.complete(WasiImportCompletion::FdWrite(completion))?;
         }
         WasiImportRequest::FdWriteObject(request) => {
+            println!(
+                "ChoreoFS object write attempt: fd={} bytes={:?}",
+                request.0.fd(),
+                request.0.as_bytes()
+            );
             shell_app_endpoint
                 .send::<protocol::FdWriteObjectReqMsg>(&request)
                 .await?;
@@ -340,6 +359,20 @@ async fn run_shell_env(
                     .send::<protocol::FdFdstatGetRetMsg>(&response)
                     .await?;
                 continue_open_selector_flow(shell_env_endpoint, shell_env).await?;
+            }
+            WasiImport::FdPrestatGet => {
+                let observed = branch.recv::<protocol::FdPrestatGetReqMsg>().await?;
+                shell_env_endpoint
+                    .send::<protocol::FdPrestatGetRetMsg>(&shell_env.prestat_fd(observed.0))
+                    .await?;
+            }
+            WasiImport::FdPrestatDirName => {
+                let observed = branch.recv::<protocol::FdPrestatDirNameReqMsg>().await?;
+                shell_env_endpoint
+                    .send::<protocol::FdPrestatDirNameRetMsg>(
+                        &shell_env.prestat_dir_name(observed.0)?,
+                    )
+                    .await?;
             }
             import => {
                 return Err(DemoError::message(format!(

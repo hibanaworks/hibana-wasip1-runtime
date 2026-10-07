@@ -3824,8 +3824,11 @@ impl<'a> Interpreter<'a> {
             Wasip1Row::PathOpen => {
                 let opened_fd_ptr = self.pop_core_i32()?;
                 self.pop_core_i32()?;
-                let rights_inheriting = self.pop_core_i64()?;
-                let rights_base = self.pop_core_i64()? | rights_inheriting;
+                // Child inheritance does not authorize I/O on this descriptor.
+                // ChoreoFS objects have fixed capabilities, without a mutable
+                // directory inheritance ledger.
+                self.pop_core_i64()?;
+                let rights_base = self.pop_core_i64()?;
                 self.pop_core_i32()?;
                 let path_len = self.pop_core_i32()?;
                 let path_ptr = self.pop_core_i32()?;
@@ -7423,6 +7426,48 @@ mod tests {
             .expect("spawn wasm test")
             .join()
             .expect("wasm test joins");
+    }
+
+    #[test]
+    fn path_open_inheriting_rights_never_become_base_io_rights() {
+        for (base, inheriting) in [(2, 64), (64, 2), (1 << 14, 66), (0, 66), (2, u64::MAX)] {
+            let module = core_wasip1_single_import_module(
+                Wasip1ImportName::PathOpen,
+                &[
+                    VALTYPE_I32,
+                    VALTYPE_I32,
+                    VALTYPE_I32,
+                    VALTYPE_I32,
+                    VALTYPE_I32,
+                    VALTYPE_I64,
+                    VALTYPE_I64,
+                    VALTYPE_I32,
+                    VALTYPE_I32,
+                ],
+                &[VALTYPE_I32],
+                &[
+                    TestWasmArg::I32(3),
+                    TestWasmArg::I32(0),
+                    TestWasmArg::I32(160),
+                    TestWasmArg::I32(10),
+                    TestWasmArg::I32(0),
+                    TestWasmArg::I64(base),
+                    TestWasmArg::I64(inheriting),
+                    TestWasmArg::I32(0),
+                    TestWasmArg::I32(196),
+                ],
+                true,
+            );
+            let mut guest = TestVm::new(&module).unwrap();
+            let VmEvent::PathOpen(path) = guest.resume(test_budget()).unwrap() else {
+                panic!("path_open expected");
+            };
+            assert_eq!(path.rights_base(), base);
+            guest.write_memory(196, &[0xa5; 4]).unwrap();
+            guest.finish_path_open(path, 0, 2).unwrap();
+            assert_eq!(guest.read_memory_u32(196).unwrap(), 0xa5a5a5a5);
+            assert_eq!(guest.resume(test_budget()).unwrap(), VmEvent::Exit(0));
+        }
     }
 
     #[test]
