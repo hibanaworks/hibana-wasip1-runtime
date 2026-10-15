@@ -85,14 +85,96 @@ fn print_prompt() -> io::Result<()> {
     write_stdout(b"wasi> ")
 }
 
+#[link(wasm_import_module = "wasi_snapshot_preview1")]
+unsafe extern "C" {
+    #[link_name = "path_open"]
+    fn wasi_path_open(
+        fd: u32,
+        lookup: u32,
+        path: *const u8,
+        len: u32,
+        oflags: u32,
+        base: u64,
+        inheriting: u64,
+        flags: u32,
+        opened: *mut u32,
+    ) -> u32;
+    #[link_name = "fd_readdir"]
+    fn wasi_readdir(fd: u32, buf: *mut u8, len: u32, cookie: u64, used: *mut u32) -> u32;
+    #[link_name = "fd_fdstat_get"]
+    fn wasi_fdstat(fd: u32, stat: *mut u8) -> u32;
+    #[link_name = "fd_close"]
+    fn wasi_close(fd: u32) -> u32;
+}
+
 fn list(path: &str) -> Result<(), ()> {
-    let entries = fs::read_dir(path).map_err(|_| ())?;
-    for entry in entries {
-        let entry = entry.map_err(|_| ())?;
-        write_stdout(entry.file_name().to_string_lossy().as_bytes()).map_err(|_| ())?;
-        write_stdout(b"\n").map_err(|_| ())?;
+    let path = path.strip_prefix('/').unwrap_or(path).as_bytes();
+    let mut stat = [0u8; 24];
+    // SAFETY: stat is the complete WASI fdstat output region.
+    if unsafe { wasi_fdstat(3, stat.as_mut_ptr()) } != 0 {
+        return Err(());
     }
-    Ok(())
+    let rights = u64::from_le_bytes(stat[8..16].try_into().map_err(|_| ())?);
+    if stat[0] != 3 || rights & (1 << 14) == 0 {
+        return Err(());
+    }
+    let mut fd = 0;
+    // SAFETY: path and opened fd are live guest-memory regions. The bounded
+    // runtime still checks their ranges and ChoreoFS admits the directory.
+    if unsafe {
+        wasi_path_open(
+            3,
+            0,
+            path.as_ptr(),
+            path.len() as u32,
+            2,
+            1 << 14,
+            0,
+            4,
+            &mut fd,
+        )
+    } != 0
+    {
+        return Err(());
+    }
+    let result = list_open(fd);
+    // SAFETY: the descriptor was returned by the matching successful path_open.
+    if unsafe { wasi_close(fd) } != 0 {
+        return Err(());
+    }
+    result
+}
+fn list_open(fd: u32) -> Result<(), ()> {
+    let mut cookie = 0;
+    loop {
+        let mut bytes = [0u8; 96];
+        let mut used = 0;
+        // SAFETY: both output regions are valid and disjoint. A 96-byte request
+        // respects this runtime's bounded directory-completion profile.
+        if unsafe { wasi_readdir(fd, bytes.as_mut_ptr(), 96, cookie, &mut used) } != 0 {
+            return Err(());
+        }
+        let mut offset = 0;
+        while offset + 24 <= used as usize {
+            let len =
+                u32::from_le_bytes(bytes[offset + 16..offset + 20].try_into().map_err(|_| ())?)
+                    as usize;
+            let end = offset + 24 + len;
+            if end > used as usize {
+                break;
+            }
+            cookie = u64::from_le_bytes(bytes[offset..offset + 8].try_into().map_err(|_| ())?);
+            write_stdout(&bytes[offset + 24..end]).map_err(|_| ())?;
+            write_stdout(b"\n").map_err(|_| ())?;
+            offset = end;
+        }
+        if used < 96 {
+            return Ok(());
+        }
+        if offset == 0 {
+            return Err(());
+        }
+    }
 }
 
 fn cat(path: &str) -> Result<(), ()> {

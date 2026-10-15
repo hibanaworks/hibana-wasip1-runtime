@@ -34,6 +34,19 @@ fn directory_child_rights_and_file_base_rights_are_distinct() {
 }
 
 #[test]
+fn file_stat_cannot_report_rights_absent_from_the_open_binding() {
+    use crate::protocol::{FdStat, MemRights};
+    let stat = FdStat::new(6, MemRights::ReadWrite);
+    for (binding, expected) in [
+        (FdBinding::read(FdReadRow::Base), 2),
+        (FdBinding::write(FdWriteRow::Object), 64),
+        (FdBinding::none(), 0),
+    ] {
+        assert_eq!(wasm_fd_stat(stat, Some(binding)).rights_base(), expected);
+    }
+}
+
+#[test]
 fn binding_table_and_pending_token_stay_small() {
     assert!(
         size_of::<FdBindingTable>() <= FD_BINDING_CAPACITY * 8,

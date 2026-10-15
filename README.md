@@ -20,7 +20,7 @@ WASI P1 guest
 It depends on `hibana`; it does not define a second message system, a host
 policy layer, or a filesystem fallback.
 
-Version `0.1` targets Hibana `0.9.6` and its schema-identified wire payload
+Version `0.1` targets Hibana `0.9.9` and its schema-identified wire payload
 contract.
 
 ## Install
@@ -156,7 +156,11 @@ allowed after validation. Readiness is correspondence data, not I/O authority;
 fd rights, incarnation and physical readiness remain the answering owner's job.
 The format replaces the scalar poll format and uses distinct schema identities.
 There is one bounded `no_std` path for Pico and host users.
-I/O completion payloads carry at most 96 bytes, path payloads at most 40 bytes,
+I/O completion payloads carry at most 96 bytes. Writes may complete a valid
+prefix and the guest may write the remainder. Directory requests must use a
+buffer of at most 96 bytes. Larger directory buffers are rejected, because
+silently shortening a directory read can be mistaken for end of directory.
+Path payloads at most 40 bytes,
 and the fd table holds 16 live bindings while accepting any `u8` fd number.
 
 The current Wasm profile is bounded as follows:
@@ -301,8 +305,19 @@ binding, and its ledger rights. A read request cannot open a writer; conflicting
 applicable modes and requests with no applicable I/O capability are denied.
 As WASI permits, directory enumeration rights are inapplicable to files, and
 byte-read rights are inapplicable to directories. Inheriting rights never become
-base rights. Objects retain fixed capabilities; this is not a mutable directory
-inheritance or general WASI rights-attenuation implementation.
+base rights. Objects retain fixed capabilities. `read_write` objects borrow their contents
+from the answering role. Each successful open returns only the I/O bindings
+requested by that open, within the material and ledger rights. `fdstat` cannot
+report rights missing from that live binding. This is not a mutable directory
+inheritance implementation.
+
+`path_open` preserves open and fd flags in its typed request. ChoreoFS rejects
+a directory-only open on a file, exclusive creation of an existing object, and
+truncate or append without write rights. The answering owner applies an admitted
+truncate or append to its own storage. Directory reads with nonblocking flags
+are supported for the ready in-memory listing. Other unsupported fd flags are
+rejected. Schema identities distinguish these requests and duplex `fdstat`
+responses from the earlier formats.
 
 ## Examples
 
@@ -345,11 +360,8 @@ execution, worst-case stack usage, or whole-application resource fit.
 
 ## Build And Test
 
-Repository builds use the sibling `../hibana` checkout through the root Cargo
-patch. Check out Hibana's `development/rolled-route-ownership` branch there;
-the [CI workflow](.github/workflows/quality.yml) pins the verified core revision.
-The proof gate uses its Lean 4.30.0 workspace. Package verification also rebuilds
-the normalized crate against the registry dependency.
+Repository and package builds use the exact published Hibana `0.9.9` crate.
+No sibling core checkout is needed. The proof gate uses its Lean 4.30.0 workspace.
 
 Run the full local gate:
 
@@ -385,7 +397,7 @@ option.
 compilation, the affine ownership compile-fail test, Lean kernel checks, and Z3.
 Each Rust verification uses a temporary target that is deleted on success or
 failure. The gate verifies 20 model theorems and 520 admission decisions exported
-from actual Rust VM execution, plus 6 path-rights theorems and 128 actual
+from actual Rust VM execution, plus 10 path-rights theorems and 160 actual
 ChoreoFS admission decisions. Z3 checks 64-bit I/O rights with four UNSAT
 properties and three SAT witnesses. [Proof scope](proofs/README.md) records the
 unmodeled boundaries and the exact axiom audit. [Surface reduction](api-removal.md)

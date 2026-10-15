@@ -7,7 +7,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = ROOT / "proofs/PollWriteback.lean"
-PROOF_WORKSPACE = ROOT.parent / "hibana/proofs/lean"
+PROOF_WORKSPACE = ROOT / "proofs"
 
 
 def rust(evidence: Path, name: str, arguments: list[str]) -> None:
@@ -37,7 +37,7 @@ def main() -> None:
     rust(evidence, "ownership", ["test", "--offline", "--locked", "--doc"])
     combined = evidence / "Correspondence.lean"
     combined.write_text(MODEL.read_text() + (evidence / "decisions.lean").read_text().replace("import PollWriteback\n", ""))
-    proof = subprocess.run(["lake", "env", "lean", str(combined)], cwd=PROOF_WORKSPACE,
+    proof = subprocess.run(["lean", str(combined)], cwd=PROOF_WORKSPACE,
                            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     (evidence / "lean.log").write_text(proof.stdout)
     names = [
@@ -62,18 +62,19 @@ def main() -> None:
     path_combined = evidence / "PathCorrespondence.lean"
     path_combined.write_text((ROOT / "proofs/PathRights.lean").read_text() +
                              (evidence / "path-decisions.lean").read_text().replace("import PathRights\n", ""))
-    path_proof = subprocess.run(["lake", "env", "lean", str(path_combined)], cwd=PROOF_WORKSPACE,
+    path_proof = subprocess.run(["lean", str(path_combined)], cwd=PROOF_WORKSPACE,
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     (evidence / "path-lean.log").write_text(path_proof.stdout)
     path_names = ["accepted_has_capability", "accepted_has_exact_io_mode", "mismatched_io_mode_rejected",
-                  "writable_requires_write", "read_request_cannot_open_writer", "empty_material_rejected"]
+                  "writable_requires_write", "read_request_cannot_open_writer", "empty_material_rejected",
+                  "read_write_requires_requested_io", "read_write_accepts_read", "read_write_accepts_write", "read_write_accepts_both"]
     path_expected = [f"'WasiPathRights.{name}' depends on axioms: [propext]" for name in path_names]
     path_expected.extend(f"'WasiPathRights.actual_path_decision_{index}' depends on axioms: [propext]"
-                         for index in range(128))
+                         for index in range(160))
     if path_proof.returncode or path_proof.stdout.splitlines() != path_expected:
         print(path_proof.stdout)
         raise SystemExit("Path-rights Lean proof or exact axiom audit failed")
-    print("Lean: 6 path-rights theorems and 128 actual ChoreoFS decisions passed")
+    print("Lean: 10 path-rights theorems and 160 actual ChoreoFS decisions passed")
     smt = subprocess.run(["z3", str(ROOT / "proofs/PathRights.smt2")], cwd=ROOT,
                          text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     (evidence / "path-z3.log").write_text(smt.stdout)

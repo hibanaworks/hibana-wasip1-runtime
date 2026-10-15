@@ -10,7 +10,7 @@ Run `python3 scripts/check_pico2.py` for a separate resource gate. It runs a
 16-subscription guest on the host, then links the same fixture for Cortex-M33
 with the ordinary runtime API, one 64 KiB linear memory and caller-owned VM
 storage. The gate counts linked flash sections and static RAM plus a 24 KiB
-stack reservation. Its limits are 512 KiB flash and 128 KiB reserved RAM.
+stack reservation. Its limits are 512 KiB flash and 160 KiB reserved RAM.
 These are fixture budgets, not whole-StackChan budgets. The link fixture has
 no RP2350 boot metadata or hardware startup; it establishes linking and storage
 fit, not physical Pico 2 execution or a worst-case stack bound. No allocator,
@@ -50,12 +50,12 @@ were checked against the [WASI Preview 1 specification](https://github.com/WebAs
 `PathRights.lean` proves six statements about fixed ChoreoFS I/O capabilities:
 an accepted object has a nonempty capability and the exact applicable I/O mode;
 an incompatible mode rejects; a writer requires the write bit; a read request
-cannot open a writer; empty materials reject. The gate exports 128 decisions
+cannot open a writer; empty materials reject. The gate exports 160 decisions
 from actual Rust `ChoreoFs::path_open` calls: four material kinds, every
 combination of the three I/O bits, and four ancillary-bit patterns including
 the high bit and every non-I/O bit. Denied calls return no descriptor or binding.
 The kernel checks every decision; the exact axiom audit permits only `propext`
-for all six general theorems and 128 finite decisions.
+for all six general theorems and 160 finite decisions.
 
 `PathRights.smt2` checks all 64-bit base-right patterns. Four UNSAT queries rule
 out empty grants, added I/O rights, silently dropped conflicting applicable

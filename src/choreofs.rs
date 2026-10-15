@@ -81,15 +81,15 @@ impl FdSpec {
 /// `ChoreoFsObject` is not a manifest and not an authority table. It only expands
 /// into [`ChoreoFsFact`] and [`LedgerFdFact`] for local object facts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChoreoFsObject {
-    path: &'static [u8],
+pub struct ChoreoFsObject<'a> {
+    path: &'a [u8],
     object: ObjectId,
     fd: FdSpec,
-    material: ChoreoFsObjectMaterial<'static>,
+    material: ChoreoFsObjectMaterial<'a>,
 }
 
-impl ChoreoFsObject {
-    pub const fn new(path: &'static [u8], object: ObjectId, fd: FdSpec) -> Self {
+impl<'a> ChoreoFsObject<'a> {
+    pub const fn new(path: &'a [u8], object: ObjectId, fd: FdSpec) -> Self {
         Self {
             path,
             object,
@@ -99,10 +99,10 @@ impl ChoreoFsObject {
     }
 
     pub const fn readable(
-        path: &'static [u8],
+        path: &'a [u8],
         object: ObjectId,
         fd: FdSpec,
-        bytes: &'static [u8],
+        bytes: &'a [u8],
         binding: FdBinding,
     ) -> Self {
         Self {
@@ -114,10 +114,10 @@ impl ChoreoFsObject {
     }
 
     pub const fn readdir(
-        path: &'static [u8],
+        path: &'a [u8],
         object: ObjectId,
         fd: FdSpec,
-        listing: &'static [u8],
+        listing: &'a [u8],
         binding: FdBinding,
     ) -> Self {
         Self {
@@ -129,7 +129,7 @@ impl ChoreoFsObject {
     }
 
     pub const fn writable(
-        path: &'static [u8],
+        path: &'a [u8],
         object: ObjectId,
         fd: FdSpec,
         binding: FdBinding,
@@ -142,7 +142,28 @@ impl ChoreoFsObject {
         }
     }
 
-    pub const fn path(&self) -> &'static [u8] {
+    /// Borrowed file contents remain owned by the answering role. A read-only
+    /// open receives only a read binding, even when this object supports writes.
+    pub const fn read_write(
+        path: &'a [u8],
+        object: ObjectId,
+        fd: FdSpec,
+        bytes: &'a [u8],
+        binding: FdBinding,
+    ) -> Self {
+        Self {
+            path,
+            object,
+            fd,
+            material: ChoreoFsObjectMaterial {
+                object,
+                binding,
+                kind: ChoreoFsObjectMaterialKind::ReadWrite(bytes),
+            },
+        }
+    }
+
+    pub const fn path(&self) -> &'a [u8] {
         self.path
     }
 
@@ -154,7 +175,7 @@ impl ChoreoFsObject {
         self.fd
     }
 
-    pub const fn choreofs_fact(&self) -> ChoreoFsFact<'static> {
+    pub const fn choreofs_fact(&self) -> ChoreoFsFact<'a> {
         ChoreoFsFact::new(self.path, self.object)
     }
 
@@ -162,21 +183,21 @@ impl ChoreoFsObject {
         LedgerFdFact::new(self.fd.fd, self.object, self.fd.rights, self.fd.generation)
     }
 
-    const fn material(&self) -> ChoreoFsObjectMaterial<'static> {
+    const fn material(&self) -> ChoreoFsObjectMaterial<'a> {
         self.material
     }
 }
 
 /// Bounded static expansion of ChoreoFS object facts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChoreoFsObjectSet<const N: usize> {
-    choreofs: [ChoreoFsFact<'static>; N],
+pub struct ChoreoFsObjectSet<'a, const N: usize> {
+    choreofs: [ChoreoFsFact<'a>; N],
     ledger: [LedgerFdFact; N],
-    materials: [ChoreoFsObjectMaterial<'static>; N],
+    materials: [ChoreoFsObjectMaterial<'a>; N],
 }
 
-impl<const N: usize> ChoreoFsObjectSet<N> {
-    pub const fn new(specs: [ChoreoFsObject; N]) -> Self {
+impl<'a, const N: usize> ChoreoFsObjectSet<'a, N> {
+    pub const fn new(specs: [ChoreoFsObject<'a>; N]) -> Self {
         let mut choreofs = [ChoreoFsFact::EMPTY; N];
         let mut ledger = [LedgerFdFact::EMPTY; N];
         let mut materials = [ChoreoFsObjectMaterial::EMPTY; N];
@@ -194,15 +215,15 @@ impl<const N: usize> ChoreoFsObjectSet<N> {
         }
     }
 
-    pub const fn choreofs_facts(&'static self) -> ChoreoFsFacts<'static> {
+    pub const fn choreofs_facts(&self) -> ChoreoFsFacts<'_> {
         ChoreoFsFacts::new(&self.choreofs)
     }
 
-    pub const fn ledger_facts(&'static self) -> LedgerFacts<'static> {
+    pub const fn ledger_facts(&self) -> LedgerFacts<'_> {
         LedgerFacts::new(&self.ledger)
     }
 
-    pub const fn choreofs(&'static self) -> ChoreoFs<'static> {
+    pub const fn choreofs(&self) -> ChoreoFs<'_> {
         ChoreoFs::new_with_materials(
             self.choreofs_facts(),
             self.ledger_facts(),
@@ -272,6 +293,7 @@ enum ChoreoFsObjectMaterialKind<'a> {
     Readable(&'a [u8]),
     Readdir(&'a [u8]),
     Writable,
+    ReadWrite(&'a [u8]),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -459,6 +481,26 @@ impl<'a> ChoreoFs<'a> {
         let Some(material) = self.materials.object(object) else {
             return ChoreoFsOpen::denied(open, Some(object), ERRNO_NOENT);
         };
+        if open.fd_flags() & !1 != 0
+            && !(open.fd_flags() == 4
+                && matches!(material.kind, ChoreoFsObjectMaterialKind::Readdir(_)))
+        {
+            return ChoreoFsOpen::denied(open, Some(object), 58); // NOTSUP
+        }
+        if open.open_flags() & 5 == 5 {
+            return ChoreoFsOpen::denied(open, Some(object), 20); // EXIST
+        }
+        if open.open_flags() & 2 != 0
+            && !matches!(material.kind, ChoreoFsObjectMaterialKind::Readdir(_))
+        {
+            return ChoreoFsOpen::denied(open, Some(object), 54); // NOTDIR
+        }
+        if (open.open_flags() & 8 != 0 || open.fd_flags() & 1 != 0)
+            && (open.rights_base() & FD_WRITE_RIGHT == 0
+                || matches!(material.kind, ChoreoFsObjectMaterialKind::Readdir(_)))
+        {
+            return ChoreoFsOpen::denied(open, Some(object), ERRNO_ACCES);
+        }
         let Some(required_rights) = material_required_rights(material, open.rights_base()) else {
             return ChoreoFsOpen::denied(open, Some(object), ERRNO_ACCES);
         };
@@ -468,7 +510,25 @@ impl<'a> ChoreoFs<'a> {
         let Some(fact) = self.ledger.object_with_rights(object, required_rights) else {
             return ChoreoFsOpen::denied(open, Some(object), ERRNO_ACCES);
         };
-        ChoreoFsOpen::opened(open, object, fact.fd(), material.binding())
+        let binding = material.binding();
+        let selected = FdBinding {
+            read: if required_rights & FD_READ_RIGHT != 0 {
+                binding.read
+            } else {
+                None
+            },
+            write: if required_rights & FD_WRITE_RIGHT != 0 {
+                binding.write
+            } else {
+                None
+            },
+            readdir: if required_rights & FD_READDIR_RIGHT != 0 {
+                binding.readdir
+            } else {
+                None
+            },
+        };
+        ChoreoFsOpen::opened(open, object, fact.fd(), selected)
     }
 
     pub fn fd_readdir(&self, read: protocol::FdReaddir) -> ChoreoFsReadDir<'a> {
@@ -485,8 +545,18 @@ impl<'a> ChoreoFs<'a> {
         let Some(material) = self.material_for_fd(read.fd()) else {
             return ChoreoFsRead::denied(read, None, ERRNO_BADF);
         };
-        let ChoreoFsObjectMaterialKind::Readable(bytes) = material.kind else {
-            return ChoreoFsRead::denied(read, Some(material.object()), ERRNO_BADF);
+        let bytes = match material.kind {
+            ChoreoFsObjectMaterialKind::Readable(bytes)
+            | ChoreoFsObjectMaterialKind::ReadWrite(bytes)
+                if material.binding.read.is_some()
+                    && self
+                        .ledger
+                        .fd(read.fd())
+                        .is_some_and(|fact| fact.rights & FD_READ_RIGHT != 0) =>
+            {
+                bytes
+            }
+            _ => return ChoreoFsRead::denied(read, Some(material.object()), ERRNO_BADF),
         };
         ChoreoFsRead::ready(read, material.object(), bytes)
     }
@@ -496,7 +566,17 @@ impl<'a> ChoreoFs<'a> {
             .material_for_fd(write.fd())
             .map(|material| (material.object(), material.kind))
         {
-            Some((object, ChoreoFsObjectMaterialKind::Writable)) => {
+            Some((
+                object,
+                ChoreoFsObjectMaterialKind::Writable | ChoreoFsObjectMaterialKind::ReadWrite(_),
+            )) if self
+                .ledger
+                .fd(write.fd())
+                .is_some_and(|fact| fact.rights & FD_WRITE_RIGHT != 0)
+                && self
+                    .material_for_fd(write.fd())
+                    .is_some_and(|material| material.binding.write.is_some()) =>
+            {
                 ChoreoFsWrite::ready(write, object)
             }
             Some((object, _)) => ChoreoFsWrite::denied(write, Some(object), ERRNO_ACCES),
@@ -511,6 +591,45 @@ impl<'a> ChoreoFs<'a> {
                 protocol::FdStatRet(FdStat::new(fd, rights_from_binding(material.binding())))
             }
             None => protocol::FdStatRet(FdStat::new_with_errno(fd, MemRights::Read, ERRNO_BADF)),
+        }
+    }
+
+    pub fn fd_filestat_get(&self, request: protocol::FdRequest) -> protocol::FdFilestatRet {
+        protocol::FdFilestatRet(
+            self.material_for_fd(request.fd())
+                .map(Self::material_stat)
+                .unwrap_or_else(|| protocol::FileStat::new_with_errno(0, 0, ERRNO_BADF)),
+        )
+    }
+
+    pub fn path_filestat_get(
+        &self,
+        request: protocol::PathFilestatGet,
+    ) -> protocol::PathFilestatRet {
+        protocol::PathFilestatRet(
+            self.choreofs
+                .resolve(request.path())
+                .and_then(|object| self.materials.object(object))
+                .map(Self::material_stat)
+                .unwrap_or_else(|| protocol::FileStat::new_with_errno(0, 0, ERRNO_NOENT)),
+        )
+    }
+
+    fn material_stat(material: ChoreoFsObjectMaterial<'_>) -> protocol::FileStat {
+        match material.kind {
+            ChoreoFsObjectMaterialKind::Readable(bytes)
+            | ChoreoFsObjectMaterialKind::ReadWrite(bytes) => {
+                protocol::FileStat::new(protocol::WASIP1_FILETYPE_REGULAR_FILE, bytes.len() as u64)
+            }
+            ChoreoFsObjectMaterialKind::Readdir(_) => {
+                protocol::FileStat::new(protocol::WASIP1_FILETYPE_DIRECTORY, 0)
+            }
+            ChoreoFsObjectMaterialKind::Writable => {
+                protocol::FileStat::new(protocol::WASIP1_FILETYPE_REGULAR_FILE, 0)
+            }
+            ChoreoFsObjectMaterialKind::Empty => {
+                protocol::FileStat::new_with_errno(0, 0, ERRNO_NOENT)
+            }
         }
     }
 
@@ -804,6 +923,10 @@ fn binding_allows_rights(binding: FdBinding, rights: u64) -> bool {
 
 fn material_required_rights(material: ChoreoFsObjectMaterial<'_>, rights: u64) -> Option<u64> {
     let (required, applicable) = match material.kind {
+        ChoreoFsObjectMaterialKind::ReadWrite(_) => {
+            let requested = rights & (FD_READ_RIGHT | FD_WRITE_RIGHT);
+            return (requested != 0).then_some(requested);
+        }
         ChoreoFsObjectMaterialKind::Empty => return None,
         ChoreoFsObjectMaterialKind::Readable(_) => (FD_READ_RIGHT, FD_READ_RIGHT | FD_WRITE_RIGHT),
         ChoreoFsObjectMaterialKind::Readdir(_) => {
@@ -818,7 +941,9 @@ fn material_required_rights(material: ChoreoFsObjectMaterial<'_>, rights: u64) -
 }
 
 const fn rights_from_binding(binding: FdBinding) -> MemRights {
-    if binding.write.is_some() {
+    if binding.read.is_some() && binding.write.is_some() {
+        MemRights::ReadWrite
+    } else if binding.write.is_some() {
         MemRights::Write
     } else {
         MemRights::Read
@@ -829,7 +954,7 @@ const fn rights_from_binding(binding: FdBinding) -> MemRights {
 mod tests {
     use super::*;
 
-    static OBJECTS: ChoreoFsObjectSet<2> = ChoreoFsObjectSet::new([
+    static OBJECTS: ChoreoFsObjectSet<'static, 2> = ChoreoFsObjectSet::new([
         ChoreoFsObject::new(
             b"outputs/led/green",
             ObjectId(1),
@@ -838,7 +963,7 @@ mod tests {
         ChoreoFsObject::new(b"outputs/led/red", ObjectId(2), FdSpec::new(11, 0b10, 101)),
     ]);
 
-    static RUNTIME_OBJECTS: ChoreoFsObjectSet<3> = ChoreoFsObjectSet::new([
+    static RUNTIME_OBJECTS: ChoreoFsObjectSet<'static, 3> = ChoreoFsObjectSet::new([
         ChoreoFsObject::readdir(
             b"objects",
             ObjectId(10),
@@ -931,10 +1056,65 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_read_write_files_keep_contents_and_attenuate_open_rights() {
+        let contents = [7, 8, 9];
+        let both = FdBinding {
+            read: Some(protocol::FdReadRow::Base),
+            write: Some(protocol::FdWriteRow::Object),
+            readdir: None,
+        };
+        let objects = ChoreoFsObjectSet::new([ChoreoFsObject::read_write(
+            b"file",
+            ObjectId(40),
+            FdSpec::new(6, FD_READ_RIGHT | FD_WRITE_RIGHT, 1),
+            &contents,
+            both,
+        )]);
+        let fs = objects.choreofs();
+        for rights in [
+            FD_READ_RIGHT,
+            FD_WRITE_RIGHT,
+            FD_READ_RIGHT | FD_WRITE_RIGHT,
+        ] {
+            let open = fs.path_open(protocol::PathOpen::new(3, rights, b"file").unwrap());
+            assert!(open.is_open());
+            assert_eq!(open.binding().read.is_some(), rights & FD_READ_RIGHT != 0);
+            assert_eq!(open.binding().write.is_some(), rights & FD_WRITE_RIGHT != 0);
+        }
+        assert!(
+            !fs.path_open(protocol::PathOpen::new(3, 0, b"file").unwrap())
+                .is_open()
+        );
+        let (read, offset) = fs
+            .fd_read(protocol::FdRead::new(6, 2).unwrap())
+            .read_from(1)
+            .unwrap();
+        assert_eq!(read.0.as_bytes(), &[8, 9]);
+        assert_eq!(offset, 3);
+        assert_eq!(fs.fd_filestat_get(protocol::FdRequest::new(6)).0.size(), 3);
+        let read_only_truncate = protocol::PathOpen::new(3, FD_READ_RIGHT, b"file")
+            .unwrap()
+            .with_flags(8, 0)
+            .unwrap();
+        assert!(!fs.path_open(read_only_truncate).is_open());
+        let write_truncate = protocol::PathOpen::new(3, FD_WRITE_RIGHT, b"file")
+            .unwrap()
+            .with_flags(8, 0)
+            .unwrap();
+        assert!(fs.path_open(write_truncate).is_open());
+        assert_eq!(contents, [7, 8, 9]); // Admission itself never mutates file data.
+        let exclusive = protocol::PathOpen::new(3, FD_WRITE_RIGHT, b"file")
+            .unwrap()
+            .with_flags(5, 0)
+            .unwrap();
+        assert_eq!(fs.path_open(exclusive).errno(), 20);
+    }
+
+    #[test]
     #[ignore = "exports actual ChoreoFS decisions for the Lean correspondence gate"]
     fn export_actual_path_rights_decisions() {
         use std::fmt::Write;
-        static OBJECTS: ChoreoFsObjectSet<4> = ChoreoFsObjectSet::new([
+        static OBJECTS: ChoreoFsObjectSet<'static, 5> = ChoreoFsObjectSet::new([
             ChoreoFsObject::new(b"empty", ObjectId(20), FdSpec::new(7, 0, 0)),
             ChoreoFsObject::readable(
                 b"reader",
@@ -956,15 +1136,32 @@ mod tests {
                 b"",
                 FdBinding::readdir(protocol::FdReaddirRow::Base),
             ),
+            ChoreoFsObject::read_write(
+                b"file",
+                ObjectId(24),
+                FdSpec::new(11, FD_READ_RIGHT | FD_WRITE_RIGHT, 0),
+                b"",
+                FdBinding {
+                    read: Some(protocol::FdReadRow::Base),
+                    write: Some(protocol::FdWriteRow::Object),
+                    readdir: None,
+                },
+            ),
         ]);
         let output = std::env::var("HIBANA_WASIP1_PATH_LEAN_EXPORT").expect("export destination");
         let choreofs = OBJECTS.choreofs();
         let mask = FD_READ_RIGHT | FD_WRITE_RIGHT | FD_READDIR_RIGHT;
         let mut lean = std::string::String::from("import PathRights\nnamespace WasiPathRights\n");
         let mut index = 0;
-        for (kind, path) in [b"empty".as_slice(), b"reader", b"writer", b"directory"]
-            .into_iter()
-            .enumerate()
+        for (kind, path) in [
+            b"empty".as_slice(),
+            b"reader",
+            b"writer",
+            b"directory",
+            b"file",
+        ]
+        .into_iter()
+        .enumerate()
         {
             for bits in 0..8 {
                 let io = (if bits & 1 != 0 { FD_READ_RIGHT } else { 0 })
@@ -985,7 +1182,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(index, 128);
+        assert_eq!(index, 160);
         lean.push_str("end WasiPathRights\n");
         std::fs::write(output, lean).unwrap();
         std::println!("Exported {index} actual ChoreoFS path admission decisions");
@@ -993,7 +1190,7 @@ mod tests {
 
     #[test]
     fn path_open_still_requires_both_actual_binding_and_ledger_right() {
-        static OBJECTS: ChoreoFsObjectSet<4> = ChoreoFsObjectSet::new([
+        static OBJECTS: ChoreoFsObjectSet<'static, 4> = ChoreoFsObjectSet::new([
             ChoreoFsObject::writable(
                 b"no-binding",
                 ObjectId(30),

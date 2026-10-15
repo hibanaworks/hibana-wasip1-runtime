@@ -633,16 +633,20 @@ fn lower_request<'a>(
             WasiImportRequest::FdReaddir(protocol::FdReaddirReq(protocol::FdReaddir::new(
                 call.fd(),
                 call.cookie(),
-                inline_io_request_len(call.max_len()),
+                exact_io_reply_len(
+                    u32::try_from(call.max_len())
+                        .map_err(|_| ExchangeError::Wasm(WasmError::Truncated))?,
+                )?,
             )?))
         }
-        Call::PathOpen(call) => {
-            WasiImportRequest::PathOpen(protocol::PathOpenReq(protocol::PathOpen::new(
+        Call::PathOpen(call) => WasiImportRequest::PathOpen(protocol::PathOpenReq(
+            protocol::PathOpen::new(
                 call.fd(),
                 call.rights_base(),
                 call.path_bytes(guest)?.as_bytes(),
-            )?))
-        }
+            )?
+            .with_flags(call.open_flags(), call.fd_flags())?,
+        )),
         Call::FdPrestatGet(call) => {
             WasiImportRequest::FdPrestatGet(protocol::FdPrestatGetReq(FdRequest::new(call.fd())))
         }
@@ -813,8 +817,23 @@ fn wasm_fd_stat(stat: protocol::FdStat, binding: Option<FdBinding>) -> WasmFdSta
     let rights_base = match stat.rights() {
         MemRights::Read => FD_READ_RIGHT,
         MemRights::Write => FD_WRITE_RIGHT,
+        MemRights::ReadWrite => FD_READ_RIGHT | FD_WRITE_RIGHT,
     };
-    WasmFdStat::new(0, 0, rights_base, 0)
+    let bound_rights = match binding {
+        Some(binding) => {
+            (if binding.read.is_some() {
+                FD_READ_RIGHT
+            } else {
+                0
+            }) | (if binding.write.is_some() {
+                FD_WRITE_RIGHT
+            } else {
+                0
+            })
+        }
+        None => 0,
+    };
+    WasmFdStat::new(0, 0, rights_base & bound_rights, 0)
 }
 
 fn wasm_file_stat(stat: protocol::FileStat) -> WasmFileStat {

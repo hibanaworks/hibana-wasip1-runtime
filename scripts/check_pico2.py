@@ -87,8 +87,6 @@ version = "0.0.0"
 edition = "2024"
 [dependencies]
 hibana-wasip1-runtime = {{ path = {json.dumps(str(ROOT))} }}
-[patch.crates-io]
-hibana = {{ path = {json.dumps(str(ROOT.parent / "hibana"))} }}
 [profile.release]
 opt-level = "z"
 codegen-units = 1

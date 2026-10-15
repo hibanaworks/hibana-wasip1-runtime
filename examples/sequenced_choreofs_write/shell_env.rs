@@ -45,7 +45,7 @@ const OBJECTS_DIRENT_LOG: &[u8] = &[
     b'l', b'o', b'g',
 ];
 
-static CHOREOFS_OBJECTS: ChoreoFsObjectSet<3> = ChoreoFsObjectSet::new([
+static CHOREOFS_OBJECTS: ChoreoFsObjectSet<'static, 3> = ChoreoFsObjectSet::new([
     ChoreoFsObject::readdir(
         b"objects",
         OBJECTS_DIR_ID,
@@ -123,7 +123,8 @@ impl ShellEnv {
 
     pub fn open_path(&mut self, open: protocol::PathOpen) -> DemoResult<protocol::PathOpenedRet> {
         let normalized = normalize_choreofs_path(open.path());
-        let open = protocol::PathOpen::new(open.preopen_fd(), open.rights_base(), normalized)?;
+        let open = protocol::PathOpen::new(open.preopen_fd(), open.rights_base(), normalized)?
+            .with_flags(open.open_flags() as u32, open.fd_flags() as u32)?;
         let operation = self.choreofs.path_open(open);
         if let (Some(fd), Some(object)) = (operation.fd(), operation.object()) {
             self.materialize_choreofs_fd(fd, object);

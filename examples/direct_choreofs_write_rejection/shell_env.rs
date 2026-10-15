@@ -23,12 +23,13 @@ const FD_WRITE_RIGHT: u64 = 1 << 6;
 const ERRNO_ACCES: u16 = 2;
 const ERRNO_BADF: u16 = 8;
 
-static CHOREOFS_OBJECTS: ChoreoFsObjectSet<1> = ChoreoFsObjectSet::new([ChoreoFsObject::writable(
-    b"outputs/led/green",
-    LED_GREEN_ID,
-    FdSpec::new(LED_GREEN_FD, FD_WRITE_RIGHT, 1),
-    FdBinding::write(FdWriteRow::Object),
-)]);
+static CHOREOFS_OBJECTS: ChoreoFsObjectSet<'static, 1> =
+    ChoreoFsObjectSet::new([ChoreoFsObject::writable(
+        b"outputs/led/green",
+        LED_GREEN_ID,
+        FdSpec::new(LED_GREEN_FD, FD_WRITE_RIGHT, 1),
+        FdBinding::write(FdWriteRow::Object),
+    )]);
 
 pub struct ShellEnv {
     choreofs: ChoreoFs<'static>,
@@ -142,7 +143,8 @@ impl ShellEnv {
 
     pub fn open_path(&mut self, open: protocol::PathOpen) -> DemoResult<protocol::PathOpenedRet> {
         let normalized = normalize_choreofs_path(open.path());
-        let open = protocol::PathOpen::new(open.preopen_fd(), open.rights_base(), normalized)?;
+        let open = protocol::PathOpen::new(open.preopen_fd(), open.rights_base(), normalized)?
+            .with_flags(open.open_flags() as u32, open.fd_flags() as u32)?;
         let operation = self.choreofs.path_open(open);
         if let (Some(fd), Some(object)) = (operation.fd(), operation.object()) {
             self.entries.retain(|entry| entry.fd != fd);

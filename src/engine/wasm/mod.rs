@@ -375,6 +375,13 @@ pub struct PathOpen {
 }
 
 impl PathOpen {
+    pub const fn open_flags(&self) -> u32 {
+        self.call.open_flags()
+    }
+    pub const fn fd_flags(&self) -> u32 {
+        self.call.fd_flags()
+    }
+
     pub const fn fd(&self) -> u8 {
         self.call.fd()
     }

@@ -891,6 +891,8 @@ pub(super) struct PathOpenCall {
     path_ptr: u32,
     path_len: u32,
     rights_base: u64,
+    open_flags: u32,
+    fd_flags: u32,
     opened_fd_ptr: u32,
 }
 
@@ -901,6 +903,12 @@ impl PathOpenCall {
 
     pub(super) const fn rights_base(self) -> u64 {
         self.rights_base
+    }
+    pub(super) const fn open_flags(self) -> u32 {
+        self.open_flags
+    }
+    pub(super) const fn fd_flags(self) -> u32 {
+        self.fd_flags
     }
 }
 
@@ -3823,13 +3831,11 @@ impl<'a> Interpreter<'a> {
             }
             Wasip1Row::PathOpen => {
                 let opened_fd_ptr = self.pop_core_i32()?;
-                self.pop_core_i32()?;
-                // Child inheritance does not authorize I/O on this descriptor.
-                // ChoreoFS objects have fixed capabilities, without a mutable
-                // directory inheritance ledger.
+                let fd_flags = self.pop_core_i32()?;
+                // Inheriting rights cannot authorize this descriptor's base I/O.
                 self.pop_core_i64()?;
                 let rights_base = self.pop_core_i64()?;
-                self.pop_core_i32()?;
+                let open_flags = self.pop_core_i32()?;
                 let path_len = self.pop_core_i32()?;
                 let path_ptr = self.pop_core_i32()?;
                 self.pop_core_i32()?;
@@ -3839,6 +3845,8 @@ impl<'a> Interpreter<'a> {
                     path_ptr,
                     path_len,
                     rights_base,
+                    open_flags,
+                    fd_flags,
                     opened_fd_ptr,
                 }))
             }
@@ -4859,7 +4867,7 @@ impl<'a> Vm<'a> {
             .prepare_wasip1_completion(pending, Wasip1Result::I32(errno))?;
         let published = if errno == 0 {
             let requested = self.fd_write_total_len(call)?;
-            if written > requested {
+            if written > requested.min(WASIP1_IO_CHUNK_CAPACITY as u32) {
                 return Err(unsupported!("fd_write reply exceeds requested bytes"));
             }
             written
@@ -5058,6 +5066,7 @@ impl<'a> Vm<'a> {
     }
 
     pub(super) fn path_bytes(&self, call: PathOpenCall) -> Result<PathBytes, WasmError> {
+        self.core.require_memory_range(call.opened_fd_ptr, 4)?;
         self.read_path_bytes(call.path_ptr, call.path_len)
     }
 
@@ -5273,34 +5282,31 @@ impl<'a> Vm<'a> {
         call: FdWriteCall,
         out: &mut [u8],
     ) -> Result<usize, WasmError> {
-        let payload_len = self.fd_write_total_len(call)? as usize;
-        if payload_len > out.len() {
-            return Err(unsupported!("fd_write payload buffer too small"));
-        }
-        if call.iovs_len == 0 {
-            self.core.read_memory(call.iovs, &mut out[..payload_len])?;
-        } else {
-            let mut copied = 0usize;
-            for index in 0..call.iovs_len {
-                let offset = index.checked_mul(8).ok_or(WasmError::Truncated)?;
-                let iov = call.iovs.checked_add(offset).ok_or(WasmError::Truncated)?;
-                let ptr = self.core.read_memory_u32(iov)?;
-                let len = self
-                    .core
-                    .read_memory_u32(iov.checked_add(4).ok_or(WasmError::Truncated)?)?
-                    as usize;
-                let end = copied.checked_add(len).ok_or(WasmError::Truncated)?;
-                self.core.read_memory(ptr, &mut out[copied..end])?;
-                copied = end;
+        // Validate every input region and the result counter before publishing
+        // even a short write. A later invalid iovec cannot follow an external effect.
+        self.core.require_memory_range(call.nwritten, 4)?;
+        let payload_len = (self.fd_write_total_len(call)? as usize).min(out.len());
+        let mut copied = 0usize;
+        for index in 0..call.iovs_len {
+            let offset = index.checked_mul(8).ok_or(WasmError::Truncated)?;
+            let iov = call.iovs.checked_add(offset).ok_or(WasmError::Truncated)?;
+            let ptr = self.core.read_memory_u32(iov)?;
+            let len = self
+                .core
+                .read_memory_u32(iov.checked_add(4).ok_or(WasmError::Truncated)?)?
+                as usize;
+            self.core.require_memory_range(ptr, len)?;
+            let take = len.min(payload_len - copied);
+            if take != 0 {
+                self.core
+                    .read_memory(ptr, &mut out[copied..copied + take])?;
             }
+            copied += take;
         }
         Ok(payload_len)
     }
 
     pub(super) fn fd_write_total_len(&self, call: FdWriteCall) -> Result<u32, WasmError> {
-        if call.iovs_len == 0 {
-            return Ok(call.nwritten);
-        }
         let mut total = 0u32;
         for index in 0..call.iovs_len {
             let offset = index.checked_mul(8).ok_or(WasmError::Truncated)?;
@@ -5341,10 +5347,11 @@ impl<'a> Vm<'a> {
             return Err(unsupported!("only one fd_read iovec is supported"));
         }
         let len_addr = call.iovs.checked_add(4).ok_or(WasmError::Truncated)?;
-        Ok((
-            self.core.read_memory_u32(call.iovs)?,
-            self.core.read_memory_u32(len_addr)?,
-        ))
+        let pointer = self.core.read_memory_u32(call.iovs)?;
+        let len = self.core.read_memory_u32(len_addr)?;
+        self.core.require_memory_range(pointer, len as usize)?;
+        self.core.require_memory_range(call.nread, 4)?;
+        Ok((pointer, len))
     }
 
     fn write_cstr_vector(
@@ -6734,19 +6741,22 @@ mod tests {
 
     #[test]
     fn core_wasip1_trampoline_maps_fd_write() {
-        static CORE_WASIP1_FD_WRITE_GUEST: &[u8] = &[
-            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0c, 0x02, 0x60, 0x04, 0x7f,
-            0x7f, 0x7f, 0x7f, 0x01, 0x7f, 0x60, 0x00, 0x00, 0x02, 0x23, 0x01, 0x16, b'w', b'a',
-            b's', b'i', b'_', b's', b'n', b'a', b'p', b's', b'h', b'o', b't', b'_', b'p', b'r',
-            b'e', b'v', b'i', b'e', b'w', b'1', 0x08, b'f', b'd', b'_', b'w', b'r', b'i', b't',
-            b'e', 0x00, 0x00, 0x03, 0x02, 0x01, 0x01, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x0a,
-            0x01, 0x06, b'_', b's', b't', b'a', b'r', b't', 0x00, 0x01, 0x0a, 0x16, 0x01, 0x14,
-            0x00, 0x41, 0x00, 0x41, 0x31, 0x3a, 0x00, 0x00, 0x41, 0x03, 0x41, 0x00, 0x41, 0x00,
-            0x41, 0x01, 0x10, 0x00, 0x1a, 0x0b,
-        ];
-
-        let mut guest = TestVm::new(CORE_WASIP1_FD_WRITE_GUEST)
-            .expect("instantiate core wasip1 fd_write guest");
+        let module = core_wasip1_single_import_module(
+            Wasip1ImportName::FdWrite,
+            &[VALTYPE_I32; 4],
+            &[VALTYPE_I32],
+            &[
+                TestWasmArg::I32(3),
+                TestWasmArg::I32(0),
+                TestWasmArg::I32(1),
+                TestWasmArg::I32(196),
+            ],
+            true,
+        );
+        let mut guest = TestVm::new(&module).unwrap();
+        guest.write_memory(0, &160u32.to_le_bytes()).unwrap();
+        guest.write_memory(4, &1u32.to_le_bytes()).unwrap();
+        guest.write_memory(160, b"1").unwrap();
         assert_eq!(guest.import_plan_diagnostics().import_count(), 1);
         let VmEvent::FdWrite(write) = guest
             .resume(test_budget())
@@ -6851,6 +6861,50 @@ mod tests {
                 WasmError::Invalid(diagnostic!("fd_write import signature mismatch"))
             ),
             Ok(_) => panic!("signature-mismatch import must be rejected at load time"),
+        }
+    }
+
+    #[test]
+    fn fd_write_prefix_preflights_all_iovecs_and_zero_vectors_are_empty() {
+        for count in [0, 2] {
+            let module = core_wasip1_single_import_module(
+                Wasip1ImportName::FdWrite,
+                &[VALTYPE_I32; 4],
+                &[VALTYPE_I32],
+                &[
+                    TestWasmArg::I32(1),
+                    TestWasmArg::I32(0),
+                    TestWasmArg::I32(count),
+                    TestWasmArg::I32(32),
+                ],
+                true,
+            );
+            let mut guest = TestVm::new(&module).unwrap();
+            guest.write_memory(0, &128u32.to_le_bytes()).unwrap();
+            guest.write_memory(4, &100u32.to_le_bytes()).unwrap();
+            guest.write_memory(8, &228u32.to_le_bytes()).unwrap();
+            guest.write_memory(12, &100u32.to_le_bytes()).unwrap();
+            guest.write_memory(128, &[7; 200]).unwrap();
+            let VmEvent::FdWrite(write) = guest.resume(test_budget()).unwrap() else {
+                panic!("write");
+            };
+            let payload = guest.fd_write_payload(write).unwrap();
+            assert_eq!(payload.as_bytes().len(), if count == 0 { 0 } else { 96 });
+            if count == 2 {
+                assert_eq!(payload.as_bytes(), &[7; 96]);
+                assert!(guest.finish_fd_write(write, 97, 0).is_err());
+                // The invalid tail is checked even though the exposed prefix ends in iovec 0.
+                guest.write_memory(8, &65535u32.to_le_bytes()).unwrap();
+                assert!(guest.fd_write_payload(write).is_err());
+                guest.write_memory(8, &228u32.to_le_bytes()).unwrap();
+            }
+            guest
+                .finish_fd_write(write, if count == 0 { 0 } else { 96 }, 0)
+                .unwrap();
+            assert_eq!(
+                guest.read_memory_u32(32).unwrap(),
+                if count == 0 { 0 } else { 96 }
+            );
         }
     }
 
@@ -7450,10 +7504,10 @@ mod tests {
                     TestWasmArg::I32(0),
                     TestWasmArg::I32(160),
                     TestWasmArg::I32(10),
-                    TestWasmArg::I32(0),
+                    TestWasmArg::I32(8),
                     TestWasmArg::I64(base),
                     TestWasmArg::I64(inheriting),
-                    TestWasmArg::I32(0),
+                    TestWasmArg::I32(1),
                     TestWasmArg::I32(196),
                 ],
                 true,
@@ -7463,6 +7517,8 @@ mod tests {
                 panic!("path_open expected");
             };
             assert_eq!(path.rights_base(), base);
+            assert_eq!(path.open_flags(), 8);
+            assert_eq!(path.fd_flags(), 1);
             guest.write_memory(196, &[0xa5; 4]).unwrap();
             guest.finish_path_open(path, 0, 2).unwrap();
             assert_eq!(guest.read_memory_u32(196).unwrap(), 0xa5a5a5a5);

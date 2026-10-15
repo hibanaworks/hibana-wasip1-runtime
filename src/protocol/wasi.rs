@@ -11,6 +11,7 @@ pub type MemoryGrowRetMsg = Msg<LABEL_ENGINE_MEMORY_GROW_RET, MemoryGrowRet>;
 pub enum MemRights {
     Read,
     Write,
+    ReadWrite,
 }
 
 impl MemRights {
@@ -18,6 +19,7 @@ impl MemRights {
         match self {
             Self::Read => 1,
             Self::Write => 2,
+            Self::ReadWrite => 3,
         }
     }
 
@@ -25,6 +27,7 @@ impl MemRights {
         match tag {
             1 => Ok(Self::Read),
             2 => Ok(Self::Write),
+            3 => Ok(Self::ReadWrite),
             _ => Err(CodecError::Malformed),
         }
     }
@@ -785,6 +788,8 @@ impl FdPrestatDirName {
 pub struct PathOpen {
     rights_base: u64,
     path: [u8; WASIP1_PATH_CHUNK_CAPACITY],
+    open_flags: u16,
+    fd_flags: u16,
     preopen_fd: u8,
     len: u8,
 }
@@ -798,10 +803,27 @@ impl PathOpen {
         out[..path.len()].copy_from_slice(path);
         Ok(Self {
             rights_base,
+            open_flags: 0,
+            fd_flags: 0,
             path: out,
             preopen_fd,
             len: path.len() as u8,
         })
+    }
+
+    pub fn with_flags(mut self, open: u32, fd: u32) -> Result<Self, CodecError> {
+        if open & !15 != 0 || fd & !31 != 0 {
+            return Err(CodecError::Malformed);
+        }
+        self.open_flags = open as u16;
+        self.fd_flags = fd as u16;
+        Ok(self)
+    }
+    pub const fn open_flags(&self) -> u16 {
+        self.open_flags
+    }
+    pub const fn fd_flags(&self) -> u16 {
+        self.fd_flags
     }
 
     pub const fn preopen_fd(&self) -> u8 {
@@ -825,16 +847,19 @@ impl PathOpen {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() < 10 {
+        if bytes.len() < 14 {
             return Err(CodecError::Truncated);
         }
-        let len = bytes[9] as usize;
-        if bytes.len() != 10 + len {
+        let len = bytes[13] as usize;
+        if bytes.len() != 14 + len {
             return Err(CodecError::Malformed);
         }
         let mut rights = [0u8; 8];
         rights.copy_from_slice(&bytes[1..9]);
-        Self::new(bytes[0], u64::from_be_bytes(rights), &bytes[10..])
+        Self::new(bytes[0], u64::from_be_bytes(rights), &bytes[14..])?.with_flags(
+            u16::from_be_bytes([bytes[9], bytes[10]]) as u32,
+            u16::from_be_bytes([bytes[11], bytes[12]]) as u32,
+        )
     }
 }
 
@@ -1758,14 +1783,16 @@ impl TypedWasiPayload for PathOpen {
 
     fn encode_payload(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let len = self.len();
-        if out.len() < 10 + len {
+        if out.len() < 14 + len {
             return Err(CodecError::Truncated);
         }
         out[0] = self.preopen_fd();
         out[1..9].copy_from_slice(&self.rights_base().to_be_bytes());
-        out[9] = len as u8;
-        out[10..10 + len].copy_from_slice(self.path());
-        Ok(10 + len)
+        out[9..11].copy_from_slice(&self.open_flags().to_be_bytes());
+        out[11..13].copy_from_slice(&self.fd_flags().to_be_bytes());
+        out[13] = len as u8;
+        out[14..14 + len].copy_from_slice(self.path());
+        Ok(14 + len)
     }
 
     fn decode_payload_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -2288,6 +2315,32 @@ mod tests {
             PathOpen::new(3, 0, &[b'p'; WASIP1_PATH_CHUNK_CAPACITY + 1]),
             Err(CodecError::Malformed)
         ));
+    }
+
+    #[test]
+    fn path_open_flags_and_duplex_stat_are_exact_wire_data() {
+        let open = PathOpenReq(
+            PathOpen::new(3, 66, b"work/0")
+                .unwrap()
+                .with_flags(8, 1)
+                .unwrap(),
+        );
+        let mut bytes = [0; 64];
+        let len = open.encode_into(&mut bytes).unwrap();
+        assert_eq!(len, 20);
+        assert_eq!(decode::<PathOpenReq>(&bytes[..len]), Ok(open));
+        assert!(decode::<PathOpenReq>(&bytes[..len - 1]).is_err());
+        bytes[9] = 128;
+        assert!(decode::<PathOpenReq>(&bytes[..len]).is_err());
+        assert!(
+            PathOpen::new(3, 66, b"work/0")
+                .unwrap()
+                .with_flags(16, 0)
+                .is_err()
+        );
+        let stat = FdStatRet(FdStat::new(6, MemRights::ReadWrite));
+        let len = stat.encode_into(&mut bytes).unwrap();
+        assert_eq!(decode::<FdStatRet>(&bytes[..len]), Ok(stat));
     }
 
     #[test]
