@@ -10,7 +10,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "thumbv8m.main-none-eabi"
-RAM_LIMIT = 128 * 1024
+RAM_LIMIT = 160 * 1024
 FLASH_LIMIT = 512 * 1024
 STACK_RESERVED = 24 * 1024
 

@@ -167,11 +167,11 @@ The current Wasm profile is bounded as follows:
 
 | Area | Ceiling |
 | --- | ---: |
-| types / imports / functions / globals | 24 / 16 / 224 / 16 |
+| types / imports / functions / globals | 24 / 16 / 384 / 16 |
 | parameters / results per function | 12 / 1 |
-| value stack / locals / call frames | 64 / 32 / 16 |
-| control frames / decoded control targets | 128 / 192 |
-| `br_table` labels / table functions | 64 / 64 |
+| value stack / locals / call frames | 128 / 32 / 64 |
+| control frames / decoded control targets | 512 / 320 |
+| `br_table` labels / table functions | 64 / 128 |
 | data segments / element segments | 8 / 8 |
 
 These are rejection ceilings, not truncation points. Raising one requires
@@ -342,9 +342,11 @@ while the guest continues to use ordinary Rust `std` APIs.
 ## Embedded Budget
 
 The same public API is compiled for Pico 2 (`thumbv8m.main-none-eabi`). On ARM, a compile-time
-assertion limits the VM object to 32 KiB. `DEFAULT_GUEST_MEMORY_BYTES` is one
+assertion limits the VM object to 64 KiB. `DEFAULT_GUEST_MEMORY_BYTES` is one
 64 KiB Wasm page, so the VM object plus default guest backing is bounded by
-96 KiB before caller-owned Hibana session, transport, and application storage.
+128 KiB before caller-owned Hibana session, transport, and application storage.
+The Pico 2 link fixture reserves a further 24 KiB stack and checks a 160 KiB
+combined RAM ceiling, including the fixture storage. These explicit bounds replace the earlier smaller profile.
 
 Guest memory remains caller-owned. `memory.grow` cannot commit beyond that
 backing or the module limit. The hot path performs no allocation and uses

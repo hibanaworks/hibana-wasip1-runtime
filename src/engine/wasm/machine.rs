@@ -218,23 +218,23 @@ const TEST_RESUME_FUEL: u32 = 1024;
 const WASM_BLOCKTYPE_EMPTY: u8 = 0x40;
 const CORE_WASM_MAX_TYPES: usize = 24;
 const CORE_WASM_MAX_IMPORTS: usize = 16;
-const CORE_WASM_MAX_FUNCTIONS: usize = 224;
+const CORE_WASM_MAX_FUNCTIONS: usize = 384;
 const CORE_WASM_MAX_GLOBALS: usize = 16;
 const CORE_WASM_MAX_PARAMS: usize = 12;
 const CORE_WASM_MAX_RESULTS: usize = 1;
-const CORE_WASM_VALUE_STACK_CAPACITY: usize = 64;
+const CORE_WASM_VALUE_STACK_CAPACITY: usize = 128;
 const CORE_WASM_LOCAL_CAPACITY: usize = 32;
-const CORE_WASM_CALL_STACK_CAPACITY: usize = 16;
-const CORE_WASM_CONTROL_STACK_CAPACITY: usize = 128;
-const CORE_WASM_CONTROL_TARGET_CAPACITY: usize = 192;
+const CORE_WASM_CALL_STACK_CAPACITY: usize = 64;
+const CORE_WASM_CONTROL_STACK_CAPACITY: usize = 512;
+const CORE_WASM_CONTROL_TARGET_CAPACITY: usize = 320;
 const CORE_WASM_CONTROL_TARGET_FRAME_NONE: u8 = u8::MAX;
 const CORE_WASM_BR_TABLE_CAPACITY: usize = 64;
-const CORE_WASM_TABLE_CAPACITY: usize = 64;
+const CORE_WASM_TABLE_CAPACITY: usize = 128;
 const CORE_WASM_MAX_ELEMENT_SEGMENTS: usize = 8;
 const CORE_WASM_DATA_COUNT_NONE: u8 = u8::MAX;
 const CORE_WASM_PAGE_SIZE: usize = 64 * 1024;
 #[cfg(any(test, target_arch = "arm"))]
-const VM_OBJECT_BUDGET_BYTES: usize = 32 * 1024;
+const VM_OBJECT_BUDGET_BYTES: usize = 64 * 1024;
 #[cfg(test)]
 const WASIP1_EVENTTYPE_CLOCK: u8 = 0;
 #[cfg(test)]
@@ -1166,9 +1166,9 @@ pub(super) struct EnvironGetCall {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CodeBody<'a> {
-    code: &'a [u8],
-    local_count: usize,
-    local_kinds: [ValueKind; CORE_WASM_LOCAL_CAPACITY],
+    body: &'a [u8],
+    code_start: u32,
+    local_count: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1195,12 +1195,12 @@ enum Instr {
 struct ControlInstr {
     result_count: usize,
     result_kind: ValueKind,
-    else_pos: u16,
-    end_pos: u16,
+    else_pos: u32,
+    end_pos: u32,
 }
 
 impl ControlInstr {
-    const NONE: u16 = u16::MAX;
+    const NONE: u32 = u32::MAX;
 
     const fn new(result_count: usize, result_kind: ValueKind) -> Self {
         Self {
@@ -1230,13 +1230,13 @@ impl ControlInstr {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CoreControlTarget {
-    start_pos: u16,
-    else_pos: u16,
-    end_pos: u16,
+    start_pos: u32,
+    else_pos: u32,
+    end_pos: u32,
 }
 
 impl CoreControlTarget {
-    const NONE: u16 = u16::MAX;
+    const NONE: u32 = u32::MAX;
     const EMPTY: Self = Self {
         start_pos: 0,
         else_pos: Self::NONE,
@@ -1245,7 +1245,7 @@ impl CoreControlTarget {
 
     fn new(start_pos: usize) -> Result<Self, WasmError> {
         Ok(Self {
-            start_pos: u16::try_from(start_pos)
+            start_pos: u32::try_from(start_pos)
                 .map_err(|_| unsupported!("core wasm body too large"))?,
             else_pos: Self::NONE,
             end_pos: Self::NONE,
@@ -1314,12 +1314,59 @@ struct Global {
     initial: Value,
 }
 
+// Each local stores its payload and exactly one type tag. Keeping the tags
+// separate avoids the alignment padding of a full Value in every frame slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalValues {
+    words: [u64; CORE_WASM_LOCAL_CAPACITY],
+    kinds: [ValueKind; CORE_WASM_LOCAL_CAPACITY],
+}
+impl LocalValues {
+    const fn empty() -> Self {
+        Self {
+            words: [0; CORE_WASM_LOCAL_CAPACITY],
+            kinds: [ValueKind::I32; CORE_WASM_LOCAL_CAPACITY],
+        }
+    }
+    fn get(&self, index: usize) -> Option<Value> {
+        let word = *self.words.get(index)?;
+        Some(match self.kinds[index] {
+            ValueKind::I32 => Value::I32(word as u32),
+            ValueKind::I64 => Value::I64(word),
+            ValueKind::F32 => Value::F32(word as u32),
+            ValueKind::F64 => Value::F64(word),
+            ValueKind::FuncRef => Value::FuncRef(word as u32),
+        })
+    }
+    fn initialize(&mut self, index: usize, value: Value) -> Result<(), WasmError> {
+        let word = self.words.get_mut(index).ok_or(WasmError::StackOverflow)?;
+        *word = match value {
+            Value::I32(v) | Value::F32(v) | Value::FuncRef(v) => v as u64,
+            Value::I64(v) | Value::F64(v) => v,
+        };
+        self.kinds[index] = value.kind();
+        Ok(())
+    }
+    fn initialize_range(
+        &mut self,
+        range: core::ops::Range<usize>,
+        value: Value,
+    ) -> Result<(), WasmError> {
+        if range.start > range.end || range.end > CORE_WASM_LOCAL_CAPACITY {
+            return Err(WasmError::StackOverflow);
+        }
+        for index in range {
+            self.initialize(index, value)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Frame<'a> {
     code: &'a [u8],
     pc: usize,
-    locals: [Value; CORE_WASM_LOCAL_CAPACITY],
-    local_kinds: [ValueKind; CORE_WASM_LOCAL_CAPACITY],
+    locals: LocalValues,
     local_count: usize,
     control_base: usize,
     control_len: usize,
@@ -1330,8 +1377,7 @@ impl<'a> Frame<'a> {
         Self {
             code: &[],
             pc: 0,
-            locals: [Value::I32(0); CORE_WASM_LOCAL_CAPACITY],
-            local_kinds: [ValueKind::I32; CORE_WASM_LOCAL_CAPACITY],
+            locals: LocalValues::empty(),
             local_count: 0,
             control_base: 0,
             control_len: 0,
@@ -1520,8 +1566,8 @@ struct ControlFrame {
     result_kind: ValueKind,
     result_count: u8,
     stack_height: u8,
-    start_pos: u16,
-    end_pos: u16,
+    start_pos: u32,
+    end_pos: u32,
 }
 
 impl ControlFrame {
@@ -1549,9 +1595,9 @@ impl ControlFrame {
                 .map_err(|_| unsupported!("core control result count too large"))?,
             stack_height: u8::try_from(stack_height)
                 .map_err(|_| unsupported!("core value stack too deep"))?,
-            start_pos: u16::try_from(start_pos)
+            start_pos: u32::try_from(start_pos)
                 .map_err(|_| unsupported!("core wasm body too large"))?,
-            end_pos: u16::try_from(end_pos)
+            end_pos: u32::try_from(end_pos)
                 .map_err(|_| unsupported!("core wasm body too large"))?,
         })
     }
@@ -2162,34 +2208,27 @@ impl<'a> Module<'a> {
             let body_len = section.read_var_u32()? as usize;
             let body = section.read_bytes(body_len)?;
             let mut body_reader = Reader::new(body);
-            let mut local_count = 0usize;
-            let mut local_kinds = [ValueKind::I32; CORE_WASM_LOCAL_CAPACITY];
-
             let function_type = self.core_func_type(self.function_type_indices[local_index])?;
-            local_kinds[..function_type.param_count]
-                .copy_from_slice(&function_type.params[..function_type.param_count]);
-            local_count += function_type.param_count;
+            let mut local_count = function_type.param_count;
 
             let local_decl_count = body_reader.read_var_u32()?;
             for _ in 0..local_decl_count {
                 let count = body_reader.read_var_u32()? as usize;
-                let kind = ValueKind::decode(body_reader.read_u8()?)?;
+                ValueKind::decode(body_reader.read_u8()?)?;
                 let end = local_count
                     .checked_add(count)
                     .ok_or(unsupported!("too many core wasm locals"))?;
                 if end > CORE_WASM_LOCAL_CAPACITY {
                     return Err(unsupported!("too many core wasm locals"));
                 }
-                for slot in local_kinds.iter_mut().take(end).skip(local_count) {
-                    *slot = kind;
-                }
                 local_count = end;
             }
-            let code = &body[body_reader.pos..];
             self.code_bodies[local_index] = Some(CodeBody {
-                code,
-                local_count,
-                local_kinds,
+                body,
+                code_start: u32::try_from(body_reader.pos)
+                    .map_err(|_| unsupported!("core code offset exceeds u32"))?,
+                local_count: u8::try_from(local_count)
+                    .map_err(|_| unsupported!("too many core wasm locals"))?,
             });
         }
         Ok(())
@@ -2472,7 +2511,7 @@ fn decode_core_control_targets(
                 if target.else_pos != ControlInstr::NONE {
                     return Err(invalid!("duplicate else"));
                 }
-                target.else_pos = u16::try_from(opcode_pos)
+                target.else_pos = u32::try_from(opcode_pos)
                     .map_err(|_| unsupported!("core wasm body too large"))?;
             }
             OPCODE_END => {
@@ -2487,7 +2526,7 @@ fn decode_core_control_targets(
                     let target = targets
                         .get_mut(target_index)
                         .ok_or(invalid!("core control target missing"))?;
-                    target.end_pos = u16::try_from(opcode_pos)
+                    target.end_pos = u32::try_from(opcode_pos)
                         .map_err(|_| unsupported!("core wasm body too large"))?;
                     stack[depth] = usize::MAX;
                 }
@@ -2809,7 +2848,7 @@ impl<'a> Interpreter<'a> {
             }
             OPCODE_LOCAL_GET => {
                 let local = value as usize;
-                let value = *self
+                let value = self
                     .current_frame()?
                     .locals
                     .get(local)
@@ -3655,17 +3694,29 @@ impl<'a> Interpreter<'a> {
                 .get_mut(self.frame_len)
                 .ok_or(WasmError::StackOverflow)?;
             *slot = Frame::empty();
-            slot.code = body.code;
-            slot.local_count = body.local_count;
-            slot.local_kinds = body.local_kinds;
+            slot.code = &body.body[body.code_start as usize..];
+            slot.local_count = body.local_count as usize;
             slot.control_base = control_base;
             slot.control_len = 0;
 
             for index in 0..ty.param_count {
-                slot.locals[index] = self.values[arg_start + index];
+                slot.locals
+                    .initialize(index, self.values[arg_start + index])?;
             }
-            for index in ty.param_count..body.local_count {
-                slot.locals[index] = Value::zero(body.local_kinds[index]);
+            // Local declarations remain borrowed from the immutable module.
+            // Expand only the called function's locals into its active frame.
+            let mut declarations = Reader::new(&body.body[..body.code_start as usize]);
+            let groups = declarations.read_var_u32()?;
+            let mut next = ty.param_count;
+            for _ in 0..groups {
+                let count = declarations.read_var_u32()? as usize;
+                let kind = ValueKind::decode(declarations.read_u8()?)?;
+                let end = next.checked_add(count).ok_or(WasmError::StackOverflow)?;
+                slot.locals.initialize_range(next..end, Value::zero(kind))?;
+                next = end;
+            }
+            if next != body.local_count as usize || !declarations.is_empty() {
+                return Err(invalid!("core local declaration mismatch"));
             }
         }
         self.frame_len += 1;
@@ -4137,11 +4188,18 @@ impl<'a> Interpreter<'a> {
         if local >= frame.local_count {
             return Err(invalid!("core local.set inactive local"));
         }
-        if value.kind() != frame.local_kinds[local] {
+        // Initialization gives every local its declared kind. All later writes
+        // pass this check before mutation, so the value retains that kind.
+        if value.kind()
+            != frame
+                .locals
+                .get(local)
+                .ok_or(WasmError::StackOverflow)?
+                .kind()
+        {
             return Err(invalid!("core local type mismatch"));
         }
-        frame.locals[local] = value;
-        Ok(())
+        frame.locals.initialize(local, value)
     }
 
     fn push_core_control(&mut self, control: ControlFrame) -> Result<(), WasmError> {
@@ -5637,7 +5695,14 @@ mod tests {
     }
 
     #[test]
-    fn vm_object_stays_within_embedded_budget() {
+    fn vm_object_stays_within_runtime_budget() {
+        assert!(size_of::<super::CodeBody<'static>>() <= 4 * size_of::<usize>());
+        std::println!(
+            "Vm={} CodeBody={} Frame={}",
+            size_of::<Vm<'static>>(),
+            size_of::<super::CodeBody<'static>>(),
+            size_of::<super::Frame<'static>>()
+        );
         assert!(
             size_of::<Vm<'static>>() <= VM_OBJECT_BUDGET_BYTES,
             "Vm object uses {} bytes, budget is {} bytes",
@@ -6249,6 +6314,120 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_local_declarations_initialize_each_wasm_value_kind() {
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        push_test_section(&mut module, SECTION_TYPE, &[1, 0x60, 0, 0]);
+        push_test_section(&mut module, SECTION_FUNCTION, &[1, 0]);
+        push_test_section(&mut module, SECTION_MEMORY, &[1, 0, 1]);
+        let mut exports = vec![1];
+        push_test_name(&mut exports, b"_start");
+        exports.extend_from_slice(&[0, 0]);
+        push_test_section(&mut module, SECTION_EXPORT, &exports);
+        let mut body = vec![
+            5,
+            1,
+            VALTYPE_I32,
+            1,
+            VALTYPE_I64,
+            1,
+            super::VALTYPE_F32,
+            1,
+            super::VALTYPE_F64,
+            1,
+            super::VALTYPE_FUNCREF,
+        ];
+        for local in 0..5 {
+            body.extend_from_slice(&[OPCODE_I32_CONST, local * 4, super::OPCODE_LOCAL_GET, local]);
+            match local {
+                0 => body.push(super::OPCODE_I32_EQZ),
+                1 => body.push(super::OPCODE_I64_EQZ),
+                2 => body.extend_from_slice(&[
+                    super::OPCODE_F32_CONST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    super::OPCODE_F32_EQ,
+                ]),
+                3 => body.extend_from_slice(&[
+                    super::OPCODE_F64_CONST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    super::OPCODE_F64_EQ,
+                ]),
+                4 => body.push(super::OPCODE_REF_IS_NULL),
+                _ => unreachable!(),
+            }
+            body.extend_from_slice(&[super::OPCODE_I32_STORE, 2, 0]);
+        }
+        body.push(OPCODE_END);
+        let mut code = vec![1];
+        push_test_u32(&mut code, body.len() as u32);
+        code.extend_from_slice(&body);
+        push_test_section(&mut module, SECTION_CODE, &code);
+        let mut core = TestInterpreter::new(&module).expect("instantiate mixed locals");
+        assert_eq!(
+            core.resume().expect("execute mixed locals"),
+            ExecutionEvent::Done
+        );
+        for local in 0..5 {
+            assert_eq!(core.read_memory_u32(local * 4), Ok(1));
+        }
+    }
+
+    #[test]
+    fn packed_locals_preserve_all_value_bits_and_kinds() {
+        let values = [
+            super::Value::I32(u32::MAX),
+            super::Value::I64(u64::MAX),
+            super::Value::F32(0x7fc0_1234),
+            super::Value::F64(0x7ff8_0000_0000_1234),
+            super::Value::FuncRef(u32::MAX),
+        ];
+        let mut locals = super::LocalValues::empty();
+        for (index, value) in values.iter().copied().enumerate() {
+            locals.initialize(index, value).unwrap();
+            assert_eq!(locals.get(index), Some(value));
+        }
+        assert_eq!(locals.get(super::CORE_WASM_LOCAL_CAPACITY), None);
+        let before = locals;
+        assert_eq!(
+            locals.initialize(super::CORE_WASM_LOCAL_CAPACITY, super::Value::I32(1)),
+            Err(super::WasmError::StackOverflow)
+        );
+        assert_eq!(locals, before);
+    }
+
+    #[test]
+    fn local_set_rejects_another_kind_without_changing_the_declared_kind() {
+        let mut frame = super::Frame::empty();
+        frame.local_count = 1;
+        frame.locals.initialize(0, super::Value::I64(0)).unwrap();
+        // Build a live VM through a real module before replacing its active
+        // frame with this one-local fixture. Neither local write may change
+        // the kind accepted by the next write.
+        let module = core_test_module(&[], false, None, None, None);
+        let mut core = TestInterpreter::new(&module).expect("instantiate local write test");
+        core.frames[0] = frame;
+        assert_eq!(core.set_core_local(0, super::Value::I64(17)), Ok(()));
+        assert_eq!(core.frames[0].locals.get(0), Some(super::Value::I64(17)));
+        assert_eq!(
+            core.set_core_local(0, super::Value::I32(9)),
+            Err(WasmError::Invalid(diagnostic_message_code(
+                "core local type mismatch"
+            )))
+        );
+        assert_eq!(core.frames[0].locals.get(0), Some(super::Value::I64(17)));
+        assert_eq!(core.set_core_local(0, super::Value::I64(23)), Ok(()));
+    }
+
+    #[test]
     fn core_wasm_engine_runs_local_function_calls_without_wasi_imports() {
         static CORE_LOCAL_CALL_GUEST: &[u8] = &[
             0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x00, 0x01,
@@ -6263,6 +6442,72 @@ mod tests {
             core.resume().expect("local call reaches done"),
             ExecutionEvent::Done
         );
+    }
+
+    #[test]
+    fn large_function_body_keeps_if_block_and_loop_targets_exact() {
+        for condition in [0, 1] {
+            let mut body = vec![OPCODE_I32_CONST, condition, super::OPCODE_IF, 0x40];
+            body.extend_from_slice(&[super::OPCODE_BLOCK, 0x40, super::OPCODE_BR, 0]);
+            body.resize(body.len() + 80_000, super::OPCODE_NOP);
+            body.push(OPCODE_END);
+            body.extend_from_slice(&[
+                OPCODE_I32_CONST,
+                0,
+                OPCODE_I32_CONST,
+                7,
+                super::OPCODE_I32_STORE,
+                2,
+                0,
+                super::OPCODE_ELSE,
+                OPCODE_I32_CONST,
+                0,
+                OPCODE_I32_CONST,
+                9,
+                super::OPCODE_I32_STORE,
+                2,
+                0,
+                OPCODE_END,
+                OPCODE_I32_CONST,
+                4,
+                OPCODE_I32_CONST,
+                2,
+                super::OPCODE_I32_STORE,
+                2,
+                0,
+                super::OPCODE_LOOP,
+                0x40,
+                OPCODE_I32_CONST,
+                4,
+                OPCODE_I32_CONST,
+                4,
+                super::OPCODE_I32_LOAD,
+                2,
+                0,
+                OPCODE_I32_CONST,
+                1,
+                super::OPCODE_I32_SUB,
+                super::OPCODE_I32_STORE,
+                2,
+                0,
+                OPCODE_I32_CONST,
+                4,
+                super::OPCODE_I32_LOAD,
+                2,
+                0,
+                super::OPCODE_BR_IF,
+                0,
+                OPCODE_END,
+            ]);
+            let module = core_test_module(&body, true, None, None, None);
+            let mut core = TestInterpreter::new(&module).expect("instantiate large body");
+            assert_eq!(core.run(256), Ok(ExecutionEvent::Done));
+            assert_eq!(
+                core.read_memory_u32(0),
+                Ok(if condition == 0 { 9 } else { 7 })
+            );
+            assert_eq!(core.read_memory_u32(4), Ok(0));
+        }
     }
 
     #[test]

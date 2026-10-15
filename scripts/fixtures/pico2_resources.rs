@@ -27,7 +27,9 @@ static SIZES: [u32; 7] = [
 ];
 
 const _: () = {
-    assert!(DEFAULT_GUEST_MEMORY_BYTES + size_of::<HibanaWasiGuestStorage<'static>>() <= 96 * 1024);
+    assert!(
+        DEFAULT_GUEST_MEMORY_BYTES + size_of::<HibanaWasiGuestStorage<'static>>() <= 128 * 1024
+    );
     assert!(size_of::<WasiImportRequest<'static>>() <= 112);
     assert!(size_of::<WasiImportCompletion<'static>>() <= 112);
     assert!(size_of::<WasiImportPending<'static, 'static>>() <= 80);
