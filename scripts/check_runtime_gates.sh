@@ -14,11 +14,11 @@ rust_check() (
     "$@"
 )
 
-cargo +1.95.0 fmt --check
-rustfmt +1.95.0 --check --edition 2024 scripts/fixtures/pico2_resources.rs
-python3 scripts/check_poll.py
-python3 scripts/check_pico2.py
+cargo +stable fmt --check
+rustfmt +stable --check --edition 2024 scripts/check_poll.rs scripts/check_pico2.rs scripts/check_package.rs scripts/fixtures/pico2_resources.rs
+bash scripts/check_poll.sh
+bash scripts/check_pico2.sh
 bash scripts/check_wasi_shell_demo.sh
-rust_check cargo +1.95.0 doc --locked --no-deps
+rust_check cargo +stable doc --locked --no-deps
 rust_check bash scripts/check_miri.sh
-rust_check cargo +1.95.0 package --locked --allow-dirty
+bash scripts/check_package.sh

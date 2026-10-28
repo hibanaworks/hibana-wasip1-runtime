@@ -1,21 +1,23 @@
 # Bounded WASI poll and path-rights evidence
 
-Run `python3 scripts/check_poll.py` from the runtime repository. Rust tests,
+Run `bash scripts/check_poll.sh` from the runtime repository. Rust tests,
 Clippy, Pico 2 (`thumbv8m.main-none-eabi`) compilation and the affine ownership compile-fail
-check each use a separate temporary target. Every target is deleted at the end
-of its check, including failure. Sources, decision exports and logs remain.
-The proof uses the local Hibana Lean 4.30.0 workspace in `../hibana/proofs/lean`.
+check use one temporary target for this checkout. It is deleted when the gate
+finishes or fails. Decision exports and logs remain in the printed evidence
+directory. Lean 4.30.0 is selected by `proofs/lean-toolchain`.
 
-Run `python3 scripts/check_pico2.py` for a separate resource gate. It runs a
+Run `bash scripts/check_pico2.sh` for a separate resource gate. It runs a
 16-subscription guest on the host, then links the same fixture for Cortex-M33
 with the ordinary runtime API, one 64 KiB linear memory and caller-owned VM
-storage. The gate counts linked flash sections and static RAM plus a 24 KiB
-stack reservation. Its limits are 512 KiB flash and 160 KiB reserved RAM.
+storage. The gate reads the ELF load extents, including alignment, and the target
+type sizes. RAM includes a 24 KiB stack reservation. Its limits are 512 KiB flash
+and 160 KiB reserved RAM. Three mutated images must be rejected: a wrong
+architecture, an oversized SRAM load, and missing type-size evidence.
 These are fixture budgets, not whole-StackChan budgets. The link fixture has
 no RP2350 boot metadata or hardware startup; it establishes linking and storage
 fit, not physical Pico 2 execution or a worst-case stack bound. No allocator,
 special Pico API or reduced runtime implementation is used. Rust products are
-deleted after each host or target check; logs and numeric evidence remain.
+deleted when the gate finishes or fails; logs and numeric evidence remain.
 
 `PollWriteback.lean` proves 15 general statements and 5 finite cases. Greedy
 ordered matching yields a sublist of requested `(userdata, event kind)` keys,
@@ -47,15 +49,16 @@ is live; Lean does not model Rust's borrow checker.
 The 48-byte subscription and 32-byte event layouts and clock flag meanings
 were checked against the [WASI Preview 1 specification](https://github.com/WebAssembly/WASI/blob/snapshot-01/phases/snapshot/docs.md#subscription-struct).
 
-`PathRights.lean` proves six statements about fixed ChoreoFS I/O capabilities:
+`PathRights.lean` proves ten statements about fixed ChoreoFS I/O capabilities:
 an accepted object has a nonempty capability and the exact applicable I/O mode;
 an incompatible mode rejects; a writer requires the write bit; a read request
-cannot open a writer; empty materials reject. The gate exports 160 decisions
-from actual Rust `ChoreoFs::path_open` calls: four material kinds, every
+cannot open a writer; empty materials reject; borrowed read/write files retain
+the requested mode. The gate exports 160 decisions
+from actual Rust `ChoreoFs::path_open` calls: five material kinds, every
 combination of the three I/O bits, and four ancillary-bit patterns including
 the high bit and every non-I/O bit. Denied calls return no descriptor or binding.
 The kernel checks every decision; the exact axiom audit permits only `propext`
-for all six general theorems and 160 finite decisions.
+for all ten general theorems and 160 finite decisions.
 
 `PathRights.smt2` checks all 64-bit base-right patterns. Four UNSAT queries rule
 out empty grants, added I/O rights, silently dropped conflicting applicable

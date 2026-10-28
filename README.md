@@ -20,20 +20,19 @@ WASI P1 guest
 It depends on `hibana`; it does not define a second message system, a host
 policy layer, or a filesystem fallback.
 
-Version `0.1` targets Hibana `0.9.9` and its schema-identified wire payload
-contract.
+This checkout uses Hibana `0.10.0`, pinned to the Git revision in `Cargo.toml`.
 
 ## Install
 
 ```bash
-cargo add hibana-wasip1-runtime
+cargo add hibana-wasip1-runtime --git https://github.com/hibanaworks/hibana-wasip1-runtime --branch feature/endpoint-delegation
 ```
 
 Or write the dependency explicitly:
 
 ```toml
 [dependencies]
-hibana-wasip1-runtime = "0.1"
+hibana-wasip1-runtime = { git = "https://github.com/hibanaworks/hibana-wasip1-runtime", branch = "feature/endpoint-delegation" }
 ```
 
 ## What This Crate Is
@@ -346,24 +345,29 @@ assertion limits the VM object to 64 KiB. `DEFAULT_GUEST_MEMORY_BYTES` is one
 64 KiB Wasm page, so the VM object plus default guest backing is bounded by
 128 KiB before caller-owned Hibana session, transport, and application storage.
 The Pico 2 link fixture reserves a further 24 KiB stack and checks a 160 KiB
-combined RAM ceiling, including the fixture storage. These explicit bounds replace the earlier smaller profile.
+combined RAM ceiling, including the fixture storage.
 
 Guest memory remains caller-owned. `memory.grow` cannot commit beyond that
 backing or the module limit. The hot path performs no allocation and uses
 explicit fuel, bounded copies, compact typed payloads, and checked ABI ranges.
 Host-only example code is not part of this resource claim.
 
-`python3 scripts/check_pico2.py` executes a 16-interest poll guest on the host
+`bash scripts/check_pico2.sh` executes a 16-interest poll guest on the host
 and links the same runtime fixture for Cortex-M33. The fixture includes one
 64 KiB linear memory, caller-owned VM storage and a 24 KiB stack reservation.
-It checks a 128 KiB reserved-RAM limit and a 512 KiB flash-load limit, with no
+It checks a 160 KiB reserved-RAM limit and a 512 KiB flash-load limit, with no
 allocator or separate board API. Linking does not establish physical Pico 2
 execution, worst-case stack usage, or whole-application resource fit.
 
 ## Build And Test
 
-Repository and package builds use the exact published Hibana `0.9.9` crate.
-No sibling core checkout is needed. The proof gate uses its Lean 4.30.0 workspace.
+Repository builds select one pinned Hibana `0.10.0` Git dependency. No sibling
+core checkout is needed. The proof gate uses Lean 4.30.0, selected by
+`proofs/lean-toolchain`.
+
+The package gate compiles the Cargo archive with that same Git revision and
+checks its resolved core identity. Publishing also requires Hibana's declared
+version to be available on crates.io.
 
 Run the full local gate:
 
@@ -386,7 +390,7 @@ bounds, atomic writeback, pending-call mismatch rejection, canonical
 argument/environment payloads, memory-growth pending, fuel suspension, restart
 behavior, ChoreoFS object lookup, example behavior, clippy,
 Miri, Pico 2 compilation and resource linking, documentation, and package verification. CI runs
-the same gate with Rust `1.95.0` and Miri `nightly-2026-05-28`.
+the same gate with current stable Rust and Miri `nightly-2026-05-28`.
 
 ## License
 
@@ -395,12 +399,11 @@ option.
 
 ## Poll proof and verification
 
-`python3 scripts/check_poll.py` runs all-target tests, Clippy, Pico 2
+`bash scripts/check_poll.sh` runs all-target tests, Clippy, Pico 2
 compilation, the affine ownership compile-fail test, Lean kernel checks, and Z3.
 Each Rust verification uses a temporary target that is deleted on success or
 failure. The gate verifies 20 model theorems and 520 admission decisions exported
 from actual Rust VM execution, plus 10 path-rights theorems and 160 actual
 ChoreoFS admission decisions. Z3 checks 64-bit I/O rights with four UNSAT
 properties and three SAT witnesses. [Proof scope](proofs/README.md) records the
-unmodeled boundaries and the exact axiom audit. [Surface reduction](api-removal.md)
-records the removed APIs and ownership changes.
+unmodeled boundaries and the exact axiom audit.

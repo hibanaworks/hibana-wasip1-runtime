@@ -21,12 +21,14 @@ include = [
     "/examples/**",
     "/scripts/**",
     "/proofs/**",
-    "/api-removal.md",
 ]
 
 [dependencies]
-hibana = { version = "=0.9.9", default-features = false }
+hibana = { git = "https://github.com/hibanaworks/hibana", rev = "2f695129ac0c8a8fd12bfe43b75dced33e47087f", version = "=0.10.0", default-features = false }
 
 [dev-dependencies]
 futures-executor = "0.3"
 futures-util = "0.3"
+
+[lints.rust]
+long_running_const_eval = "forbid"

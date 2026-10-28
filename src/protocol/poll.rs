@@ -125,7 +125,7 @@ fn copy_records<const N: usize>(
     records: &[[u8; N]],
     fields: fn(&[u8; N]) -> [(usize, usize); 3],
 ) {
-    for (output, input) in out.chunks_exact_mut(N).zip(records) {
+    for (output, input) in out.as_chunks_mut::<N>().0.iter_mut().zip(records) {
         output.fill(0);
         for (start, end) in fields(input) {
             output[start..end].copy_from_slice(&input[start..end]);

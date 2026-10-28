@@ -25,8 +25,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep z3
-          rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt --component llvm-tools-preview
-          rustup target add --toolchain 1.95.0 thumbv8m.main-none-eabi wasm32-wasip1
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt --component llvm-tools-preview
+          rustup target add --toolchain stable thumbv8m.main-none-eabi wasm32-wasip1
       - name: Install Lean
         run: |
           curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
@@ -35,6 +35,6 @@ jobs:
       - name: Install Miri toolchain
         run: rustup toolchain install nightly-2026-05-28 --profile minimal --component miri --component rust-src
       - name: Fetch locked dependencies for offline checks
-        run: cargo +1.95.0 fetch --locked
+        run: cargo +stable fetch --locked
       - name: Run quality gates
         run: bash scripts/check_runtime_gates.sh

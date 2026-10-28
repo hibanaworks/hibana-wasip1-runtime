@@ -47,7 +47,7 @@ struct Frame {
     lane: u8,
     source_role: u8,
     target_role: u8,
-    label: u8,
+    label: u16,
     payload: Vec<u8>,
 }
 
@@ -98,15 +98,12 @@ impl Transport for InProcessTransport {
         )
     }
 
-    fn poll_send<'a, 'f>(
+    fn poll_send<'f>(
         &self,
-        tx: &'a mut Self::Tx<'a>,
+        tx: &mut Self::Tx<'_>,
         outgoing: Outgoing<'f>,
         _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), TransportError>>
-    where
-        'a: 'f,
-    {
+    ) -> Poll<Result<(), TransportError>> {
         let target_role = outgoing.target_role();
         let lane = outgoing.lane();
         let mut state = self.state.borrow_mut();
@@ -122,11 +119,11 @@ impl Transport for InProcessTransport {
         Poll::Ready(Ok(()))
     }
 
-    fn cancel_send<'a>(&self, _tx: &'a mut Self::Tx<'a>) {}
+    fn cancel_send(&self, _tx: &mut Self::Tx<'_>) {}
 
     fn poll_recv<'a>(
         &'a self,
-        rx: &'a mut Self::Rx<'a>,
+        rx: &'a mut Self::Rx<'_>,
         _cx: &mut Context<'_>,
     ) -> Poll<Result<ReceivedFrame<'a>, TransportError>> {
         if rx.current.is_some() {
@@ -221,9 +218,10 @@ fn frame_header(
     lane: u8,
     source_role: u8,
     target_role: u8,
-    label: u8,
+    label: u16,
 ) -> FrameHeader {
     let session = session.raw().to_be_bytes();
+    let label = label.to_be_bytes();
     FrameHeader::from_bytes([
         session[0],
         session[1],
@@ -232,6 +230,7 @@ fn frame_header(
         lane,
         source_role,
         target_role,
-        label,
+        label[0],
+        label[1],
     ])
 }

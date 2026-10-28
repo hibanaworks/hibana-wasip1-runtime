@@ -1,5 +1,3 @@
-#![allow(long_running_const_eval)]
-
 mod shell_env;
 #[path = "../wasi_shell_demo_lib/lib.rs"]
 mod wasi_shell_demo_lib;

@@ -4,7 +4,7 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
-toolchain=${HIBANA_WASIP1_TOOLCHAIN:-1.95.0}
+toolchain=${HIBANA_WASIP1_TOOLCHAIN:-stable}
 
 if ! rustup target list --installed --toolchain "$toolchain" | rg -q '^wasm32-wasip1$'; then
     echo "wasm32-wasip1 target is not installed for $toolchain" >&2
@@ -42,6 +42,9 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = "debuginfo"
+
+[lints.rust]
+long_running_const_eval = "forbid"
 CARGO
 
 cargo "+$toolchain" generate-lockfile \
