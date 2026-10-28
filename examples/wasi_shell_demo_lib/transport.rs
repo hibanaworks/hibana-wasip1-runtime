@@ -2,29 +2,36 @@ use core::{
     cell::RefCell,
     task::{Context, Poll, Waker},
 };
-use std::{
-    collections::VecDeque,
-    rc::Rc,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, rc::Rc};
 
 use hibana::runtime::{
     ids::SessionId,
-    transport::{FrameHeader, Outgoing, PortOpen, ReceivedFrame, Transport, TransportError},
+    transport::{
+        EndpointBinding, FrameHeader, Outgoing, PortOpen, ReceivedFrame, Transport, TransportError,
+    },
     wire::Payload,
 };
 
 #[derive(Clone)]
 pub struct InProcessTransport {
     state: Rc<RefCell<TransportState>>,
+    session: SessionId,
+    resource: u8,
+    binding: Rc<EndpointBinding>,
 }
 
 impl InProcessTransport {
-    pub fn new() -> Self {
+    pub fn new(session: SessionId, resource: u8, binding: Rc<EndpointBinding>) -> Self {
         Self {
             state: Rc::new(RefCell::new(TransportState::new())),
+            session,
+            resource,
+            binding,
         }
+    }
+
+    pub fn is_drained(&self) -> bool {
+        self.state.borrow().frames.is_empty()
     }
 }
 
@@ -52,6 +59,7 @@ struct Frame {
 }
 
 struct RecvWaiter {
+    session_id: SessionId,
     local_role: u8,
     lane: u8,
     waker: Waker,
@@ -63,16 +71,17 @@ pub struct Tx {
 }
 
 pub struct Rx {
+    session_id: SessionId,
     local_role: u8,
     lane: u8,
     current: Option<Frame>,
-    pending_since: Option<Instant>,
-    deadline_armed: bool,
 }
 
-const RECV_STALL_TIMEOUT_MS: u64 = 100;
-
 impl Transport for InProcessTransport {
+    fn initial_endpoint_binding(&self, session: SessionId, role: u8) -> Option<&EndpointBinding> {
+        (session == self.session && role == self.resource).then_some(self.binding.as_ref())
+    }
+
     type Tx<'a>
         = Tx
     where
@@ -89,11 +98,10 @@ impl Transport for InProcessTransport {
                 local_role: port.local_role(),
             },
             Rx {
+                session_id: port.session_id(),
                 local_role: port.local_role(),
                 lane: port.lane(),
                 current: None,
-                pending_since: None,
-                deadline_armed: false,
             },
         )
     }
@@ -115,7 +123,7 @@ impl Transport for InProcessTransport {
             label: outgoing.frame_label().raw(),
             payload: outgoing.payload().as_bytes().to_vec(),
         });
-        state.wake_recv_waiters(target_role, lane);
+        state.wake_recv_waiters(tx.session_id, target_role, lane);
         Poll::Ready(Ok(()))
     }
 
@@ -132,32 +140,22 @@ impl Transport for InProcessTransport {
         if rx.current.is_none() {
             let frame = {
                 let mut state = self.state.borrow_mut();
-                let index = state
-                    .frames
-                    .iter()
-                    .position(|frame| frame.target_role == rx.local_role && frame.lane == rx.lane);
+                let index = state.frames.iter().position(|frame| {
+                    frame.session_id == rx.session_id
+                        && frame.target_role == rx.local_role
+                        && frame.lane == rx.lane
+                });
                 index.and_then(|idx| state.frames.remove(idx))
             };
             let Some(frame) = frame else {
-                let since = rx.pending_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= Duration::from_millis(RECV_STALL_TIMEOUT_MS) {
-                    return Poll::Ready(Err(TransportError::Deadline));
-                }
-                self.state
-                    .borrow_mut()
-                    .store_recv_waiter(rx.local_role, rx.lane, _cx.waker());
-                if !rx.deadline_armed {
-                    rx.deadline_armed = true;
-                    let waker = _cx.waker().clone();
-                    let _watchdog = thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(RECV_STALL_TIMEOUT_MS));
-                        waker.wake();
-                    });
-                }
+                self.state.borrow_mut().store_recv_waiter(
+                    rx.session_id,
+                    rx.local_role,
+                    rx.lane,
+                    _cx.waker(),
+                );
                 return Poll::Pending;
             };
-            rx.pending_since = None;
-            rx.deadline_armed = false;
             rx.current = Some(frame);
         }
 
@@ -184,26 +182,36 @@ impl Transport for InProcessTransport {
 }
 
 impl TransportState {
-    fn store_recv_waiter(&mut self, local_role: u8, lane: u8, waker: &Waker) {
-        if let Some(waiter) = self
-            .waiters
-            .iter_mut()
-            .find(|waiter| waiter.local_role == local_role && waiter.lane == lane)
-        {
+    fn store_recv_waiter(
+        &mut self,
+        session_id: SessionId,
+        local_role: u8,
+        lane: u8,
+        waker: &Waker,
+    ) {
+        if let Some(waiter) = self.waiters.iter_mut().find(|waiter| {
+            waiter.session_id == session_id
+                && waiter.local_role == local_role
+                && waiter.lane == lane
+        }) {
             waiter.waker = waker.clone();
             return;
         }
         self.waiters.push(RecvWaiter {
+            session_id,
             local_role,
             lane,
             waker: waker.clone(),
         });
     }
 
-    fn wake_recv_waiters(&mut self, local_role: u8, lane: u8) {
+    fn wake_recv_waiters(&mut self, session_id: SessionId, local_role: u8, lane: u8) {
         let mut index = 0usize;
         while index < self.waiters.len() {
-            if self.waiters[index].local_role == local_role && self.waiters[index].lane == lane {
+            if self.waiters[index].session_id == session_id
+                && self.waiters[index].local_role == local_role
+                && self.waiters[index].lane == lane
+            {
                 let waiter = self.waiters.remove(index);
                 waiter.waker.wake();
             } else {

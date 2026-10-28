@@ -14,5 +14,11 @@ fi
 
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-1}
 export RUST_TEST_THREADS=${RUST_TEST_THREADS:-1}
+export MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-strict-provenance"
 
 cargo "+$toolchain" miri test --locked --lib
+if ! command -v timeout >/dev/null 2>&1; then
+    printf '%s\n' 'GNU timeout is required for the Endpoint execution checks' >&2
+    exit 1
+fi
+timeout 180s cargo "+$toolchain" miri test --locked --example sequenced_choreofs_write

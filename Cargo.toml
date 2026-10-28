@@ -24,11 +24,10 @@ include = [
 ]
 
 [dependencies]
-hibana = { git = "https://github.com/hibanaworks/hibana", rev = "2f695129ac0c8a8fd12bfe43b75dced33e47087f", version = "=0.10.0", default-features = false }
+hibana = { git = "https://github.com/hibanaworks/hibana", rev = "32be0b0fd0e39719878055a310023ef3171b8c91", version = "=0.10.0", default-features = false }
 
 [dev-dependencies]
-futures-executor = "0.3"
-futures-util = "0.3"
+tokio = { version = "1.54", features = ["rt", "macros"] }
 
 [lints.rust]
 long_running_const_eval = "forbid"

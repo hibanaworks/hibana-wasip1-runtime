@@ -4,9 +4,8 @@ mod wasi_shell_demo_lib;
 
 use std::{env, fs, path::PathBuf, process};
 
-use futures_executor::block_on;
 use hibana::{
-    g,
+    Endpoint, g,
     runtime::{
         SessionKitStorage,
         ids::SessionId,
@@ -17,7 +16,7 @@ use hibana_wasip1_runtime::{
     DEFAULT_GUEST_MEMORY_BYTES, GuestMemory,
     exchange::{
         HibanaWasiGuest, HibanaWasiGuestStorage, WasiBoundaryStep, WasiImport,
-        WasiImportCompletion, WasiImportPending, WasiImportRequest,
+        WasiImportCompletion, WasiImportRequest,
     },
     protocol,
 };
@@ -30,6 +29,12 @@ use crate::wasi_shell_demo_lib::{
 
 const SHELL_APP_ROLE: u8 = 0;
 const SHELL_ENV_ROLE: u8 = 1;
+const SHELL_IO_ROLE: u8 = 2;
+const RETURN_ENV_LABEL: u8 = 201;
+type Environment<'r> = g::Msg<200, Endpoint<'r, SHELL_IO_ROLE>>;
+type ReturnEnvironment<'r> = g::Msg<RETURN_ENV_LABEL, Endpoint<'r, SHELL_IO_ROLE>>;
+type GuestExited = g::Msg<202, i32>;
+type GuestFailed = g::Msg<203, i32>;
 const SESSION_ID: u32 = 0x5750_0001;
 
 fn main() {
@@ -63,37 +68,37 @@ fn run() -> DemoResult<i32> {
 // ChoreoFS object write row, so the direct output write cannot advance.
 fn direct_choreofs_write_blocked_choreography() -> impl hibana::runtime::program::Projectable {
     let memory_grow = g::seq(
-        g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, protocol::MemoryGrowReqMsg>(),
-        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, protocol::MemoryGrowRetMsg>(),
+        g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, protocol::MemoryGrowReqMsg>(),
+        g::send::<SHELL_ENV_ROLE, SHELL_IO_ROLE, protocol::MemoryGrowRetMsg>(),
     );
     let fd_write = g::seq(
-        g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, protocol::FdWriteReqMsg>(),
-        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, protocol::FdWriteRetMsg>(),
+        g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, protocol::FdWriteReqMsg>(),
+        g::send::<SHELL_ENV_ROLE, SHELL_IO_ROLE, protocol::FdWriteRetMsg>(),
     );
     let fd_read = g::seq(
-        g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, protocol::FdReadReqMsg>(),
-        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, protocol::FdReadRetMsg>(),
+        g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, protocol::FdReadReqMsg>(),
+        g::send::<SHELL_ENV_ROLE, SHELL_IO_ROLE, protocol::FdReadRetMsg>(),
     );
     let fd_fdstat_get = g::seq(
-        g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, protocol::FdFdstatGetReqMsg>(),
-        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, protocol::FdFdstatGetRetMsg>(),
+        g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, protocol::FdFdstatGetReqMsg>(),
+        g::send::<SHELL_ENV_ROLE, SHELL_IO_ROLE, protocol::FdFdstatGetRetMsg>(),
     );
     let path_open = g::seq(
-        g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, protocol::PathOpenReqMsg>(),
-        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, protocol::PathOpenRetMsg>(),
+        g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, protocol::PathOpenReqMsg>(),
+        g::send::<SHELL_ENV_ROLE, SHELL_IO_ROLE, protocol::PathOpenRetMsg>(),
     );
     let prestat = g::seq(
-        g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, protocol::FdPrestatGetReqMsg>(),
-        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, protocol::FdPrestatGetRetMsg>(),
+        g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, protocol::FdPrestatGetReqMsg>(),
+        g::send::<SHELL_ENV_ROLE, SHELL_IO_ROLE, protocol::FdPrestatGetRetMsg>(),
     );
     let prestat_name = g::seq(
-        g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, protocol::FdPrestatDirNameReqMsg>(),
-        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, protocol::FdPrestatDirNameRetMsg>(),
+        g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, protocol::FdPrestatDirNameReqMsg>(),
+        g::send::<SHELL_ENV_ROLE, SHELL_IO_ROLE, protocol::FdPrestatDirNameRetMsg>(),
     );
 
     let open_selector_flow = g::seq(fd_fdstat_get, path_open);
 
-    g::route(
+    let imports = g::route(
         memory_grow,
         g::route(
             fd_write,
@@ -103,226 +108,187 @@ fn direct_choreofs_write_blocked_choreography() -> impl hibana::runtime::program
             ),
         ),
     )
-    .roll()
+    .roll();
+    let finish = || {
+        g::route(
+            g::seq(
+                g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, GuestExited>(),
+                g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, ReturnEnvironment<'_>>(),
+            ),
+            g::seq(
+                g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, GuestFailed>(),
+                g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, ReturnEnvironment<'_>>(),
+            ),
+        )
+    };
+    g::seq(
+        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, Environment<'_>>(),
+        g::route(g::seq(imports, finish()), finish()),
+    )
 }
 
 // Shell app role. The runtime resumes the guest and completes each pending
 // import through this role's endpoint.
 async fn run_shell_app_engine(
     guest: &mut HibanaWasiGuest<'_>,
-    shell_app_endpoint: &mut hibana::Endpoint<'_, SHELL_APP_ROLE>,
+    control: &mut Endpoint<'_, SHELL_APP_ROLE>,
 ) -> DemoResult<i32> {
+    let mut io = control.recv::<Environment<'_>>().await?;
     let mut run_id = 1u16;
     loop {
         match guest.resume_wasi_boundary(protocol::BudgetRun::new(run_id, 0, 100_000))? {
-            WasiBoundaryStep::ImportPending(pending) => {
-                complete_pending_import(shell_app_endpoint, pending).await?;
-            }
+            WasiBoundaryStep::ImportPending(pending) => match pending.request()? {
+                WasiImportRequest::FdWrite(request) => {
+                    io.send::<protocol::FdWriteReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::FdWriteRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::FdWrite(completion))?;
+                }
+                WasiImportRequest::FdWriteObject(request) => {
+                    println!(
+                        "ChoreoFS object write attempt: fd={} bytes={:?}",
+                        request.0.fd(),
+                        request.0.as_bytes()
+                    );
+                    io.send::<protocol::FdWriteObjectReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::FdWriteObjectRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::FdWriteObject(completion))?;
+                }
+                WasiImportRequest::FdRead(request) => {
+                    io.send::<protocol::FdReadReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::FdReadRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::FdRead(completion))?;
+                }
+                WasiImportRequest::FdReaddir(request) => {
+                    io.send::<protocol::FdReaddirReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::FdReaddirRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::FdReaddir(completion))?;
+                }
+                WasiImportRequest::PathOpen(request) => {
+                    io.send::<protocol::PathOpenReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::PathOpenRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::PathOpen(completion))?;
+                }
+                WasiImportRequest::FdPrestatGet(request) => {
+                    io.send::<protocol::FdPrestatGetReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::FdPrestatGetRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::FdPrestatGet(completion))?;
+                }
+                WasiImportRequest::FdPrestatDirName(request) => {
+                    io.send::<protocol::FdPrestatDirNameReqMsg>(&request)
+                        .await?;
+                    let completion = io.recv::<protocol::FdPrestatDirNameRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::FdPrestatDirName(completion))?;
+                }
+                WasiImportRequest::FdFilestatGet(request) => {
+                    io.send::<protocol::FdFilestatGetReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::FdFilestatGetRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::FdFilestatGet(completion))?;
+                }
+                WasiImportRequest::ArgsSizesGet(request) => {
+                    io.send::<protocol::ArgsSizesGetReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::ArgsSizesGetRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::ArgsSizesGet(completion))?;
+                }
+                WasiImportRequest::ArgsGet(request) => {
+                    io.send::<protocol::ArgsGetReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::ArgsGetRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::ArgsGet(completion))?;
+                }
+                WasiImportRequest::EnvironSizesGet(request) => {
+                    io.send::<protocol::EnvironSizesGetReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::EnvironSizesGetRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::EnvironSizesGet(completion))?;
+                }
+                WasiImportRequest::EnvironGet(request) => {
+                    io.send::<protocol::EnvironGetReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::EnvironGetRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::EnvironGet(completion))?;
+                }
+                WasiImportRequest::FdFdstatGet(request) => {
+                    io.send::<protocol::FdFdstatGetReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::FdFdstatGetRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::FdFdstatGet(completion))?;
+                }
+                WasiImportRequest::PathFilestatGet(request) => {
+                    io.send::<protocol::PathFilestatGetReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::PathFilestatGetRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::PathFilestatGet(completion))?;
+                }
+                WasiImportRequest::FdClose(request) => {
+                    io.send::<protocol::FdCloseReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::FdCloseRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::FdClose(completion))?;
+                }
+                WasiImportRequest::ClockResGet(request) => {
+                    io.send::<protocol::ClockResGetReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::ClockResGetRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::ClockResGet(completion))?;
+                }
+                WasiImportRequest::ClockTimeGet(request) => {
+                    io.send::<protocol::ClockTimeGetReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::ClockTimeGetRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::ClockTimeGet(completion))?;
+                }
+                WasiImportRequest::PollOneoff(request) => {
+                    io.send::<protocol::PollOneoffReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::PollOneoffRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::PollOneoff(completion))?;
+                }
+                WasiImportRequest::RandomGet(request) => {
+                    io.send::<protocol::RandomGetReqMsg>(&request).await?;
+                    let completion = io.recv::<protocol::RandomGetRetMsg>().await?;
+                    pending.complete(WasiImportCompletion::RandomGet(completion))?;
+                }
+            },
             WasiBoundaryStep::MemoryGrowPending(pending) => {
                 let request = pending.request();
-                shell_app_endpoint
-                    .send::<protocol::MemoryGrowReqMsg>(&request)
-                    .await?;
-                let decision = shell_app_endpoint
-                    .recv::<protocol::MemoryGrowRetMsg>()
-                    .await?;
+                io.send::<protocol::MemoryGrowReqMsg>(&request).await?;
+                let decision = io.recv::<protocol::MemoryGrowRetMsg>().await?;
                 pending.complete(decision)?;
             }
             WasiBoundaryStep::BudgetExpired(_) => {
                 run_id = run_id.wrapping_add(1);
+                tokio::task::yield_now().await;
             }
             WasiBoundaryStep::Exit(exit) => {
-                return Ok(exit.status() as i32);
+                let status = exit.status() as i32;
+                if status == 0 {
+                    io.send::<GuestExited>(&status).await?;
+                } else {
+                    io.send::<GuestFailed>(&status).await?;
+                }
+                control.send::<ReturnEnvironment<'_>>(io).await?;
+                return Ok(status);
             }
         }
     }
-}
-
-async fn complete_pending_import(
-    shell_app_endpoint: &mut hibana::Endpoint<'_, SHELL_APP_ROLE>,
-    pending: WasiImportPending<'_, '_>,
-) -> DemoResult<()> {
-    match pending.request()? {
-        WasiImportRequest::FdWrite(request) => {
-            shell_app_endpoint
-                .send::<protocol::FdWriteReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint.recv::<protocol::FdWriteRetMsg>().await?;
-            pending.complete(WasiImportCompletion::FdWrite(completion))?;
-        }
-        WasiImportRequest::FdWriteObject(request) => {
-            println!(
-                "ChoreoFS object write attempt: fd={} bytes={:?}",
-                request.0.fd(),
-                request.0.as_bytes()
-            );
-            shell_app_endpoint
-                .send::<protocol::FdWriteObjectReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::FdWriteObjectRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::FdWriteObject(completion))?;
-        }
-        WasiImportRequest::FdRead(request) => {
-            shell_app_endpoint
-                .send::<protocol::FdReadReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint.recv::<protocol::FdReadRetMsg>().await?;
-            pending.complete(WasiImportCompletion::FdRead(completion))?;
-        }
-        WasiImportRequest::FdReaddir(request) => {
-            shell_app_endpoint
-                .send::<protocol::FdReaddirReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::FdReaddirRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::FdReaddir(completion))?;
-        }
-        WasiImportRequest::PathOpen(request) => {
-            shell_app_endpoint
-                .send::<protocol::PathOpenReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::PathOpenRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::PathOpen(completion))?;
-        }
-        WasiImportRequest::FdPrestatGet(request) => {
-            shell_app_endpoint
-                .send::<protocol::FdPrestatGetReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::FdPrestatGetRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::FdPrestatGet(completion))?;
-        }
-        WasiImportRequest::FdPrestatDirName(request) => {
-            shell_app_endpoint
-                .send::<protocol::FdPrestatDirNameReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::FdPrestatDirNameRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::FdPrestatDirName(completion))?;
-        }
-        WasiImportRequest::FdFilestatGet(request) => {
-            shell_app_endpoint
-                .send::<protocol::FdFilestatGetReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::FdFilestatGetRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::FdFilestatGet(completion))?;
-        }
-        WasiImportRequest::ArgsSizesGet(request) => {
-            shell_app_endpoint
-                .send::<protocol::ArgsSizesGetReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::ArgsSizesGetRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::ArgsSizesGet(completion))?;
-        }
-        WasiImportRequest::ArgsGet(request) => {
-            shell_app_endpoint
-                .send::<protocol::ArgsGetReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint.recv::<protocol::ArgsGetRetMsg>().await?;
-            pending.complete(WasiImportCompletion::ArgsGet(completion))?;
-        }
-        WasiImportRequest::EnvironSizesGet(request) => {
-            shell_app_endpoint
-                .send::<protocol::EnvironSizesGetReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::EnvironSizesGetRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::EnvironSizesGet(completion))?;
-        }
-        WasiImportRequest::EnvironGet(request) => {
-            shell_app_endpoint
-                .send::<protocol::EnvironGetReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::EnvironGetRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::EnvironGet(completion))?;
-        }
-        WasiImportRequest::FdFdstatGet(request) => {
-            shell_app_endpoint
-                .send::<protocol::FdFdstatGetReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::FdFdstatGetRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::FdFdstatGet(completion))?;
-        }
-        WasiImportRequest::PathFilestatGet(request) => {
-            shell_app_endpoint
-                .send::<protocol::PathFilestatGetReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::PathFilestatGetRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::PathFilestatGet(completion))?;
-        }
-        WasiImportRequest::FdClose(request) => {
-            shell_app_endpoint
-                .send::<protocol::FdCloseReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint.recv::<protocol::FdCloseRetMsg>().await?;
-            pending.complete(WasiImportCompletion::FdClose(completion))?;
-        }
-        WasiImportRequest::ClockResGet(request) => {
-            shell_app_endpoint
-                .send::<protocol::ClockResGetReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::ClockResGetRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::ClockResGet(completion))?;
-        }
-        WasiImportRequest::ClockTimeGet(request) => {
-            shell_app_endpoint
-                .send::<protocol::ClockTimeGetReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::ClockTimeGetRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::ClockTimeGet(completion))?;
-        }
-        WasiImportRequest::PollOneoff(request) => {
-            shell_app_endpoint
-                .send::<protocol::PollOneoffReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::PollOneoffRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::PollOneoff(completion))?;
-        }
-        WasiImportRequest::RandomGet(request) => {
-            shell_app_endpoint
-                .send::<protocol::RandomGetReqMsg>(&request)
-                .await?;
-            let completion = shell_app_endpoint
-                .recv::<protocol::RandomGetRetMsg>()
-                .await?;
-            pending.complete(WasiImportCompletion::RandomGet(completion))?;
-        }
-    }
-    Ok(())
 }
 
 // Shell environment role. `offer()` appears only at route boundaries; once an
 // arm is selected, the rest of that arm is direct endpoint `recv` / `send`.
-async fn run_shell_env(
-    shell_env_endpoint: &mut hibana::Endpoint<'_, SHELL_ENV_ROLE>,
+async fn run_shell_env<'r>(
+    shell_env_endpoint: &mut Endpoint<'r, SHELL_ENV_ROLE>,
+    io: Endpoint<'r, SHELL_IO_ROLE>,
     shell_env: &mut ShellEnv,
 ) -> DemoResult<()> {
+    shell_env_endpoint.send::<Environment<'_>>(io).await?;
     loop {
         let branch = shell_env_endpoint.offer().await?;
+        match branch.label() {
+            202 => {
+                if branch.recv::<GuestExited>().await? != 0 {
+                    return Err(DemoError::message("successful exit has nonzero status"));
+                }
+                let _io = shell_env_endpoint.recv::<ReturnEnvironment<'_>>().await?;
+                return Ok(());
+            }
+            203 => {
+                let _status = branch.recv::<GuestFailed>().await?;
+                let _io = shell_env_endpoint.recv::<ReturnEnvironment<'_>>().await?;
+                return Ok(());
+            }
+            _ => {}
+        }
         if branch.label() == protocol::LABEL_ENGINE_MEMORY_GROW {
             let observed = branch.recv::<protocol::MemoryGrowReqMsg>().await?;
             let decision = if observed.0.would_fit() {
@@ -356,7 +322,13 @@ async fn run_shell_env(
                 shell_env_endpoint
                     .send::<protocol::FdFdstatGetRetMsg>(&response)
                     .await?;
-                continue_open_selector_flow(shell_env_endpoint, shell_env).await?;
+                let observed = shell_env_endpoint
+                    .recv::<protocol::PathOpenReqMsg>()
+                    .await?;
+                let response = shell_env.open_path(observed.0)?;
+                shell_env_endpoint
+                    .send::<protocol::PathOpenRetMsg>(&response)
+                    .await?;
             }
             WasiImport::FdPrestatGet => {
                 let observed = branch.recv::<protocol::FdPrestatGetReqMsg>().await?;
@@ -381,27 +353,6 @@ async fn run_shell_env(
     }
 }
 
-async fn continue_open_selector_flow(
-    shell_env_endpoint: &mut hibana::Endpoint<'_, SHELL_ENV_ROLE>,
-    shell_env: &mut ShellEnv,
-) -> DemoResult<()> {
-    recv_path_open_req_send_ret(shell_env_endpoint, shell_env).await
-}
-
-async fn recv_path_open_req_send_ret(
-    shell_env_endpoint: &mut hibana::Endpoint<'_, SHELL_ENV_ROLE>,
-    shell_env: &mut ShellEnv,
-) -> DemoResult<()> {
-    let observed = shell_env_endpoint
-        .recv::<protocol::PathOpenReqMsg>()
-        .await?;
-    let response = shell_env.open_path(observed.0)?;
-    shell_env_endpoint
-        .send::<protocol::PathOpenRetMsg>(&response)
-        .await?;
-    Ok(())
-}
-
 fn offered_import(label: u8) -> DemoResult<WasiImport> {
     WasiImport::from_label(label)
         .ok_or_else(|| DemoError::message(format!("route boundary reached non-WASI label {label}")))
@@ -414,14 +365,16 @@ where
     let shell_app_program: RoleProgram<SHELL_APP_ROLE> = project(program);
     let shell_env_program: RoleProgram<SHELL_ENV_ROLE> = project(program);
 
-    let transport = InProcessTransport::new();
+    let sid = SessionId::new(SESSION_ID);
+    let io_program = project::<SHELL_IO_ROLE>(program);
+    let transport = InProcessTransport::new(sid, SHELL_IO_ROLE, shell_env.binding.clone());
     let mut slab = vec![0u8; 256 * 1024];
     let mut kit_storage = SessionKitStorage::<InProcessTransport>::uninit();
     let kit = kit_storage.init();
     let rv = kit.rendezvous(&mut slab, transport.clone())?;
-    let sid = SessionId::new(SESSION_ID);
     let mut shell_app_endpoint = rv.enter(sid, &shell_app_program)?;
     let mut shell_env_endpoint = rv.enter(sid, &shell_env_program)?;
+    let io = rv.enter(sid, &io_program)?;
 
     let mut guest_memory = [0u8; DEFAULT_GUEST_MEMORY_BYTES];
     let mut guest_storage = HibanaWasiGuestStorage::uninit();
@@ -431,33 +384,18 @@ where
         initial_bindings(),
     )?;
 
-    let status = block_on(run_until_guest_exit(
-        run_shell_app_engine(guest, &mut shell_app_endpoint),
-        run_shell_env(&mut shell_env_endpoint, shell_env),
-    ))?;
+    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    let (status, ()) = runtime.block_on(async {
+        tokio::try_join!(
+            run_shell_app_engine(guest, &mut shell_app_endpoint),
+            run_shell_env(&mut shell_env_endpoint, io, shell_env),
+        )
+    })?;
+    if !transport.is_drained() {
+        return Err(DemoError::message("unread frames after environment return"));
+    }
     shell_env.flush_output();
     Ok(status)
-}
-
-async fn run_until_guest_exit<ShellAppFuture, ShellEnvFuture>(
-    shell_app: ShellAppFuture,
-    shell_env: ShellEnvFuture,
-) -> DemoResult<i32>
-where
-    ShellAppFuture: core::future::Future<Output = DemoResult<i32>>,
-    ShellEnvFuture: core::future::Future<Output = DemoResult<()>>,
-{
-    futures_util::pin_mut!(shell_app);
-    futures_util::pin_mut!(shell_env);
-    match futures_util::future::select(shell_app, shell_env).await {
-        futures_util::future::Either::Left((result, _shell_env)) => result,
-        futures_util::future::Either::Right((result, _shell_app)) => {
-            result?;
-            Err(DemoError::message(
-                "shell environment role ended before guest exit",
-            ))
-        }
-    }
 }
 
 fn print_output_state(shell_env: &ShellEnv) {

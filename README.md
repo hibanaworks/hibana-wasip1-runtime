@@ -328,15 +328,28 @@ The repository includes one guest program and two host choreographies:
 | `examples/direct_choreofs_write_rejection` | demonstrates that a direct write does not advance when the ChoreoFS object write row is absent |
 | `examples/sequenced_choreofs_write` | demonstrates that choreography can require reading `/objects/log` before writing `/outputs/led/green` |
 
+Both hosts pass the environment's I/O endpoint to the role running the guest.
+That role sends the actual WASI requests through the received endpoint. The
+environment receives each request, applies the ChoreoFS operation and returns
+its result. The guest returns the endpoint when it exits. The global protocol
+contains the transfer, import order and return.
+
+The initial `EndpointBinding` belongs to the concrete environment. All
+transports reaching that environment share it, so another session cannot issue
+a second endpoint for the same environment. File descriptors and object facts
+identify data and operations. They do not replace the endpoint's protocol checks.
+
 Run the demonstration:
 
 ```sh
 bash scripts/check_wasi_shell_demo.sh
 ```
 
-The important point is not the shell UI. The executable evidence shows that
-changing the Hibana choreography changes which WASI guest progress is possible,
-while the guest continues to use ordinary Rust `std` APIs.
+The guest uses ordinary Rust `std` APIs. The first host rejects an object write
+absent from its protocol. The second allows the write after the required read.
+Tokio drives the guest and environment roles together.
+The example transport uses in-process queues and wakes a waiting receiver when
+a frame arrives. These examples do not test network failure detection.
 
 ## Embedded Budget
 
@@ -376,6 +389,9 @@ bash scripts/check_runtime_gates.sh
 ```
 
 Focused checks:
+
+The Miri script uses GNU `timeout` to detect a stalled Endpoint execution.
+On macOS it is provided by Homebrew's `coreutils` package.
 
 ```sh
 cargo test --locked choreofs

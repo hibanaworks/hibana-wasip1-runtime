@@ -1,7 +1,9 @@
+use hibana::runtime::transport::EndpointBinding;
 use std::{
     collections::VecDeque,
     io,
     io::{BufRead, Write},
+    rc::Rc,
 };
 
 use hibana_wasip1_runtime::{
@@ -32,6 +34,7 @@ static CHOREOFS_OBJECTS: ChoreoFsObjectSet<'static, 1> =
     )]);
 
 pub struct ShellEnv {
+    pub(crate) binding: Rc<EndpointBinding>,
     choreofs: ChoreoFs<'static>,
     entries: Vec<FdEntry>,
     input: VecDeque<u8>,
@@ -40,7 +43,11 @@ pub struct ShellEnv {
 
 impl ShellEnv {
     pub fn new() -> Self {
+        // SAFETY: this value owns the example's object service. Every transport
+        // reaching that service shares this binding, including later sessions.
+        let binding = Rc::new(unsafe { EndpointBinding::new() });
         Self {
+            binding,
             choreofs: choreofs(),
             entries: vec![
                 FdEntry::input(),
