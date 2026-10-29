@@ -24,7 +24,7 @@ include = [
 ]
 
 [dependencies]
-hibana = { git = "https://github.com/hibanaworks/hibana", rev = "a316d680c5d085ae108828d359f91d5d3ec92a05", version = "=0.10.0", default-features = false }
+hibana = { git = "https://github.com/hibanaworks/hibana", rev = "3e2220a85368e03b8b0fa099c39c7ec13557a200", version = "=0.10.0", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["rt", "macros"] }
