@@ -279,9 +279,9 @@ host harness budgets explicit instead of hiding allocation inside the engine.
 ChoreoFS is a typed object vocabulary for local roles that want a WASI guest's
 ordinary `std::fs` calls to address choreography-owned objects.
 
-It is not a host filesystem. It does not own route selection, endpoint progress,
-or fallback behavior. A local role uses ChoreoFS only after choreography has
-admitted the corresponding WASI row.
+The integration supplies paths, object contents, and fd bindings. Hibana's
+projected protocol controls which requests the answering role can receive.
+ChoreoFS interprets those received requests against the supplied object facts.
 
 Typical flow:
 
@@ -290,14 +290,34 @@ std::fs in the guest
   -> WASI P1 import
   -> protocol::PathOpenReqMsg / FdReadReqMsg / FdWriteReqMsg
   -> Hibana choreography admits or rejects progress
-  -> local role optionally uses ChoreoFS object and fd facts
+  -> answering role consumes the received request through ChoreoFS
   -> matching protocol::*RetMsg
 ```
 
+Filesystem request messages yield a `ReceivedPayload` from `recv`. It can be
+used once and cannot be constructed from local bytes. Pass it directly to the
+matching ChoreoFS operation:
+
+```rust
+let request = io.recv::<protocol::PathOpenReqMsg>().await?;
+let opened = objects.choreofs().path_open(request).opened_ret();
+io.send::<protocol::PathOpenRetMsg>(&opened).await?;
+```
+
+The same rule applies to reads, writes, directory enumeration, file metadata,
+and close. Their request types distinguish operations even when their byte
+formats match. Raw request values remain available for constructing messages;
+they cannot invoke ChoreoFS. Custom messages carrying a filesystem request and
+application data implement `ChoreoFsRequest` and retain their `ReceivedPayload`
+in the decoded result. Their codec must validate the complete request before
+receive commits.
+
 `ChoreoFsOpen`, `ChoreoFsRead`, `ChoreoFsReadDir`, and `ChoreoFsWrite` are
-operation tokens for one already-admitted request. They expose selected object
-facts and produce typed completion payloads; they do not replace Hibana route
-authority.
+non-cloneable operation values. They expose the selected object facts and
+produce the corresponding completion payloads. They retain the receive's
+endpoint borrow until their last use. Finish the operation before sending its
+completion. `FdWriteReq` and `FdWriteObjectReq` select distinct write rows;
+ChoreoFS checks that the received row matches the object's fd binding.
 
 `path_open` checks the requested base I/O mode against the material, its actual
 binding, and its ledger rights. A read request cannot open a writer; conflicting

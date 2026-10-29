@@ -304,28 +304,28 @@ async fn run_shell_env<'r>(
         match offered_import(branch.label())? {
             WasiImport::FdWrite => {
                 let observed = branch.recv::<protocol::FdWriteReqMsg>().await?;
-                let response = shell_env.write_fd(observed.0);
+                let response = shell_env.write_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdWriteRetMsg>(&response)
                     .await?;
             }
             WasiImport::FdRead => {
                 let observed = branch.recv::<protocol::FdReadReqMsg>().await?;
-                let response = shell_env.read_fd(observed.0)?;
+                let response = shell_env.read_fd(observed)?;
                 shell_env_endpoint
                     .send::<protocol::FdReadRetMsg>(&response)
                     .await?;
             }
             WasiImport::FdFdstatGet => {
                 let observed = branch.recv::<protocol::FdFdstatGetReqMsg>().await?;
-                let response = shell_env.stat_fd(observed.0);
+                let response = shell_env.stat_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdFdstatGetRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint
                     .recv::<protocol::PathOpenReqMsg>()
                     .await?;
-                let response = shell_env.open_path(observed.0)?;
+                let response = shell_env.open_path(observed)?;
                 shell_env_endpoint
                     .send::<protocol::PathOpenRetMsg>(&response)
                     .await?;

@@ -1,6 +1,6 @@
 use hibana::{
     g::Msg,
-    runtime::wire::{CodecError, Payload, WireEncode, WirePayload},
+    runtime::wire::{CodecError, Payload, ReceivedPayload, WireEncode, WirePayload},
 };
 
 mod schema {
@@ -22,6 +22,10 @@ mod schema {
         FD_READ = 4,
         FD_READDIR = 5,
         FD_REQUEST = 6,
+        FD_CLOSE = 39,
+        FD_FILESTAT_GET = 40,
+        FD_PRESTAT_GET = 41,
+        FD_WRITE_OBJECT = 42,
         FD_PRESTAT_DIR_NAME = 7,
         PATH_OPEN = 37,
         PATH_FILESTAT_GET = 9,
@@ -55,29 +59,65 @@ mod schema {
 
 macro_rules! wire_payload {
     ($wrapper:ident, $payload:ty) => {
+        wire_payload!($wrapper, $payload, <$payload as TypedWasiPayload>::SCHEMA_ID);
+    };
+    ($wrapper:ident, $payload:ty, request) => {
+        wire_payload!($wrapper, $payload, request, <$payload as TypedWasiPayload>::SCHEMA_ID);
+    };
+    ($wrapper:ident, $payload:ty, request, $schema:expr) => {
+        wire_payload!(@impl $wrapper, $payload, $schema, ReceivedPayload<'a, Self>, input => input);
+        impl crate::choreofs::ChoreoFsRequest for $wrapper {
+            type Request = Self;
+            fn request(input: &ReceivedPayload<'_, Self>) -> Self {
+                Self(<$payload as TypedWasiPayload>::decode_payload_bytes(input.as_bytes())
+                    .expect("payload was validated"))
+            }
+        }
+    };
+    ($wrapper:ident, $payload:ty, write, $schema:expr, $row:expr) => {
+        wire_payload!(@impl $wrapper, $payload, $schema, ReceivedPayload<'a, Self>, input => input);
+        impl crate::choreofs::ChoreoFsRequest for $wrapper {
+            type Request = (FdWrite, FdWriteRow);
+            fn request(input: &ReceivedPayload<'_, Self>) -> Self::Request {
+                (<$payload as TypedWasiPayload>::decode_payload_bytes(input.as_bytes())
+                    .expect("payload was validated"), $row)
+            }
+        }
+    };
+    ($wrapper:ident, $payload:ty, $schema:expr) => {
+        wire_payload!(@impl $wrapper, $payload, $schema, Self, input => Self(
+            <$payload as TypedWasiPayload>::decode_payload_bytes(input.as_bytes())
+                .expect("payload was validated")
+        ));
+    };
+    (@impl $wrapper:ident, $payload:ty, $schema:expr, $decoded:ty, $input:ident => $decode:expr) => {
         impl WireEncode for $wrapper {
             fn encode_into(&self, out: &mut [u8]) -> Result<usize, CodecError> {
                 self.0.encode_payload(out)
             }
         }
-
         impl WirePayload for $wrapper {
-            const SCHEMA_ID: u32 = <$payload as TypedWasiPayload>::SCHEMA_ID;
-
-            type Decoded<'a> = Self;
-
+            const SCHEMA_ID: u32 = $schema;
+            type Decoded<'a> = $decoded;
             fn validate_payload(input: Payload<'_>) -> Result<(), CodecError> {
                 <$payload as TypedWasiPayload>::decode_payload_bytes(input.as_bytes()).map(drop)
             }
-
-            fn decode_validated_payload<'a>(input: Payload<'a>) -> Self::Decoded<'a> {
-                Self(
-                    <$payload as TypedWasiPayload>::decode_payload_bytes(input.as_bytes())
-                        .expect("payload was validated"),
-                )
+            fn decode_validated_payload<'a>($input: ReceivedPayload<'a, Self>) -> Self::Decoded<'a> {
+                $decode
+            }
+        }
+        #[cfg(test)]
+        impl TestWireDecode for $wrapper {
+            fn decode_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
+                <$payload as TypedWasiPayload>::decode_payload_bytes(bytes).map(Self)
             }
         }
     };
+}
+
+#[cfg(test)]
+trait TestWireDecode: Sized {
+    fn decode_bytes(bytes: &[u8]) -> Result<Self, CodecError>;
 }
 
 pub const LABEL_ENGINE_MEMORY_GROW: u8 = 54;

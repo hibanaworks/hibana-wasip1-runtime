@@ -374,7 +374,7 @@ impl WasiImport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WasiImportRequest<'a> {
     FdWrite(protocol::FdWriteReq),
-    FdWriteObject(protocol::FdWriteReq),
+    FdWriteObject(protocol::FdWriteObjectReq),
     FdRead(protocol::FdReadReq),
     FdReaddir(protocol::FdReaddirReq),
     PathOpen(protocol::PathOpenReq),
@@ -614,7 +614,9 @@ fn lower_request<'a>(
                 .ok_or(ExchangeError::UnboundFd(call.fd()))?
             {
                 FdWriteRow::Base => WasiImportRequest::FdWrite(request),
-                FdWriteRow::Object => WasiImportRequest::FdWriteObject(request),
+                FdWriteRow::Object => {
+                    WasiImportRequest::FdWriteObject(protocol::FdWriteObjectReq(request.0))
+                }
             }
         }
         Call::FdRead(call) => {

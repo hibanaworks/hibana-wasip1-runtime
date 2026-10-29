@@ -1,3 +1,7 @@
+#[cfg(test)]
+use hibana_wasip1_runtime::choreofs::ChoreoFsRequest;
+#[cfg(test)]
+mod admission;
 mod shell_env;
 #[path = "../wasi_shell_demo_lib/lib.rs"]
 mod wasi_shell_demo_lib;
@@ -380,49 +384,49 @@ async fn run_shell_env<'r>(
         match offered_import(branch.label())? {
             WasiImport::FdWrite => {
                 let observed = branch.recv::<protocol::FdWriteReqMsg>().await?;
-                let response = shell_env.write_fd(observed.0);
+                let response = shell_env.write_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdWriteRetMsg>(&response)
                     .await?;
             }
             WasiImport::FdRead => {
                 let observed = branch.recv::<protocol::FdReadReqMsg>().await?;
-                let response = shell_env.read_fd(observed.0)?;
+                let response = shell_env.read_fd(observed)?;
                 shell_env_endpoint
                     .send::<protocol::FdReadRetMsg>(&response)
                     .await?;
             }
             WasiImport::FdReaddir => {
                 let observed = branch.recv::<protocol::FdReaddirReqMsg>().await?;
-                let response = shell_env.read_dir_fd(observed.0)?;
+                let response = shell_env.read_dir_fd(observed)?;
                 shell_env_endpoint
                     .send::<protocol::FdReaddirRetMsg>(&response)
                     .await?;
             }
             WasiImport::FdFdstatGet => {
                 let observed = branch.recv::<protocol::FdFdstatGetReqMsg>().await?;
-                let response = shell_env.stat_fd(observed.0);
+                let response = shell_env.stat_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdFdstatGetRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint
                     .recv::<protocol::PathOpenReqMsg>()
                     .await?;
-                let response = shell_env.open_path(observed.0)?;
+                let response = shell_env.open_path(observed)?;
                 shell_env_endpoint
                     .send::<protocol::PathOpenRetMsg>(&response)
                     .await?;
             }
             WasiImport::FdFilestatGet => {
                 let observed = branch.recv::<protocol::FdFilestatGetReqMsg>().await?;
-                let response = shell_env.file_stat_fd(observed.0);
+                let response = shell_env.file_stat_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdFilestatGetRetMsg>(&response)
                     .await?;
             }
             WasiImport::FdClose => {
                 let observed = branch.recv::<protocol::FdCloseReqMsg>().await?;
-                let response = shell_env.close_fd(observed.0);
+                let response = shell_env.close_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdCloseRetMsg>(&response)
                     .await?;
@@ -443,43 +447,43 @@ async fn run_shell_env<'r>(
             }
             WasiImport::PathFilestatGet => {
                 let observed = branch.recv::<protocol::PathFilestatGetReqMsg>().await?;
-                let response = shell_env.file_stat_path(observed.0);
+                let response = shell_env.file_stat_path(observed);
                 shell_env_endpoint
                     .send::<protocol::PathFilestatGetRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint
                     .recv::<protocol::FdFdstatGetReqMsg>()
                     .await?;
-                let response = shell_env.stat_fd(observed.0);
+                let response = shell_env.stat_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdFdstatGetRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint
                     .recv::<protocol::PathOpenReqMsg>()
                     .await?;
-                let response = shell_env.open_path(observed.0)?;
+                let response = shell_env.open_path(observed)?;
                 shell_env_endpoint
                     .send::<protocol::PathOpenRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint
                     .recv::<protocol::FdFilestatGetReqMsg>()
                     .await?;
-                let response = shell_env.file_stat_fd(observed.0);
+                let response = shell_env.file_stat_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdFilestatGetRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint.recv::<protocol::FdReadReqMsg>().await?;
-                let response = shell_env.read_fd(observed.0)?;
+                let response = shell_env.read_fd(observed)?;
                 shell_env_endpoint
                     .send::<protocol::FdReadRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint.recv::<protocol::FdReadReqMsg>().await?;
-                let response = shell_env.read_fd(observed.0)?;
+                let response = shell_env.read_fd(observed)?;
                 shell_env_endpoint
                     .send::<protocol::FdReadRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint.recv::<protocol::FdCloseReqMsg>().await?;
-                let response = shell_env.close_fd(observed.0);
+                let response = shell_env.close_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdCloseRetMsg>(&response)
                     .await?;
@@ -487,38 +491,38 @@ async fn run_shell_env<'r>(
                 let observed = shell_env_endpoint
                     .recv::<protocol::FdFdstatGetReqMsg>()
                     .await?;
-                let response = shell_env.stat_fd(observed.0);
+                let response = shell_env.stat_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdFdstatGetRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint
                     .recv::<protocol::PathOpenReqMsg>()
                     .await?;
-                let response = shell_env.open_path(observed.0)?;
+                let response = shell_env.open_path(observed)?;
                 shell_env_endpoint
                     .send::<protocol::PathOpenRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint
                     .recv::<protocol::FdWriteObjectReqMsg>()
                     .await?;
-                let response = shell_env.write_fd(observed.0);
+                let response = shell_env.write_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdWriteObjectRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint
                     .recv::<protocol::FdWriteObjectReqMsg>()
                     .await?;
-                let response = shell_env.write_fd(observed.0);
+                let response = shell_env.write_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdWriteObjectRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint.recv::<protocol::FdWriteReqMsg>().await?;
-                let response = shell_env.write_fd(observed.0);
+                let response = shell_env.write_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdWriteRetMsg>(&response)
                     .await?;
                 let observed = shell_env_endpoint.recv::<protocol::FdCloseReqMsg>().await?;
-                let response = shell_env.close_fd(observed.0);
+                let response = shell_env.close_fd(observed);
                 shell_env_endpoint
                     .send::<protocol::FdCloseRetMsg>(&response)
                     .await?;
@@ -613,7 +617,7 @@ mod tests {
 
         owner.send::<Environment<'_>>(io).await?;
         let mut io = app.recv::<Environment<'_>>().await?;
-        let request = protocol::FdWriteReq(protocol::FdWrite::new(6, b"1")?);
+        let request = protocol::FdWriteObjectReq(protocol::FdWrite::new(6, b"1")?);
         assert!(
             io.send::<protocol::FdWriteObjectReqMsg>(&request)
                 .await
@@ -647,9 +651,8 @@ mod tests {
         ))
         .await?;
         let request = owner.recv::<protocol::FdFdstatGetReqMsg>().await?;
-        owner
-            .send::<protocol::FdFdstatGetRetMsg>(&env.stat_fd(request.0))
-            .await?;
+        let response = env.stat_fd(request);
+        owner.send::<protocol::FdFdstatGetRetMsg>(&response).await?;
         io.recv::<protocol::FdFdstatGetRetMsg>().await?;
 
         assert!(io.send::<GuestExited>(&0).await.is_err());
@@ -679,11 +682,12 @@ mod tests {
             async {
                 owner.send::<Environment<'_>>(io).await?;
                 let request = owner.recv::<protocol::FdWriteReqMsg>().await?;
-                owner
-                    .send::<protocol::FdWriteRetMsg>(&protocol::FdWriteDoneRet(
-                        protocol::FdWriteDone::new(request.0.fd(), request.0.len() as u8),
-                    ))
-                    .await?;
+                let request = protocol::FdWriteReq::request(&request).0;
+                let response = protocol::FdWriteDoneRet(protocol::FdWriteDone::new(
+                    request.fd(),
+                    request.len() as u8,
+                ));
+                owner.send::<protocol::FdWriteRetMsg>(&response).await?;
                 let branch = owner.offer().await?;
                 assert_eq!(branch.label(), 202);
                 assert_eq!(branch.recv::<GuestExited>().await?, 0);

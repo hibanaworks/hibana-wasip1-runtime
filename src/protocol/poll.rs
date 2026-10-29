@@ -1,5 +1,5 @@
 use super::{CodecError, PollOneoffReq, PollReadyRet, schema};
-use hibana::runtime::wire::{Payload, WireEncode, WirePayload};
+use hibana::runtime::wire::{Payload, ReceivedPayload, WireEncode, WirePayload};
 
 const CAPACITY: usize = crate::exchange::FD_BINDING_CAPACITY;
 
@@ -192,7 +192,7 @@ macro_rules! borrowed_poll_payload {
             fn validate_payload(input: Payload<'_>) -> Result<(), CodecError> {
                 $payload::new(decode(input.as_bytes(), $canonical)?).map(drop)
             }
-            fn decode_validated_payload<'a>(input: Payload<'a>) -> Self::Decoded<'a> {
+            fn decode_validated_payload<'a>(input: ReceivedPayload<'a, Self>) -> Self::Decoded<'a> {
                 $wrapper(
                     $payload::new(
                         decode(input.as_bytes(), $canonical).expect("payload was validated"),
@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(bytes[0], 3);
         PollOneoffReq::validate_payload(Payload::new(&bytes)).unwrap();
         assert_eq!(
-            PollOneoffReq::decode_validated_payload(Payload::new(&bytes)),
+            PollOneoffReq(PollOneoff::new(decode(&bytes, subscription_fields).unwrap()).unwrap()),
             request
         );
         for capacity in 0..bytes.len() {
@@ -281,7 +281,7 @@ mod tests {
         request.encode_into(&mut wire).unwrap();
         assert_eq!(&wire[1..], &subscription(1));
         assert_eq!(
-            PollOneoffReq::decode_validated_payload(Payload::new(&wire)),
+            PollOneoffReq(PollOneoff::new(decode(&wire, subscription_fields).unwrap()).unwrap()),
             request
         );
         wire[24] = 0xa5;
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(reply.encode_into(&mut wire), Ok(65));
         PollReadyRet::validate_payload(Payload::new(&wire)).unwrap();
         assert_eq!(
-            PollReadyRet::decode_validated_payload(Payload::new(&wire)),
+            PollReadyRet(PollReady::new(decode(&wire, event_fields).unwrap()).unwrap()),
             reply
         );
         for capacity in 0..wire.len() {

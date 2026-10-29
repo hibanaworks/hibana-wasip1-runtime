@@ -202,6 +202,9 @@ impl TypedWasiPayload for MemoryGrowDecision {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdWriteReq(pub FdWrite);
+/// A WASI write request for a descriptor bound to the object-write row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdWriteObjectReq(pub FdWrite);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdReadReq(pub FdRead);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,14 +283,32 @@ pub struct PathOpenedRet(pub PathOpened);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryGrowRet(pub MemoryGrowDecision);
 
-wire_payload!(FdWriteReq, FdWrite);
-wire_payload!(FdReadReq, FdRead);
-wire_payload!(FdReaddirReq, FdReaddir);
-wire_payload!(FdFdstatGetReq, FdRequest);
-wire_payload!(FdPrestatGetReq, FdRequest);
+wire_payload!(
+    FdWriteReq,
+    FdWrite,
+    write,
+    schema::FD_WRITE,
+    FdWriteRow::Base
+);
+wire_payload!(
+    FdWriteObjectReq,
+    FdWrite,
+    write,
+    schema::FD_WRITE_OBJECT,
+    FdWriteRow::Object
+);
+wire_payload!(FdReadReq, FdRead, request);
+wire_payload!(FdReaddirReq, FdReaddir, request);
+wire_payload!(FdFdstatGetReq, FdRequest, request);
+wire_payload!(FdPrestatGetReq, FdRequest, schema::FD_PRESTAT_GET);
 wire_payload!(FdPrestatDirNameReq, FdPrestatDirName);
-wire_payload!(FdFilestatGetReq, FdRequest);
-wire_payload!(FdCloseReq, FdRequest);
+wire_payload!(
+    FdFilestatGetReq,
+    FdRequest,
+    request,
+    schema::FD_FILESTAT_GET
+);
+wire_payload!(FdCloseReq, FdRequest, request, schema::FD_CLOSE);
 wire_payload!(ClockResGetReq, ClockResGet);
 wire_payload!(ClockTimeGetReq, ClockTimeGet);
 wire_payload!(RandomGetReq, RandomGet);
@@ -295,8 +316,8 @@ wire_payload!(ArgsSizesGetReq, ArgsSizesGet);
 wire_payload!(ArgsGetReq, ArgsGet);
 wire_payload!(EnvironSizesGetReq, EnvironSizesGet);
 wire_payload!(EnvironGetReq, EnvironGet);
-wire_payload!(PathOpenReq, PathOpen);
-wire_payload!(PathFilestatGetReq, PathFilestatGet);
+wire_payload!(PathOpenReq, PathOpen, request);
+wire_payload!(PathFilestatGetReq, PathFilestatGet, request);
 wire_payload!(MemoryGrowReq, MemoryGrow);
 
 wire_payload!(FdWriteDoneRet, FdWriteDone);
@@ -320,7 +341,7 @@ wire_payload!(MemoryGrowRet, MemoryGrowDecision);
 
 pub type FdWriteReqMsg = Msg<LABEL_WASI_FD_WRITE, FdWriteReq>;
 pub type FdWriteRetMsg = Msg<LABEL_WASI_FD_WRITE_RET, FdWriteDoneRet>;
-pub type FdWriteObjectReqMsg = Msg<LABEL_WASI_FD_WRITE_OBJECT, FdWriteReq>;
+pub type FdWriteObjectReqMsg = Msg<LABEL_WASI_FD_WRITE_OBJECT, FdWriteObjectReq>;
 pub type FdWriteObjectRetMsg = Msg<LABEL_WASI_FD_WRITE_OBJECT_RET, FdWriteDoneRet>;
 pub type FdReadReqMsg = Msg<LABEL_WASI_FD_READ, FdReadReq>;
 pub type FdReadRetMsg = Msg<LABEL_WASI_FD_READ_RET, FdReadDoneRet>;
@@ -2198,10 +2219,8 @@ impl TypedWasiPayload for PathOpened {
 mod tests {
     use super::*;
 
-    fn decode<'a, P: WirePayload>(bytes: &'a [u8]) -> Result<P::Decoded<'a>, CodecError> {
-        let payload = Payload::new(bytes);
-        P::validate_payload(payload)?;
-        Ok(P::decode_validated_payload(payload))
+    fn decode<P: TestWireDecode>(bytes: &[u8]) -> Result<P, CodecError> {
+        P::decode_bytes(bytes)
     }
 
     #[test]
@@ -2280,7 +2299,7 @@ mod tests {
             assert!(!schema::ALL[..index].contains(&schema_id));
         }
 
-        assert_eq!(
+        assert_ne!(
             <FdFdstatGetReq as WirePayload>::SCHEMA_ID,
             <FdCloseReq as WirePayload>::SCHEMA_ID
         );

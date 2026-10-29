@@ -1,4 +1,5 @@
 use hibana::runtime::transport::EndpointBinding;
+use hibana::runtime::wire::ReceivedPayload;
 use std::{
     collections::VecDeque,
     io,
@@ -7,7 +8,10 @@ use std::{
 };
 
 use hibana_wasip1_runtime::{
-    choreofs::{ChoreoFs, ChoreoFsObject, ChoreoFsObjectSet, ChoreoFsWrite, FdSpec, ObjectId},
+    choreofs::{
+        ChoreoFs, ChoreoFsObject, ChoreoFsObjectSet, ChoreoFsRequest, ChoreoFsWrite, FdSpec,
+        ObjectId,
+    },
     exchange::FdBindingTable,
     protocol::{
         self, FdBinding, FdClosed, FdPrestat, FdPrestatDirNameDone, FdReadDone, FdReadRow,
@@ -96,12 +100,16 @@ impl ShellEnv {
         self.led_green
     }
 
-    pub fn write_fd(&mut self, write: protocol::FdWrite) -> protocol::FdWriteDoneRet {
+    pub fn write_fd<P>(&mut self, received: ReceivedPayload<'_, P>) -> protocol::FdWriteDoneRet
+    where
+        P: ChoreoFsRequest<Request = (protocol::FdWrite, protocol::FdWriteRow)>,
+    {
+        let (write, row) = P::request(&received);
         match self.entries.iter().find(|entry| entry.fd == write.fd()) {
             Some(FdEntry {
                 kind: FdKind::Output,
                 ..
-            }) => {
+            }) if row == protocol::FdWriteRow::Base => {
                 let _ = io::stdout().write_all(write.as_bytes());
                 let _ = io::stdout().flush();
                 protocol::FdWriteDoneRet(FdWriteDone::new(write.fd(), write.len() as u8))
@@ -109,7 +117,7 @@ impl ShellEnv {
             Some(FdEntry {
                 kind: FdKind::ErrorOutput,
                 ..
-            }) => {
+            }) if row == protocol::FdWriteRow::Base => {
                 let _ = io::stderr().write_all(write.as_bytes());
                 let _ = io::stderr().flush();
                 protocol::FdWriteDoneRet(FdWriteDone::new(write.fd(), write.len() as u8))
@@ -117,22 +125,22 @@ impl ShellEnv {
             Some(FdEntry {
                 kind: FdKind::OutputLedGreen,
                 ..
-            }) => {
-                let write = self.choreofs.fd_write(write);
+            }) if row == protocol::FdWriteRow::Object => {
+                let write = self.choreofs.fd_write(received);
                 self.apply_led_green_write(write)
             }
-            Some(_) => self.choreofs.fd_write(write).written(),
+            Some(_) => self.choreofs.fd_write(received).written(),
             None => {
                 protocol::FdWriteDoneRet(FdWriteDone::new_with_errno(write.fd(), 0, ERRNO_BADF))
             }
         }
     }
 
-    pub fn open_path(&mut self, open: protocol::PathOpen) -> DemoResult<protocol::PathOpenedRet> {
-        let normalized = normalize_choreofs_path(open.path());
-        let open = protocol::PathOpen::new(open.preopen_fd(), open.rights_base(), normalized)?
-            .with_flags(open.open_flags() as u32, open.fd_flags() as u32)?;
-        let operation = self.choreofs.path_open(open);
+    pub fn open_path(
+        &mut self,
+        received: ReceivedPayload<'_, protocol::PathOpenReq>,
+    ) -> DemoResult<protocol::PathOpenedRet> {
+        let operation = self.choreofs.path_open(received);
         if let (Some(fd), Some(object)) = (operation.fd(), operation.object()) {
             self.materialize_choreofs_fd(fd, object);
         }
@@ -165,14 +173,22 @@ impl ShellEnv {
         )?))
     }
 
-    pub fn file_stat_fd(&self, request: FdRequest) -> protocol::FdFilestatRet {
+    pub fn file_stat_fd(
+        &self,
+        received: ReceivedPayload<'_, protocol::FdFilestatGetReq>,
+    ) -> protocol::FdFilestatRet {
+        let request = protocol::FdFilestatGetReq::request(&received).0;
         let Some(entry) = self.entries.iter().find(|entry| entry.fd == request.fd()) else {
             return protocol::FdFilestatRet(FileStat::new_with_errno(0, 0, ERRNO_BADF));
         };
         protocol::FdFilestatRet(entry.file_stat())
     }
 
-    pub fn file_stat_path(&self, request: protocol::PathFilestatGet) -> protocol::PathFilestatRet {
+    pub fn file_stat_path(
+        &self,
+        received: ReceivedPayload<'_, protocol::PathFilestatGetReq>,
+    ) -> protocol::PathFilestatRet {
+        let request = protocol::PathFilestatGetReq::request(&received).0;
         match self
             .choreofs
             .facts()
@@ -194,8 +210,9 @@ impl ShellEnv {
 
     pub fn read_dir_fd(
         &mut self,
-        read: protocol::FdReaddir,
+        received: ReceivedPayload<'_, protocol::FdReaddirReq>,
     ) -> DemoResult<protocol::FdReaddirDoneRet> {
+        let read = protocol::FdReaddirReq::request(&received).0;
         let Some(entry) = self.entries.iter().find(|entry| entry.fd == read.fd()) else {
             return Ok(protocol::FdReaddirDoneRet(FdReaddirDone::new(
                 read.fd(),
@@ -209,7 +226,7 @@ impl ShellEnv {
                 b"",
                 ERRNO_SUCCESS,
             )?)),
-            FdKind::Dir => Ok(self.choreofs.fd_readdir(read).read_dir()?),
+            FdKind::Dir => Ok(self.choreofs.fd_readdir(received).read_dir()?),
             _ => Ok(protocol::FdReaddirDoneRet(FdReaddirDone::new(
                 read.fd(),
                 b"",
@@ -218,7 +235,11 @@ impl ShellEnv {
         }
     }
 
-    pub fn read_fd(&mut self, read: protocol::FdRead) -> DemoResult<protocol::FdReadDoneRet> {
+    pub fn read_fd(
+        &mut self,
+        received: ReceivedPayload<'_, protocol::FdReadReq>,
+    ) -> DemoResult<protocol::FdReadDoneRet> {
+        let read = protocol::FdReadReq::request(&received).0;
         let Some(index) = self.entries.iter().position(|entry| entry.fd == read.fd()) else {
             return Ok(protocol::FdReadDoneRet(FdReadDone::new_with_errno(
                 read.fd(),
@@ -231,7 +252,7 @@ impl ShellEnv {
         }
         match &mut self.entries[index].kind {
             FdKind::Object { cursor } => {
-                let (response, next_cursor) = self.choreofs.fd_read(read).read_from(*cursor)?;
+                let (response, next_cursor) = self.choreofs.fd_read(received).read_from(*cursor)?;
                 *cursor = next_cursor;
                 Ok(response)
             }
@@ -243,7 +264,11 @@ impl ShellEnv {
         }
     }
 
-    pub fn stat_fd(&self, request: FdRequest) -> protocol::FdStatRet {
+    pub fn stat_fd(
+        &self,
+        received: ReceivedPayload<'_, protocol::FdFdstatGetReq>,
+    ) -> protocol::FdStatRet {
+        let request = protocol::FdFdstatGetReq::request(&received).0;
         let fd = request.fd();
         let Some(entry) = self.entries.iter().find(|entry| entry.fd == fd) else {
             return protocol::FdStatRet(FdStat::new_with_errno(fd, MemRights::Read, ERRNO_BADF));
@@ -258,7 +283,11 @@ impl ShellEnv {
         protocol::FdStatRet(FdStat::new(fd, rights))
     }
 
-    pub fn close_fd(&mut self, request: FdRequest) -> protocol::FdClosedRet {
+    pub fn close_fd(
+        &mut self,
+        received: ReceivedPayload<'_, protocol::FdCloseReq>,
+    ) -> protocol::FdClosedRet {
+        let request = protocol::FdCloseReq::request(&received).0;
         let fd = request.fd();
         if !self.entries.iter().any(|entry| entry.fd == fd) {
             return protocol::FdClosedRet(FdClosed::new_with_errno(fd, ERRNO_BADF));
@@ -272,7 +301,7 @@ impl ShellEnv {
         let _ = io::stderr().flush();
     }
 
-    fn apply_led_green_write(&mut self, write: ChoreoFsWrite) -> protocol::FdWriteDoneRet {
+    fn apply_led_green_write(&mut self, write: ChoreoFsWrite<'_>) -> protocol::FdWriteDoneRet {
         match write.bytes() {
             b"1" => {
                 self.led_green = true;

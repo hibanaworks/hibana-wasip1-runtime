@@ -1,9 +1,22 @@
-use hibana::runtime::wire::CodecError;
+use hibana::runtime::wire::{CodecError, ReceivedPayload, WirePayload};
 
 use crate::protocol::{
     self, FdBinding, FdClosed, FdReadDone, FdReaddirDone, FdStat, FdWriteDone, MemRights,
     PathOpened,
 };
+
+/// Decode the filesystem request carried by a received protocol payload.
+///
+/// Custom message types can implement this when they carry a WASI request
+/// together with application data. ChoreoFS consumes the received payload;
+/// constructing or decoding request data alone cannot invoke an operation.
+pub trait ChoreoFsRequest: WirePayload {
+    /// The operation-specific WASI request, such as [`protocol::FdCloseReq`].
+    type Request;
+
+    /// Extract the request from bytes already validated by this payload's codec.
+    fn request(input: &ReceivedPayload<'_, Self>) -> Self::Request;
+}
 
 const ERRNO_SUCCESS: u16 = 0;
 const ERRNO_ACCES: u16 = 2;
@@ -437,7 +450,61 @@ impl<'a> LedgerFacts<'a> {
 /// ChoreoFS object facts and fd ledger.
 ///
 /// This type never owns endpoint progress. It only turns an already admitted
-/// WASI request into a typed object operation token.
+/// WASI request into a typed object operation token. Pass the value returned by
+/// `recv` directly to the corresponding operation, then send its result.
+///
+/// Locally constructed requests cannot invoke object operations:
+///
+/// ```compile_fail
+/// use hibana_wasip1_runtime::{choreofs::ChoreoFs, protocol::PathOpen};
+/// fn bypass(fs: &ChoreoFs<'_>) {
+///     fs.path_open(PathOpen::new(3, 1 << 6, b"output").unwrap());
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use hibana_wasip1_runtime::{choreofs::ChoreoFs, protocol::FdWrite};
+/// fn bypass(fs: &ChoreoFs<'_>) {
+///     fs.fd_write(FdWrite::new(4, b"bytes").unwrap());
+/// }
+/// ```
+///
+/// Reading metadata does not authorize a close, even though both requests
+/// carry the same fd encoding:
+///
+/// ```compile_fail
+/// use hibana::runtime::wire::ReceivedPayload;
+/// use hibana_wasip1_runtime::{choreofs::ChoreoFs, protocol::FdFdstatGetReq};
+/// fn wrong_operation(fs: &ChoreoFs<'_>, request: ReceivedPayload<'_, FdFdstatGetReq>) {
+///     fs.fd_close(request);
+/// }
+/// ```
+///
+/// An unfinished operation retains the endpoint borrow:
+///
+/// ```compile_fail
+/// use hibana::Endpoint;
+/// use hibana_wasip1_runtime::{choreofs::ChoreoFs, protocol};
+/// async fn advance_early(io: &mut Endpoint<'_, 1>, fs: &ChoreoFs<'_>) {
+///     let request = io.recv::<protocol::FdWriteReqMsg>().await.unwrap();
+///     let write = fs.fd_write(request);
+///     io.send::<protocol::FdWriteRetMsg>(&protocol::FdWriteDoneRet(
+///         protocol::FdWriteDone::new(4, 0),
+///     )).await.unwrap();
+///     let _ = write.written();
+/// }
+/// ```
+///
+/// Each received request can materialize one operation:
+///
+/// ```compile_fail
+/// use hibana::runtime::wire::ReceivedPayload;
+/// use hibana_wasip1_runtime::{choreofs::ChoreoFs, protocol::FdWriteReq};
+/// fn twice(fs: &ChoreoFs<'_>, request: ReceivedPayload<'_, FdWriteReq>) {
+///     let first = fs.fd_write(request);
+///     let second = fs.fd_write(request);
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChoreoFs<'a> {
     choreofs: ChoreoFsFacts<'a>,
@@ -474,8 +541,19 @@ impl<'a> ChoreoFs<'a> {
         self.ledger
     }
 
-    pub fn path_open(&self, open: protocol::PathOpen) -> ChoreoFsOpen {
-        let Some(object) = self.choreofs.resolve(open.path()) else {
+    /// Execute the received `PathOpenReq` request against these object facts.
+    pub fn path_open<'r, P>(&self, received: ReceivedPayload<'r, P>) -> ChoreoFsOpen<'r>
+    where
+        P: ChoreoFsRequest<Request = protocol::PathOpenReq>,
+    {
+        self.open_object(P::request(&received).0)
+    }
+
+    fn open_object(&self, open: protocol::PathOpen) -> ChoreoFsOpen<'static> {
+        let Some(object) = self
+            .choreofs
+            .resolve(open.path().strip_prefix(b"/").unwrap_or(open.path()))
+        else {
             return ChoreoFsOpen::denied(open, None, ERRNO_NOENT);
         };
         let Some(material) = self.materials.object(object) else {
@@ -531,7 +609,16 @@ impl<'a> ChoreoFs<'a> {
         ChoreoFsOpen::opened(open, object, fact.fd(), selected)
     }
 
-    pub fn fd_readdir(&self, read: protocol::FdReaddir) -> ChoreoFsReadDir<'a> {
+    /// Execute the received `FdReaddirReq` request against these object facts.
+    pub fn fd_readdir<'r, P>(&self, received: ReceivedPayload<'r, P>) -> ChoreoFsReadDir<'r>
+    where
+        'a: 'r,
+        P: ChoreoFsRequest<Request = protocol::FdReaddirReq>,
+    {
+        self.read_directory(P::request(&received).0)
+    }
+
+    fn read_directory(&self, read: protocol::FdReaddir) -> ChoreoFsReadDir<'a> {
         let Some(material) = self.material_for_fd(read.fd()) else {
             return ChoreoFsReadDir::denied(read, None, ERRNO_BADF);
         };
@@ -541,7 +628,16 @@ impl<'a> ChoreoFs<'a> {
         ChoreoFsReadDir::ready(read, material.object(), listing)
     }
 
-    pub fn fd_read(&self, read: protocol::FdRead) -> ChoreoFsRead<'a> {
+    /// Execute the received `FdReadReq` request against these object facts.
+    pub fn fd_read<'r, P>(&self, received: ReceivedPayload<'r, P>) -> ChoreoFsRead<'r>
+    where
+        'a: 'r,
+        P: ChoreoFsRequest<Request = protocol::FdReadReq>,
+    {
+        self.read_object(P::request(&received).0)
+    }
+
+    fn read_object(&self, read: protocol::FdRead) -> ChoreoFsRead<'a> {
         let Some(material) = self.material_for_fd(read.fd()) else {
             return ChoreoFsRead::denied(read, None, ERRNO_BADF);
         };
@@ -561,7 +657,20 @@ impl<'a> ChoreoFs<'a> {
         ChoreoFsRead::ready(read, material.object(), bytes)
     }
 
-    pub fn fd_write(&self, write: protocol::FdWrite) -> ChoreoFsWrite {
+    /// Apply a received write whose WASI row matches the object binding.
+    pub fn fd_write<'r, P>(&self, received: ReceivedPayload<'r, P>) -> ChoreoFsWrite<'r>
+    where
+        P: ChoreoFsRequest<Request = (protocol::FdWrite, protocol::FdWriteRow)>,
+    {
+        let (write, row) = P::request(&received);
+        self.write_object(write, row)
+    }
+
+    fn write_object(
+        &self,
+        write: protocol::FdWrite,
+        row: protocol::FdWriteRow,
+    ) -> ChoreoFsWrite<'static> {
         match self
             .material_for_fd(write.fd())
             .map(|material| (material.object(), material.kind))
@@ -575,7 +684,7 @@ impl<'a> ChoreoFs<'a> {
                 .is_some_and(|fact| fact.rights & FD_WRITE_RIGHT != 0)
                 && self
                     .material_for_fd(write.fd())
-                    .is_some_and(|material| material.binding.write.is_some()) =>
+                    .is_some_and(|material| material.binding.write == Some(row)) =>
             {
                 ChoreoFsWrite::ready(write, object)
             }
@@ -584,7 +693,15 @@ impl<'a> ChoreoFs<'a> {
         }
     }
 
-    pub fn fd_fdstat_get(&self, request: protocol::FdRequest) -> protocol::FdStatRet {
+    /// Execute the received `FdFdstatGetReq` request against these object facts.
+    pub fn fd_fdstat_get<P>(&self, received: ReceivedPayload<'_, P>) -> protocol::FdStatRet
+    where
+        P: ChoreoFsRequest<Request = protocol::FdFdstatGetReq>,
+    {
+        self.fd_stat(P::request(&received).0)
+    }
+
+    fn fd_stat(&self, request: protocol::FdRequest) -> protocol::FdStatRet {
         let fd = request.fd();
         match self.material_for_fd(fd) {
             Some(material) => {
@@ -594,7 +711,15 @@ impl<'a> ChoreoFs<'a> {
         }
     }
 
-    pub fn fd_filestat_get(&self, request: protocol::FdRequest) -> protocol::FdFilestatRet {
+    /// Execute the received `FdFilestatGetReq` request against these object facts.
+    pub fn fd_filestat_get<P>(&self, received: ReceivedPayload<'_, P>) -> protocol::FdFilestatRet
+    where
+        P: ChoreoFsRequest<Request = protocol::FdFilestatGetReq>,
+    {
+        self.file_stat(P::request(&received).0)
+    }
+
+    fn file_stat(&self, request: protocol::FdRequest) -> protocol::FdFilestatRet {
         protocol::FdFilestatRet(
             self.material_for_fd(request.fd())
                 .map(Self::material_stat)
@@ -602,10 +727,18 @@ impl<'a> ChoreoFs<'a> {
         )
     }
 
-    pub fn path_filestat_get(
+    /// Execute the received `PathFilestatGetReq` request against these object facts.
+    pub fn path_filestat_get<P>(
         &self,
-        request: protocol::PathFilestatGet,
-    ) -> protocol::PathFilestatRet {
+        received: ReceivedPayload<'_, P>,
+    ) -> protocol::PathFilestatRet
+    where
+        P: ChoreoFsRequest<Request = protocol::PathFilestatGetReq>,
+    {
+        self.path_stat(P::request(&received).0)
+    }
+
+    fn path_stat(&self, request: protocol::PathFilestatGet) -> protocol::PathFilestatRet {
         protocol::PathFilestatRet(
             self.choreofs
                 .resolve(request.path())
@@ -633,7 +766,15 @@ impl<'a> ChoreoFs<'a> {
         }
     }
 
-    pub fn fd_close(&self, request: protocol::FdRequest) -> protocol::FdClosedRet {
+    /// Execute the received `FdCloseReq` request against these object facts.
+    pub fn fd_close<P>(&self, received: ReceivedPayload<'_, P>) -> protocol::FdClosedRet
+    where
+        P: ChoreoFsRequest<Request = protocol::FdCloseReq>,
+    {
+        self.close_object(P::request(&received).0)
+    }
+
+    fn close_object(&self, request: protocol::FdRequest) -> protocol::FdClosedRet {
         let fd = request.fd();
         let errno = if self.material_for_fd(fd).is_some() {
             ERRNO_SUCCESS
@@ -650,8 +791,9 @@ impl<'a> ChoreoFs<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChoreoFsOpen {
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChoreoFsOpen<'r> {
+    borrow: core::marker::PhantomData<&'r mut ()>,
     request: protocol::PathOpen,
     object: Option<ObjectId>,
     fd: u8,
@@ -659,7 +801,7 @@ pub struct ChoreoFsOpen {
     errno: u16,
 }
 
-impl ChoreoFsOpen {
+impl<'r> ChoreoFsOpen<'r> {
     const fn opened(
         request: protocol::PathOpen,
         object: ObjectId,
@@ -667,6 +809,7 @@ impl ChoreoFsOpen {
         binding: FdBinding,
     ) -> Self {
         Self {
+            borrow: core::marker::PhantomData,
             request,
             object: Some(object),
             fd,
@@ -677,6 +820,7 @@ impl ChoreoFsOpen {
 
     const fn denied(request: protocol::PathOpen, object: Option<ObjectId>, errno: u16) -> Self {
         Self {
+            borrow: core::marker::PhantomData,
             request,
             object,
             fd: 0,
@@ -722,8 +866,9 @@ impl ChoreoFsOpen {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ChoreoFsRead<'a> {
+    borrow: core::marker::PhantomData<&'a mut ()>,
     request: protocol::FdRead,
     object: Option<ObjectId>,
     bytes: Option<&'a [u8]>,
@@ -733,6 +878,7 @@ pub struct ChoreoFsRead<'a> {
 impl<'a> ChoreoFsRead<'a> {
     const fn ready(request: protocol::FdRead, object: ObjectId, bytes: &'a [u8]) -> Self {
         Self {
+            borrow: core::marker::PhantomData,
             request,
             object: Some(object),
             bytes: Some(bytes),
@@ -742,6 +888,7 @@ impl<'a> ChoreoFsRead<'a> {
 
     const fn denied(request: protocol::FdRead, object: Option<ObjectId>, errno: u16) -> Self {
         Self {
+            borrow: core::marker::PhantomData,
             request,
             object,
             bytes: None,
@@ -784,8 +931,9 @@ impl<'a> ChoreoFsRead<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ChoreoFsReadDir<'a> {
+    borrow: core::marker::PhantomData<&'a mut ()>,
     request: protocol::FdReaddir,
     object: Option<ObjectId>,
     listing: Option<&'a [u8]>,
@@ -795,6 +943,7 @@ pub struct ChoreoFsReadDir<'a> {
 impl<'a> ChoreoFsReadDir<'a> {
     const fn ready(request: protocol::FdReaddir, object: ObjectId, listing: &'a [u8]) -> Self {
         Self {
+            borrow: core::marker::PhantomData,
             request,
             object: Some(object),
             listing: Some(listing),
@@ -804,6 +953,7 @@ impl<'a> ChoreoFsReadDir<'a> {
 
     const fn denied(request: protocol::FdReaddir, object: Option<ObjectId>, errno: u16) -> Self {
         Self {
+            borrow: core::marker::PhantomData,
             request,
             object,
             listing: None,
@@ -848,16 +998,18 @@ impl<'a> ChoreoFsReadDir<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChoreoFsWrite {
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChoreoFsWrite<'r> {
+    borrow: core::marker::PhantomData<&'r mut ()>,
     request: protocol::FdWrite,
     object: Option<ObjectId>,
     errno: u16,
 }
 
-impl ChoreoFsWrite {
+impl<'r> ChoreoFsWrite<'r> {
     const fn ready(request: protocol::FdWrite, object: ObjectId) -> Self {
         Self {
+            borrow: core::marker::PhantomData,
             request,
             object: Some(object),
             errno: ERRNO_SUCCESS,
@@ -866,6 +1018,7 @@ impl ChoreoFsWrite {
 
     const fn denied(request: protocol::FdWrite, object: Option<ObjectId>, errno: u16) -> Self {
         Self {
+            borrow: core::marker::PhantomData,
             request,
             object,
             errno,
@@ -1027,7 +1180,7 @@ mod tests {
                     | (if bits & 2 != 0 { FD_WRITE_RIGHT } else { 0 })
                     | (if bits & 4 != 0 { FD_READDIR_RIGHT } else { 0 });
                 for ancillary in [0, 1 << 21] {
-                    let open = choreofs.path_open(
+                    let open = choreofs.open_object(
                         protocol::PathOpen::new(3, requested | ancillary, path).unwrap(),
                     );
                     let applicable = if expected == FD_READDIR_RIGHT {
@@ -1042,13 +1195,14 @@ mod tests {
                         "path={path:?}, requested={requested:#x}"
                     );
                     if !accepted {
-                        assert_eq!(open.opened_ret().0.errno(), ERRNO_ACCES);
                         assert_eq!(open.fd(), None);
-                        assert_eq!(open.opened_ret().0.binding(), FdBinding::none());
+                        let response = open.opened_ret();
+                        assert_eq!(response.0.errno(), ERRNO_ACCES);
+                        assert_eq!(response.0.binding(), FdBinding::none());
                     }
                     // A rejected read must not consume the later valid write.
                     let valid =
-                        choreofs.path_open(protocol::PathOpen::new(3, expected, path).unwrap());
+                        choreofs.open_object(protocol::PathOpen::new(3, expected, path).unwrap());
                     assert!(valid.is_open());
                 }
             }
@@ -1076,38 +1230,38 @@ mod tests {
             FD_WRITE_RIGHT,
             FD_READ_RIGHT | FD_WRITE_RIGHT,
         ] {
-            let open = fs.path_open(protocol::PathOpen::new(3, rights, b"file").unwrap());
+            let open = fs.open_object(protocol::PathOpen::new(3, rights, b"file").unwrap());
             assert!(open.is_open());
             assert_eq!(open.binding().read.is_some(), rights & FD_READ_RIGHT != 0);
             assert_eq!(open.binding().write.is_some(), rights & FD_WRITE_RIGHT != 0);
         }
         assert!(
-            !fs.path_open(protocol::PathOpen::new(3, 0, b"file").unwrap())
+            !fs.open_object(protocol::PathOpen::new(3, 0, b"file").unwrap())
                 .is_open()
         );
         let (read, offset) = fs
-            .fd_read(protocol::FdRead::new(6, 2).unwrap())
+            .read_object(protocol::FdRead::new(6, 2).unwrap())
             .read_from(1)
             .unwrap();
         assert_eq!(read.0.as_bytes(), &[8, 9]);
         assert_eq!(offset, 3);
-        assert_eq!(fs.fd_filestat_get(protocol::FdRequest::new(6)).0.size(), 3);
+        assert_eq!(fs.file_stat(protocol::FdRequest::new(6)).0.size(), 3);
         let read_only_truncate = protocol::PathOpen::new(3, FD_READ_RIGHT, b"file")
             .unwrap()
             .with_flags(8, 0)
             .unwrap();
-        assert!(!fs.path_open(read_only_truncate).is_open());
+        assert!(!fs.open_object(read_only_truncate).is_open());
         let write_truncate = protocol::PathOpen::new(3, FD_WRITE_RIGHT, b"file")
             .unwrap()
             .with_flags(8, 0)
             .unwrap();
-        assert!(fs.path_open(write_truncate).is_open());
+        assert!(fs.open_object(write_truncate).is_open());
         assert_eq!(contents, [7, 8, 9]); // Admission itself never mutates file data.
         let exclusive = protocol::PathOpen::new(3, FD_WRITE_RIGHT, b"file")
             .unwrap()
             .with_flags(5, 0)
             .unwrap();
-        assert_eq!(fs.path_open(exclusive).errno(), 20);
+        assert_eq!(fs.open_object(exclusive).errno(), 20);
     }
 
     #[test]
@@ -1170,7 +1324,7 @@ mod tests {
                 for ancillary in [0, 1 << 21, 1 << 63, !mask] {
                     let requested = io | ancillary;
                     let open =
-                        choreofs.path_open(protocol::PathOpen::new(3, requested, path).unwrap());
+                        choreofs.open_object(protocol::PathOpen::new(3, requested, path).unwrap());
                     let accepted = open.is_open();
                     if !accepted {
                         assert_eq!(open.fd(), None);
@@ -1223,13 +1377,13 @@ mod tests {
             (b"no-ledger-right", FD_WRITE_RIGHT),
             (b"wrong-binding", FD_READ_RIGHT),
         ] {
-            let denied = choreofs.path_open(protocol::PathOpen::new(3, right, path).unwrap());
+            let denied = choreofs.open_object(protocol::PathOpen::new(3, right, path).unwrap());
             assert_eq!(denied.fd(), None);
             assert_eq!(denied.opened_ret().0.errno(), ERRNO_ACCES);
         }
         assert!(
             choreofs
-                .path_open(protocol::PathOpen::new(3, FD_WRITE_RIGHT, b"valid").unwrap())
+                .open_object(protocol::PathOpen::new(3, FD_WRITE_RIGHT, b"valid").unwrap())
                 .is_open()
         );
     }
@@ -1238,7 +1392,7 @@ mod tests {
     fn choreofs_builds_object_operation_tokens() {
         let choreofs = RUNTIME_OBJECTS.choreofs();
 
-        let open = choreofs.path_open(
+        let open = choreofs.open_object(
             protocol::PathOpen::new(3, FD_READDIR_RIGHT, b"objects").expect("path_open"),
         );
         assert_eq!(open.object(), Some(ObjectId(10)));
@@ -1252,53 +1406,57 @@ mod tests {
             Some(protocol::FdReaddirRow::Base)
         );
 
-        let mixed_dir_open = choreofs.path_open(
+        let mixed_dir_open = choreofs.open_object(
             protocol::PathOpen::new(3, FD_READ_RIGHT | FD_READDIR_RIGHT, b"objects")
                 .expect("path_open"),
         );
         assert_eq!(mixed_dir_open.fd(), Some(4));
 
-        let mixed_read_open = choreofs.path_open(
+        let mixed_read_open = choreofs.open_object(
             protocol::PathOpen::new(3, FD_READ_RIGHT | FD_READDIR_RIGHT, b"objects/log")
                 .expect("path_open"),
         );
         assert_eq!(mixed_read_open.fd(), Some(5));
 
-        let readdir =
-            choreofs.fd_readdir(protocol::FdReaddir::new(4, 0, 16).expect("fd_readdir request"));
+        let readdir = choreofs
+            .read_directory(protocol::FdReaddir::new(4, 0, 16).expect("fd_readdir request"));
         assert_eq!(readdir.object(), Some(ObjectId(10)));
         let listing = readdir.read_dir().expect("fd_readdir ret");
         assert_eq!(listing.0.as_bytes(), b"log\n");
 
         let read = protocol::FdRead::new(5, 30).expect("fd_read request");
-        let read = choreofs.fd_read(read);
+        let read = choreofs.read_object(read);
         assert_eq!(read.object(), Some(ObjectId(11)));
         let (chunk, next_offset) = read.read_from(0).expect("fd_read ret");
         assert_eq!(chunk.0.as_bytes(), b"session=attached\n");
         assert_eq!(next_offset, b"session=attached\n".len());
 
-        let denied_read = choreofs.fd_read(protocol::FdRead::new(9, 30).expect("fd_read request"));
+        let denied_read =
+            choreofs.read_object(protocol::FdRead::new(9, 30).expect("fd_read request"));
         assert_eq!(denied_read.object(), None);
         assert_eq!(denied_read.errno(), ERRNO_BADF);
         let (denied_read, _) = denied_read.read_from(0).expect("fd_read ret");
         assert_eq!(denied_read.0.errno(), ERRNO_BADF);
 
-        let denied_stat = choreofs.fd_fdstat_get(protocol::FdRequest::new(9));
+        let denied_stat = choreofs.fd_stat(protocol::FdRequest::new(9));
         assert_eq!(denied_stat.0.fd(), 9);
         assert_eq!(denied_stat.0.errno(), ERRNO_BADF);
 
-        let denied_close = choreofs.fd_close(protocol::FdRequest::new(9));
+        let denied_close = choreofs.close_object(protocol::FdRequest::new(9));
         assert_eq!(denied_close.0.fd(), 9);
         assert_eq!(denied_close.0.errno(), ERRNO_BADF);
 
-        let write = choreofs.fd_write(protocol::FdWrite::new(6, b"1").expect("fd_write request"));
+        let write = choreofs.write_object(
+            protocol::FdWrite::new(6, b"1").expect("fd_write request"),
+            protocol::FdWriteRow::Object,
+        );
         assert_eq!(write.object(), Some(ObjectId(12)));
         assert_eq!(write.bytes(), b"1");
         let written = write.written();
         assert_eq!(written.0.written(), 1);
         assert_eq!(written.0.errno(), ERRNO_SUCCESS);
 
-        let denied = choreofs.path_open(
+        let denied = choreofs.open_object(
             protocol::PathOpen::new(3, FD_WRITE_RIGHT, b"objects/log").expect("path_open"),
         );
         assert_eq!(denied.object(), Some(ObjectId(11)));
