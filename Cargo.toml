@@ -2,6 +2,7 @@
 name = "hibana-wasip1-runtime"
 version = "0.1.0"
 edition = "2024"
+autoexamples = false
 rust-version = "1.95"
 description = "Hibana-bound WASI Preview 1 runtime boundary for choreographed Wasm guests"
 license = "MIT OR Apache-2.0"
@@ -23,8 +24,16 @@ include = [
     "/proofs/**",
 ]
 
+[[example]]
+name = "direct_choreofs_write_rejection"
+path = "examples/direct_choreofs_write_rejection/main.rs"
+
+[[example]]
+name = "sequenced_choreofs_write"
+path = "examples/sequenced_choreofs_write/main.rs"
+
 [dependencies]
-hibana = { git = "https://github.com/hibanaworks/hibana", rev = "3e2220a85368e03b8b0fa099c39c7ec13557a200", version = "=0.10.0", default-features = false }
+hibana = { git = "https://github.com/hibanaworks/hibana", rev = "e139912e07fe4cd5ba599dd3749d6e03ce9d1ee1", version = "=0.10.0", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["rt", "macros"] }
