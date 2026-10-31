@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "hibana"
 version = "0.10.0"
-source = "git+https://github.com/hibanaworks/hibana?rev=e139912e07fe4cd5ba599dd3749d6e03ce9d1ee1#e139912e07fe4cd5ba599dd3749d6e03ce9d1ee1"
+source = "git+https://github.com/hibanaworks/hibana?rev=b7d65518b07226a3d69a140bbaf17d4c80fb65a8#b7d65518b07226a3d69a140bbaf17d4c80fb65a8"
 
 [[package]]
 name = "hibana-wasip1-runtime"
