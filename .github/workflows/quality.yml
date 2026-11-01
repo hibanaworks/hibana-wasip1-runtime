@@ -3,6 +3,7 @@ name: quality
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,6 +22,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: hibana-wasip1-runtime
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hibanaworks/hibana
+          ref: c1d92129b0ae95572aaa53bb2e7455c20689bb43
+          path: validation-core
       - name: Install release tools
         run: |
           sudo apt-get update
@@ -37,4 +43,6 @@ jobs:
       - name: Fetch locked dependencies for offline checks
         run: cargo +stable fetch --locked
       - name: Run quality gates
-        run: bash scripts/check_runtime_gates.sh
+        run: >-
+          bash "$GITHUB_WORKSPACE/validation-core/.github/scripts/lib/resource_guard.sh"
+          bash scripts/check_runtime_gates.sh
