@@ -367,9 +367,12 @@ bash scripts/check_wasi_shell_demo.sh
 
 The guest uses ordinary Rust `std` APIs. The first host rejects an object write
 absent from its protocol. The second allows the write after the required read.
-Tokio drives the guest and environment roles together.
+`hibana-runtime` drives the guest and environment roles concurrently. Each
+localside writes its Endpoint operations directly, with Rust async scopes
+marking where concurrent work must finish.
 The example transport uses in-process queues and wakes a waiting receiver when
-a frame arrives. These examples do not test network failure detection.
+a frame arrives. Its driver polls continuously, including under Miri; the
+examples do not measure OS readiness costs or test network failure detection.
 
 ## Embedded Budget
 

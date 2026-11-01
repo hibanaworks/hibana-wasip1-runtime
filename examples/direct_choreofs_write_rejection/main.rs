@@ -113,16 +113,16 @@ fn direct_choreofs_write_blocked_choreography() -> impl hibana::runtime::program
         g::route(
             g::seq(
                 g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, GuestExited>(),
-                g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, ReturnEnvironment<'_>>(),
+                g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, ReturnEnvironment>(),
             ),
             g::seq(
                 g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, GuestFailed>(),
-                g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, ReturnEnvironment<'_>>(),
+                g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, ReturnEnvironment>(),
             ),
         )
     };
     g::seq(
-        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, Environment<'_>>(),
+        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, Environment>(),
         g::route(g::seq(imports, finish()), finish()),
     )
 }
@@ -133,7 +133,7 @@ async fn run_shell_app_engine(
     guest: &mut HibanaWasiGuest<'_>,
     control: &mut Endpoint<'_, SHELL_APP_ROLE>,
 ) -> DemoResult<i32> {
-    let mut io = control.recv::<Environment<'_>>().await?;
+    let mut io = control.recv::<Environment>().await?;
     let mut run_id = 1u16;
     loop {
         match guest.resume_wasi_boundary(protocol::BudgetRun::new(run_id, 0, 100_000))? {
@@ -248,7 +248,7 @@ async fn run_shell_app_engine(
             }
             WasiBoundaryStep::BudgetExpired(_) => {
                 run_id = run_id.wrapping_add(1);
-                tokio::task::yield_now().await;
+                hibana_runtime::yield_now().await;
             }
             WasiBoundaryStep::Exit(exit) => {
                 let status = exit.status() as i32;
@@ -257,7 +257,7 @@ async fn run_shell_app_engine(
                 } else {
                     io.send::<GuestFailed>(&status).await?;
                 }
-                control.send::<ReturnEnvironment<'_>>(io).await?;
+                control.send::<ReturnEnvironment>(io).await?;
                 return Ok(status);
             }
         }
@@ -271,7 +271,7 @@ async fn run_shell_env<'r>(
     io: Endpoint<'r, SHELL_IO_ROLE>,
     shell_env: &mut ShellEnv,
 ) -> DemoResult<()> {
-    shell_env_endpoint.send::<Environment<'_>>(io).await?;
+    shell_env_endpoint.send::<Environment>(io).await?;
     loop {
         let branch = shell_env_endpoint.offer().await?;
         match branch.label() {
@@ -279,12 +279,12 @@ async fn run_shell_env<'r>(
                 if branch.recv::<GuestExited>().await? != 0 {
                     return Err(DemoError::message("successful exit has nonzero status"));
                 }
-                let _io = shell_env_endpoint.recv::<ReturnEnvironment<'_>>().await?;
+                let _io = shell_env_endpoint.recv::<ReturnEnvironment>().await?;
                 return Ok(());
             }
             203 => {
                 let _status = branch.recv::<GuestFailed>().await?;
-                let _io = shell_env_endpoint.recv::<ReturnEnvironment<'_>>().await?;
+                let _io = shell_env_endpoint.recv::<ReturnEnvironment>().await?;
                 return Ok(());
             }
             _ => {}
@@ -358,7 +358,12 @@ fn offered_import(label: u8) -> DemoResult<WasiImport> {
         .ok_or_else(|| DemoError::message(format!("route boundary reached non-WASI label {label}")))
 }
 
-fn run_guest_session<P>(module: &[u8], program: &P, shell_env: &mut ShellEnv) -> DemoResult<i32>
+#[hibana_runtime::main(wasi_shell_demo_lib::Events)]
+async fn run_guest_session<P>(
+    module: &[u8],
+    program: &P,
+    shell_env: &mut ShellEnv,
+) -> DemoResult<i32>
 where
     P: Projectable,
 {
@@ -384,13 +389,13 @@ where
         initial_bindings(),
     )?;
 
-    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-    let (status, ()) = runtime.block_on(async {
-        tokio::try_join!(
-            run_shell_app_engine(guest, &mut shell_app_endpoint),
-            run_shell_env(&mut shell_env_endpoint, io, shell_env),
-        )
-    })?;
+    let status = async {
+        async {
+            run_shell_env(&mut shell_env_endpoint, io, shell_env).await?;
+        };
+        run_shell_app_engine(guest, &mut shell_app_endpoint).await
+    }
+    .await?;
     if !transport.is_drained() {
         return Err(DemoError::message("unread frames after environment return"));
     }

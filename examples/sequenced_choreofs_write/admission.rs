@@ -39,8 +39,10 @@ impl ChoreoFsRequest for CloseWithTag {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn parallel_received_requests_and_custom_payloads_materialize_objects() {
+#[hibana_runtime::main(super::wasi_shell_demo_lib::Events)]
+#[test]
+async fn parallel_received_requests_and_custom_payloads_materialize_objects()
+-> Result<(), hibana::EndpointError> {
     let objects = ChoreoFsObjectSet::new([
         ChoreoFsObject::writable(
             b"output",
@@ -96,7 +98,7 @@ async fn parallel_received_requests_and_custom_payloads_materialize_objects() {
     let mut writer = rv.enter(sid, &programs.0).unwrap();
     let mut service = rv.enter(sid, &programs.1).unwrap();
     let mut reader = rv.enter(sid, &programs.2).unwrap();
-    let ((), (), ()) = tokio::try_join!(
+    async {
         async {
             writer
                 .send::<PathOpenReqMsg>(&PathOpenReq(PathOpen::new(3, 1 << 6, b"/output").unwrap()))
@@ -108,19 +110,19 @@ async fn parallel_received_requests_and_custom_payloads_materialize_objects() {
             assert_eq!(writer.recv::<FdWriteObjectRetMsg>().await?.0.written(), 3);
             writer.send::<Close>(&CloseWithTag(4, 7)).await?;
             assert_eq!(writer.recv::<Closed>().await?.0.errno(), 0);
-            Ok::<_, hibana::EndpointError>(())
-        },
+            Ok(())
+        };
         async {
             reader
                 .send::<FdReadReqMsg>(&FdReadReq(FdRead::new(5, 5).unwrap()))
                 .await?;
             assert_eq!(reader.recv::<FdReadRetMsg>().await?.0.as_bytes(), b"hello");
             Ok(())
-        },
+        };
         async {
             {
                 let [mut writes, mut reads] = service.par()?;
-                tokio::try_join!(
+                async {
                     async {
                         let request = writes.recv::<PathOpenReqMsg>().await?;
                         let opened = fs.path_open(request).opened_ret();
@@ -130,27 +132,32 @@ async fn parallel_received_requests_and_custom_payloads_materialize_objects() {
                         assert_eq!(operation.bytes(), b"new");
                         let written = operation.written();
                         writes.send::<FdWriteObjectRetMsg>(&written).await?;
-                        Ok::<_, hibana::EndpointError>(())
-                    },
+                        Ok(())
+                    };
                     async {
                         let request = reads.recv::<FdReadReqMsg>().await?;
                         let (data, _) = fs.fd_read(request).read_from(0).unwrap();
-                        reads.send::<FdReadRetMsg>(&data).await
-                    },
-                )?;
+                        reads.send::<FdReadRetMsg>(&data).await?;
+                    };
+                    Ok(())
+                }
+                .await?;
             }
             let request = service.recv::<Close>().await?;
             assert_eq!(request.as_bytes()[1], 7);
             let closed = fs.fd_close(request);
-            service.send::<Closed>(&closed).await
-        }
-    )
-    .unwrap();
+            service.send::<Closed>(&closed).await?;
+        };
+        Ok(())
+    }
+    .await?;
     assert!(transport.is_drained());
+    Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn fd_metadata_receive_cannot_be_decoded_as_close() {
+#[hibana_runtime::main(super::wasi_shell_demo_lib::Events)]
+#[test]
+async fn fd_metadata_receive_cannot_be_decoded_as_close() -> Result<(), hibana::EndpointError> {
     let global = g::send::<0, 1, FdFdstatGetReqMsg>();
     let programs = (project::<0>(&global), project::<1>(&global));
     let sid = SessionId::new(2);
@@ -172,10 +179,12 @@ async fn fd_metadata_receive_cannot_be_decoded_as_close() {
         format!("{error:?}").contains("PayloadMismatch"),
         "{error:?}"
     );
+    Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn received_write_rows_must_match_the_object_binding() {
+#[hibana_runtime::main(super::wasi_shell_demo_lib::Events)]
+#[test]
+async fn received_write_rows_must_match_the_object_binding() -> Result<(), hibana::EndpointError> {
     for binding_row in [FdWriteRow::Base, FdWriteRow::Object] {
         for sent_row in [FdWriteRow::Base, FdWriteRow::Object] {
             let objects = ChoreoFsObjectSet::new([ChoreoFsObject::writable(
@@ -231,10 +240,13 @@ async fn received_write_rows_must_match_the_object_binding() {
             assert!(transport.is_drained());
         }
     }
+    Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn base_write_receive_cannot_be_decoded_as_object_write() {
+#[hibana_runtime::main(super::wasi_shell_demo_lib::Events)]
+#[test]
+async fn base_write_receive_cannot_be_decoded_as_object_write() -> Result<(), hibana::EndpointError>
+{
     let global = g::send::<0, 1, FdWriteReqMsg>();
     let programs = (project::<0>(&global), project::<1>(&global));
     let sid = SessionId::new(4);
@@ -256,4 +268,5 @@ async fn base_write_receive_cannot_be_decoded_as_object_write() {
         format!("{error:?}").contains("PayloadMismatch"),
         "{error:?}"
     );
+    Ok(())
 }

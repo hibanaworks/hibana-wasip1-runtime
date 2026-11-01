@@ -198,16 +198,16 @@ fn sequenced_choreofs_write_choreography() -> impl hibana::runtime::program::Pro
         g::route(
             g::seq(
                 g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, GuestExited>(),
-                g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, ReturnEnvironment<'_>>(),
+                g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, ReturnEnvironment>(),
             ),
             g::seq(
                 g::send::<SHELL_IO_ROLE, SHELL_ENV_ROLE, GuestFailed>(),
-                g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, ReturnEnvironment<'_>>(),
+                g::send::<SHELL_APP_ROLE, SHELL_ENV_ROLE, ReturnEnvironment>(),
             ),
         )
     };
     g::seq(
-        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, Environment<'_>>(),
+        g::send::<SHELL_ENV_ROLE, SHELL_APP_ROLE, Environment>(),
         g::route(g::seq(imports, finish()), finish()),
     )
 }
@@ -218,7 +218,7 @@ async fn run_shell_app_engine(
     guest: &mut HibanaWasiGuest<'_>,
     control: &mut Endpoint<'_, SHELL_APP_ROLE>,
 ) -> DemoResult<i32> {
-    let mut io = control.recv::<Environment<'_>>().await?;
+    let mut io = control.recv::<Environment>().await?;
     let mut run_id = 1u16;
     loop {
         match guest.resume_wasi_boundary(protocol::BudgetRun::new(run_id, 0, 100_000))? {
@@ -328,7 +328,7 @@ async fn run_shell_app_engine(
             }
             WasiBoundaryStep::BudgetExpired(_) => {
                 run_id = run_id.wrapping_add(1);
-                tokio::task::yield_now().await;
+                hibana_runtime::yield_now().await;
             }
             WasiBoundaryStep::Exit(exit) => {
                 let status = exit.status() as i32;
@@ -337,7 +337,7 @@ async fn run_shell_app_engine(
                 } else {
                     io.send::<GuestFailed>(&status).await?;
                 }
-                control.send::<ReturnEnvironment<'_>>(io).await?;
+                control.send::<ReturnEnvironment>(io).await?;
                 return Ok(status);
             }
         }
@@ -351,7 +351,7 @@ async fn run_shell_env<'r>(
     io: Endpoint<'r, SHELL_IO_ROLE>,
     shell_env: &mut ShellEnv,
 ) -> DemoResult<()> {
-    shell_env_endpoint.send::<Environment<'_>>(io).await?;
+    shell_env_endpoint.send::<Environment>(io).await?;
     loop {
         let branch = shell_env_endpoint.offer().await?;
         match branch.label() {
@@ -359,12 +359,12 @@ async fn run_shell_env<'r>(
                 if branch.recv::<GuestExited>().await? != 0 {
                     return Err(DemoError::message("successful exit has nonzero status"));
                 }
-                let _io = shell_env_endpoint.recv::<ReturnEnvironment<'_>>().await?;
+                let _io = shell_env_endpoint.recv::<ReturnEnvironment>().await?;
                 return Ok(());
             }
             203 => {
                 let _status = branch.recv::<GuestFailed>().await?;
-                let _io = shell_env_endpoint.recv::<ReturnEnvironment<'_>>().await?;
+                let _io = shell_env_endpoint.recv::<ReturnEnvironment>().await?;
                 return Ok(());
             }
             _ => {}
@@ -536,7 +536,12 @@ async fn run_shell_env<'r>(
     }
 }
 
-fn run_guest_session<P>(module: &[u8], program: &P, shell_env: &mut ShellEnv) -> DemoResult<i32>
+#[hibana_runtime::main(wasi_shell_demo_lib::Events)]
+async fn run_guest_session<P>(
+    module: &[u8],
+    program: &P,
+    shell_env: &mut ShellEnv,
+) -> DemoResult<i32>
 where
     P: Projectable,
 {
@@ -562,13 +567,13 @@ where
         initial_bindings(),
     )?;
 
-    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-    let (status, ()) = runtime.block_on(async {
-        tokio::try_join!(
-            run_shell_app_engine(guest, &mut shell_app_endpoint),
-            run_shell_env(&mut shell_env_endpoint, io, shell_env),
-        )
-    })?;
+    let status = async {
+        async {
+            run_shell_env(&mut shell_env_endpoint, io, shell_env).await?;
+        };
+        run_shell_app_engine(guest, &mut shell_app_endpoint).await
+    }
+    .await?;
     if !transport.is_drained() {
         return Err(DemoError::message("unread frames after environment return"));
     }
@@ -599,7 +604,8 @@ fn parse_host_args() -> DemoResult<PathBuf> {
 mod tests {
     use super::*;
 
-    #[tokio::test(flavor = "current_thread")]
+    #[hibana_runtime::main(wasi_shell_demo_lib::Events)]
+    #[test]
     async fn object_write_before_the_required_read_sends_no_frame() -> DemoResult<()> {
         let global = sequenced_choreofs_write_choreography();
         let owner_program = project::<SHELL_ENV_ROLE>(&global);
@@ -615,8 +621,8 @@ mod tests {
         let mut app = runtime.enter(session, &app_program)?;
         let io = runtime.enter(session, &io_program)?;
 
-        owner.send::<Environment<'_>>(io).await?;
-        let mut io = app.recv::<Environment<'_>>().await?;
+        owner.send::<Environment>(io).await?;
+        let mut io = app.recv::<Environment>().await?;
         let request = protocol::FdWriteObjectReq(protocol::FdWrite::new(6, b"1")?);
         assert!(
             io.send::<protocol::FdWriteObjectReqMsg>(&request)
@@ -628,7 +634,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[hibana_runtime::main(wasi_shell_demo_lib::Events)]
+    #[test]
     async fn guest_exit_cannot_skip_an_unfinished_import() -> DemoResult<()> {
         let global = sequenced_choreofs_write_choreography();
         let owner_program = project::<SHELL_ENV_ROLE>(&global);
@@ -644,8 +651,8 @@ mod tests {
         let mut app = runtime.enter(session, &app_program)?;
         let io = runtime.enter(session, &io_program)?;
 
-        owner.send::<Environment<'_>>(io).await?;
-        let mut io = app.recv::<Environment<'_>>().await?;
+        owner.send::<Environment>(io).await?;
+        let mut io = app.recv::<Environment>().await?;
         io.send::<protocol::FdFdstatGetReqMsg>(&protocol::FdFdstatGetReq(
             protocol::FdRequest::new(3),
         ))
@@ -661,7 +668,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[hibana_runtime::main(wasi_shell_demo_lib::Events)]
+    #[test]
     async fn normal_exit_returns_the_same_environment_without_reissuing_it() -> DemoResult<()> {
         let global = sequenced_choreofs_write_choreography();
         let owner_program = project::<SHELL_ENV_ROLE>(&global);
@@ -678,9 +686,9 @@ mod tests {
         let io = runtime.enter(session, &io_program)?;
 
         let write = protocol::FdWriteReq(protocol::FdWrite::new(1, b"ok")?);
-        tokio::try_join!(
+        async {
             async {
-                owner.send::<Environment<'_>>(io).await?;
+                owner.send::<Environment>(io).await?;
                 let request = owner.recv::<protocol::FdWriteReqMsg>().await?;
                 let request = protocol::FdWriteReq::request(&request).0;
                 let response = protocol::FdWriteDoneRet(protocol::FdWriteDone::new(
@@ -691,17 +699,19 @@ mod tests {
                 let branch = owner.offer().await?;
                 assert_eq!(branch.label(), 202);
                 assert_eq!(branch.recv::<GuestExited>().await?, 0);
-                let _returned = owner.recv::<ReturnEnvironment<'_>>().await?;
-                Ok::<_, hibana::EndpointError>(())
-            },
+                let _returned = owner.recv::<ReturnEnvironment>().await?;
+                Ok(())
+            };
             async {
-                let mut io = app.recv::<Environment<'_>>().await?;
+                let mut io = app.recv::<Environment>().await?;
                 io.send::<protocol::FdWriteReqMsg>(&write).await?;
                 io.recv::<protocol::FdWriteRetMsg>().await?;
                 io.send::<GuestExited>(&0).await?;
-                app.send::<ReturnEnvironment<'_>>(io).await
-            },
-        )?;
+                app.send::<ReturnEnvironment>(io).await?;
+            };
+            Ok(())
+        }
+        .await?;
         assert!(transport.is_drained());
         assert!(!env.led_green());
         assert!(runtime.enter(session, &io_program).is_err());
@@ -718,7 +728,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[hibana_runtime::main(wasi_shell_demo_lib::Events)]
+    #[test]
     async fn nonzero_exit_before_any_import_returns_the_environment() -> DemoResult<()> {
         let global = sequenced_choreofs_write_choreography();
         let owner_program = project::<SHELL_ENV_ROLE>(&global);
@@ -734,21 +745,23 @@ mod tests {
         let mut app = runtime.enter(session, &app_program)?;
         let io = runtime.enter(session, &io_program)?;
 
-        tokio::try_join!(
+        async {
             async {
-                owner.send::<Environment<'_>>(io).await?;
+                owner.send::<Environment>(io).await?;
                 let branch = owner.offer().await?;
                 assert_eq!(branch.label(), 203);
                 assert_eq!(branch.recv::<GuestFailed>().await?, 7);
-                let _returned = owner.recv::<ReturnEnvironment<'_>>().await?;
-                Ok::<_, hibana::EndpointError>(())
-            },
+                let _returned = owner.recv::<ReturnEnvironment>().await?;
+                Ok(())
+            };
             async {
-                let mut io = app.recv::<Environment<'_>>().await?;
+                let mut io = app.recv::<Environment>().await?;
                 io.send::<GuestFailed>(&7).await?;
-                app.send::<ReturnEnvironment<'_>>(io).await
-            },
-        )?;
+                app.send::<ReturnEnvironment>(io).await?;
+            };
+            Ok(())
+        }
+        .await?;
         assert!(transport.is_drained());
         assert!(!env.led_green());
         Ok(())
