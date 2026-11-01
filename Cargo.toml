@@ -36,7 +36,7 @@ path = "examples/sequenced_choreofs_write/main.rs"
 hibana = { git = "https://github.com/hibanaworks/hibana", rev = "c1d92129b0ae95572aaa53bb2e7455c20689bb43", version = "=0.10.0", default-features = false }
 
 [dev-dependencies]
-hibana-runtime = { git = "https://github.com/hibanaworks/hibana-runtime", rev = "4d73bcf715a979ee6241d8c7ab614f4dfcf428b0" }
+hibana-runtime = { git = "https://github.com/hibanaworks/hibana-runtime", rev = "68966541e71e7701e9edec6d0696d5da9ac76927" }
 
 [lints.rust]
 long_running_const_eval = "forbid"
