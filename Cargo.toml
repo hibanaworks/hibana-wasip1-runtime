@@ -33,10 +33,10 @@ name = "sequenced_choreofs_write"
 path = "examples/sequenced_choreofs_write/main.rs"
 
 [dependencies]
-hibana = { git = "https://github.com/hibanaworks/hibana", rev = "40298f0f66c67c51fea2a1d444caf10c241e5fe2", version = "=0.10.0", default-features = false }
+hibana = { git = "https://github.com/hibanaworks/hibana", rev = "194eac8eb8a3a6aece5cd48b76df8946e9357b31", version = "=0.10.0", default-features = false }
 
 [dev-dependencies]
-hibana-runtime = { git = "https://github.com/hibanaworks/hibana-runtime", rev = "f09380262f76de8d92f6dd96012cf1704045bc8c" }
+hibana-runtime = { git = "https://github.com/hibanaworks/hibana-runtime", rev = "09a803afdfb45945febed46145a68ff92a03d9e4" }
 
 [lints.rust]
 long_running_const_eval = "forbid"
