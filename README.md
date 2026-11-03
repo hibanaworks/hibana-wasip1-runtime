@@ -439,10 +439,10 @@ option.
 ## Poll proof and verification
 
 `bash scripts/check_poll.sh` runs all-target tests, Clippy, Pico 2
-compilation, the affine ownership compile-fail test, Lean kernel checks, and Z3.
+compilation, the affine ownership compile-fail test and Lean kernel checks.
 Each Rust verification uses a temporary target that is deleted on success or
 failure. The gate verifies 20 model theorems and 520 admission decisions exported
-from actual Rust VM execution, plus 10 path-rights theorems and 160 actual
-ChoreoFS admission decisions. Z3 checks 64-bit I/O rights with four UNSAT
-properties and three SAT witnesses. [Proof scope](proofs/README.md) records the
+from actual Rust VM execution, plus 14 general path-rights theorems and 160
+actual ChoreoFS admission decisions. Lean covers all rights masks, including
+every 64-bit pattern, without a second solver model. [Proof scope](proofs/README.md) records the
 unmodeled boundaries and the exact axiom audit.

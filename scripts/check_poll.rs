@@ -1,4 +1,4 @@
-//! Build the public runtime and check its actual VM decisions with Lean and Z3.
+//! Build the public runtime and check its actual VM decisions with Lean.
 mod check_common;
 use check_common::{Result, fresh, run};
 use std::{
@@ -175,6 +175,10 @@ fn check(root: &Path, target: &Path, evidence: &Path) -> Result<()> {
         "read_write_accepts_read",
         "read_write_accepts_write",
         "read_write_accepts_both",
+        "accepted_has_exact_selected_mode",
+        "accepted_has_nonempty_selected_mode",
+        "accepted_cannot_add_io_rights",
+        "matching_write_is_admitted",
     ];
     let mut path_expected: Vec<_> = path_names
         .iter()
@@ -192,20 +196,8 @@ fn check(root: &Path, target: &Path, evidence: &Path) -> Result<()> {
         &path_expected,
     )?;
 
-    let smt = run(
-        Command::new("z3")
-            .arg(root.join("proofs/PathRights.smt2"))
-            .current_dir(root),
-        &evidence.join("path-z3.log"),
-    )?;
-    if smt
-        .lines()
-        .ne(["unsat", "unsat", "unsat", "unsat", "sat", "sat", "sat"])
-    {
-        return Err(format!("unexpected Z3 results: {smt}").into());
-    }
     println!(
-        "20 poll theorems, 520 VM decisions, 10 path-rights theorems, 160 ChoreoFS decisions and 7 Z3 queries passed"
+        "20 poll theorems, 520 VM decisions, 14 path-rights theorems and 160 ChoreoFS decisions passed"
     );
     Ok(())
 }

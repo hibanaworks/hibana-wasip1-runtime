@@ -49,7 +49,7 @@ is live; Lean does not model Rust's borrow checker.
 The 48-byte subscription and 32-byte event layouts and clock flag meanings
 were checked against the [WASI Preview 1 specification](https://github.com/WebAssembly/WASI/blob/snapshot-01/phases/snapshot/docs.md#subscription-struct).
 
-`PathRights.lean` proves ten statements about fixed ChoreoFS I/O capabilities:
+`PathRights.lean` proves fourteen statements about fixed ChoreoFS I/O capabilities:
 an accepted object has a nonempty capability and the exact applicable I/O mode;
 an incompatible mode rejects; a writer requires the write bit; a read request
 cannot open a writer; empty materials reject; borrowed read/write files retain
@@ -58,12 +58,14 @@ from actual Rust `ChoreoFs::path_open` calls: five material kinds, every
 combination of the three I/O bits, and four ancillary-bit patterns including
 the high bit and every non-I/O bit. Denied calls return no descriptor or binding.
 The kernel checks every decision; the exact axiom audit permits only `propext`
-for all ten general theorems and 160 finite decisions.
+for all fourteen general theorems and 160 finite decisions.
 
-`PathRights.smt2` checks all 64-bit base-right patterns. Four UNSAT queries rule
-out empty grants, added I/O rights, silently dropped conflicting applicable
-modes, and read admission on writers. Three SAT witnesses cover the old
-writable-default error, the old base/inheriting union, and a genuine write.
+The same Lean model proves that every selected mode is nonempty, equals the
+requested applicable bits and cannot add an unrequested I/O right. A matching
+write is admitted. These are general natural-number bitmask statements, so they
+include every 64-bit rights pattern without a second SMT definition. The old
+writable-default and base/inheriting-union errors are exercised by actual VM
+regressions rather than solver-only arithmetic witnesses.
 The VM regression passes different base/inheriting masks, including u64::MAX,
 and checks unchanged descriptor output on denied completion. The actual
 compiled std shell rejects a read on its write-only LED object before its
