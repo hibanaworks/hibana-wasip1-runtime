@@ -57,8 +57,11 @@ the requested mode. The gate exports 160 decisions
 from actual Rust `ChoreoFs::path_open` calls: five material kinds, every
 combination of the three I/O bits, and four ancillary-bit patterns including
 the high bit and every non-I/O bit. Denied calls return no descriptor or binding.
-The kernel checks every decision; the exact axiom audit permits only `propext`
-for all fourteen general theorems and 160 finite decisions.
+The kernel checks every decision. The exact axiom audit requires only `propext`
+for thirteen general theorems and all 160 finite decisions. The general
+no-added-rights theorem also uses `Quot.sound`, through Lean's standard natural
+number bitwise identities. Its full axiom list is checked separately; custom
+axioms and other dependencies are rejected.
 
 The same Lean model proves that every selected mode is nonempty, equals the
 requested applicable bits and cannot add an unrequested I/O right. A matching

@@ -182,7 +182,14 @@ fn check(root: &Path, target: &Path, evidence: &Path) -> Result<()> {
     ];
     let mut path_expected: Vec<_> = path_names
         .iter()
-        .map(|name| format!("'WasiPathRights.{name}' depends on axioms: [propext]"))
+        .map(|name| {
+            let axioms = if *name == "accepted_cannot_add_io_rights" {
+                "[propext, Quot.sound]"
+            } else {
+                "[propext]"
+            };
+            format!("'WasiPathRights.{name}' depends on axioms: {axioms}")
+        })
         .collect();
     path_expected.extend((0..160).map(|n| {
         format!("'WasiPathRights.actual_path_decision_{n}' depends on axioms: [propext]")
