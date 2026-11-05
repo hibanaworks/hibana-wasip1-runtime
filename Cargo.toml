@@ -33,7 +33,7 @@ name = "sequenced_choreofs_write"
 path = "examples/sequenced_choreofs_write/main.rs"
 
 [dependencies]
-hibana = { git = "https://github.com/hibanaworks/hibana", rev = "d892df33205fd8c04be205948e24dd9daa9f022c", version = "=0.10.0", default-features = false }
+hibana = { git = "https://github.com/hibanaworks/hibana", rev = "724f3e3e6e74b5d71ced86b1a0f007ba26177969", version = "=0.10.0", default-features = false }
 
 [dev-dependencies]
 hibana-runtime = { git = "https://github.com/hibanaworks/hibana-runtime", rev = "09a803afdfb45945febed46145a68ff92a03d9e4" }
